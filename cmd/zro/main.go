@@ -14,6 +14,7 @@ import (
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/edge"
+	"github.com/cubis/zro/pkg/gateway/acme"
 	"github.com/cubis/zro/pkg/gateway/balancer"
 	"github.com/cubis/zro/pkg/gateway/proxy"
 	"github.com/cubis/zro/pkg/node"
@@ -172,6 +173,28 @@ func newGatewayCmd() *cobra.Command {
 				}
 				bal := balancer.NewBalancer(balancer.StrategyRoundRobin, backends)
 				proxyEngine.RegisterRoute(cfg.Gateway.Domain, bal)
+			}
+
+			// Automated ACME TLS termination if enabled
+			if cfg.Gateway.AutoTLS && cfg.Gateway.Domain != "" {
+				acmeMgr, err := acme.NewManager(acme.Config{
+					Enabled: true,
+					Domains: []string{cfg.Gateway.Domain},
+					CertDir: cfg.Gateway.CertDir,
+				})
+				if err == nil {
+					httpsServer := &http.Server{
+						Addr:         cfg.Gateway.ListenHTTPS,
+						Handler:      proxyEngine,
+						TLSConfig:    acmeMgr.TLSConfig(),
+						ReadTimeout:  15 * time.Second,
+						WriteTimeout: 15 * time.Second,
+					}
+					go func() {
+						slog.Info("ZRO Ingress Gateway HTTPS listening with AutoTLS", "addr", cfg.Gateway.ListenHTTPS, "domain", cfg.Gateway.Domain)
+						_ = httpsServer.ListenAndServeTLS("", "")
+					}()
+				}
 			}
 
 			httpServer := &http.Server{

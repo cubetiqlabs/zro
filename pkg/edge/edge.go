@@ -13,6 +13,7 @@ import (
 	"github.com/cubis/zro/pkg/config"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
+	"github.com/cubis/zro/pkg/dataplane/derp"
 	"github.com/cubis/zro/pkg/dataplane/router"
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
 	"github.com/cubis/zro/pkg/p2p/stun"
@@ -25,6 +26,8 @@ type PoPDaemon struct {
 	wgManager    *wireguard.Manager
 	routingTable *router.Table
 	udpListener  *net.UDPConn
+	derpServer   *derp.Server
+	derpListener net.Listener
 	httpClient   *http.Client
 
 	cancel context.CancelFunc
@@ -94,6 +97,22 @@ func (e *PoPDaemon) Start(ctx context.Context) error {
 	e.wg.Add(1)
 	go e.stunServerLoop(ctx)
 
+	// Launch DERP Encrypted Packet Relay server over TCP
+	derpSrv, err := derp.NewServer(e.keyPair)
+	if err == nil {
+		e.derpServer = derpSrv
+		tcpListener, err := net.Listen("tcp", listenAddr)
+		if err == nil {
+			e.derpListener = tcpListener
+			slog.Info("ZRO Edge DERP packet relay listening", "addr", listenAddr)
+			e.wg.Add(1)
+			go func() {
+				defer e.wg.Done()
+				_ = e.derpServer.Serve(tcpListener)
+			}()
+		}
+	}
+
 	// Launch Control Plane config synchronization loop
 	e.wg.Add(1)
 	go e.syncWorker(ctx)
@@ -108,6 +127,12 @@ func (e *PoPDaemon) Stop() error {
 	}
 	if e.udpListener != nil {
 		_ = e.udpListener.Close()
+	}
+	if e.derpListener != nil {
+		_ = e.derpListener.Close()
+	}
+	if e.derpServer != nil {
+		_ = e.derpServer.Close()
 	}
 	if e.wgManager != nil {
 		_ = e.wgManager.Close()

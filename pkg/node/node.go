@@ -15,10 +15,14 @@ import (
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
+	"github.com/cubis/zro/pkg/dataplane/derp"
 	"github.com/cubis/zro/pkg/dataplane/router"
+	"github.com/cubis/zro/pkg/dataplane/tun"
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
+	"github.com/cubis/zro/pkg/p2p/disco"
 	"github.com/cubis/zro/pkg/p2p/puncher"
 	"github.com/cubis/zro/pkg/p2p/stun"
+	"github.com/cubis/zro/pkg/tunnel"
 	"github.com/google/uuid"
 )
 
@@ -34,9 +38,13 @@ type Daemon struct {
 	secondaryPoP *core.EdgePoP
 	peers        map[string]core.Node // pubKey -> node
 
+	tunDev       tun.Device
 	wgManager    *wireguard.Manager
 	routingTable *router.Table
 	udpConn      *net.UDPConn
+	discoEngine  *disco.Engine
+	derpClient   *derp.Client
+	tunnelClient *tunnel.Client
 	httpClient   *http.Client
 
 	cancel       context.CancelFunc
@@ -55,12 +63,19 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 		return nil, fmt.Errorf("failed to initialize WireGuard manager: %w", err)
 	}
 
+	tunDev, err := tun.CreateTUN(cfg.InterfaceName, cfg.MTU)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize TUN device: %w", err)
+	}
+
 	return &Daemon{
 		cfg:          cfg,
 		keyPair:      kp,
 		peers:        make(map[string]core.Node),
+		tunDev:       tunDev,
 		wgManager:    wgMgr,
 		routingTable: router.NewTable(),
+		tunnelClient: tunnel.NewClient(),
 		httpClient:   &http.Client{Timeout: 10 * time.Second},
 	}, nil
 }
@@ -70,12 +85,13 @@ func (d *Daemon) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	d.cancel = cancel
 
-	// 1. Bind local UDP listener for STUN and WireGuard peering
+	// 1. Bind local UDP listener for STUN, Disco, and WireGuard peering
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
 		return fmt.Errorf("failed to bind UDP socket: %w", err)
 	}
 	d.udpConn = udpConn
+	d.discoEngine = disco.NewEngine(d.keyPair, udpConn)
 
 	slog.Info("ZRO Node agent initialized", "pubkey", d.keyPair.PublicKey, "local_udp", udpConn.LocalAddr().String())
 
@@ -162,6 +178,12 @@ func (d *Daemon) Stop() error {
 	}
 	if d.udpConn != nil {
 		_ = d.udpConn.Close()
+	}
+	if d.tunDev != nil {
+		_ = d.tunDev.Close()
+	}
+	if d.derpClient != nil {
+		_ = d.derpClient.Close()
 	}
 	if d.wgManager != nil {
 		_ = d.wgManager.Close()
@@ -256,14 +278,22 @@ func (d *Daemon) probeWorker(ctx context.Context) {
 func (d *Daemon) tunnelWorker(ctx context.Context) {
 	defer d.wg.Done()
 
-	// Register Cloudflared-style exposed local services with the Control Plane
-	for _, tunnel := range d.cfg.Tunnels {
+	// Register Cloudflared-style exposed local services with the Control Plane and local tunnel engine
+	for _, tunCfg := range d.cfg.Tunnels {
+		_ = d.tunnelClient.ExposeService(tunnel.IngressDefinition{
+			NodeID:         d.nodeID,
+			Name:           tunCfg.Name,
+			LocalAddress:   tunCfg.LocalAddress,
+			PublicHostname: tunCfg.PublicHostname,
+			Protocol:       tunCfg.Protocol,
+		})
+
 		t := core.Tunnel{
 			NodeID:         d.nodeID,
-			Name:           tunnel.Name,
-			LocalAddress:   tunnel.LocalAddress,
-			PublicHostname: tunnel.PublicHostname,
-			Protocol:       tunnel.Protocol,
+			Name:           tunCfg.Name,
+			LocalAddress:   tunCfg.LocalAddress,
+			PublicHostname: tunCfg.PublicHostname,
+			Protocol:       tunCfg.Protocol,
 		}
 
 		body, _ := json.Marshal(t)
@@ -273,7 +303,7 @@ func (d *Daemon) tunnelWorker(ctx context.Context) {
 			res, err := d.httpClient.Do(req)
 			if err == nil {
 				_ = res.Body.Close()
-				slog.Info("Exposed local service tunnel", "name", tunnel.Name, "hostname", tunnel.PublicHostname, "local", tunnel.LocalAddress)
+				slog.Info("Exposed local service tunnel", "name", tunCfg.Name, "hostname", tunCfg.PublicHostname, "local", tunCfg.LocalAddress)
 			}
 		}
 	}
