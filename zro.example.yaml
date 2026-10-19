@@ -7,7 +7,7 @@ control_plane:
   listen_addr: ":8443"
   public_url: "https://zro-plane.cubis.tech:443"
   database_driver: "postgres" # Options: postgres, sqlite
-  database_dsn: "postgres://zro:secret@localhost:5432/zro?sslmode=disable"
+  database_dsn: "postgres://postgres:postgres@localhost:5432/zro?sslmode=disable"
   secret_key: "change-me-to-a-super-secure-cluster-secret"
   default_cidr_v4: "100.64.0.0/10"
   default_cidr_v6: "fd00:cafe::/64"
