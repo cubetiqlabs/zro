@@ -1,0 +1,27 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Database files
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Test artifacts
+*.test
+*.out
+coverage.html
+
+# Local config & certs
+zro.yaml
+certs/
+.env
+
+# IDE & OS
+.DS_Store
+.idea/
+.vscode/
