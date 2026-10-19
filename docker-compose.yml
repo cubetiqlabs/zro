@@ -27,7 +27,7 @@ services:
       dockerfile: Dockerfile
     container_name: zro-plane
     restart: unless-stopped
-    command: ["plane", "--auto-seed=true"]
+    command: ["plane"]
     depends_on:
       postgres:
         condition: service_healthy

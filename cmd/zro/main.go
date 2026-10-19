@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/cubis/zro/pkg/config"
 	"github.com/cubis/zro/pkg/control/server"
+	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/edge"
 	"github.com/cubis/zro/pkg/gateway/acme"
@@ -19,7 +22,7 @@ import (
 	"github.com/cubis/zro/pkg/gateway/proxy"
 	"github.com/cubis/zro/pkg/node"
 	"github.com/cubis/zro/pkg/store"
-	"github.com/google/uuid"
+	"github.com/cubis/zro/pkg/tunnel"
 	"github.com/spf13/cobra"
 )
 
@@ -42,6 +45,8 @@ func init() {
 	rootCmd.AddCommand(newGatewayCmd())
 	rootCmd.AddCommand(newKeygenCmd())
 	rootCmd.AddCommand(newTokenCmd())
+	rootCmd.AddCommand(newNetworkCmd())
+	rootCmd.AddCommand(newSocksCmd())
 }
 
 func main() {
@@ -52,8 +57,7 @@ func main() {
 }
 
 func newPlaneCmd() *cobra.Command {
-	var autoSeed bool
-	cmd := &cobra.Command{
+	return &cobra.Command{
 		Use:   "plane",
 		Short: "Run the ZRO Control Plane API server",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -69,12 +73,6 @@ func newPlaneCmd() *cobra.Command {
 			}
 
 			srv := server.NewServer(&cfg.ControlPlane, db)
-
-			if autoSeed {
-				if err := srv.SeedDefaultData(cmd.Context()); err != nil {
-					slog.Warn("Auto-seeding encountered an issue", "error", err)
-				}
-			}
 
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
@@ -92,8 +90,6 @@ func newPlaneCmd() *cobra.Command {
 			return srv.Shutdown(shutdownCtx)
 		},
 	}
-	cmd.Flags().BoolVar(&autoSeed, "auto-seed", true, "Automatically seed default tenant, network, and edge PoPs if empty")
-	return cmd
 }
 
 func newEdgeCmd() *cobra.Command {
@@ -243,24 +239,95 @@ func newTokenCmd() *cobra.Command {
 	var secret string
 	var networkID string
 	var hostname string
+	var pubKey string
 	var durationHours int
 
 	cmd := &cobra.Command{
 		Use:   "token",
-		Short: "Generate a signed node enrollment token",
+		Short: "Generate a signed node enrollment token with public key binding",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if secret == "" || networkID == "" || hostname == "" {
 				return fmt.Errorf("--secret, --network-id, and --hostname flags are required")
 			}
-			tok := crypto.GenerateEnrollmentToken(secret, networkID, hostname, time.Duration(durationHours)*time.Hour)
+			tok := crypto.GenerateEnrollmentToken(secret, networkID, hostname, time.Duration(durationHours)*time.Hour, pubKey)
 			fmt.Printf("Enrollment Token:\n%s\n", tok)
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVar(&secret, "secret", "change-me-in-production-cluster-secret", "Cluster secret key")
-	cmd.Flags().StringVar(&networkID, "network-id", uuid.New().String(), "Target Network UUID")
+	cmd.Flags().StringVar(&networkID, "network-id", "8056c2e21c000001", "Target 16-hex Network ID")
 	cmd.Flags().StringVar(&hostname, "hostname", "my-node", "Node hostname")
+	cmd.Flags().StringVar(&pubKey, "pubkey", "", "Optional WireGuard public key to bind cryptographically")
 	cmd.Flags().IntVar(&durationHours, "hours", 24, "Validity duration in hours")
+	return cmd
+}
+
+func newNetworkCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "network",
+		Short: "Manage ZRO overlay networks (ZeroTier-styled 16-hex IDs)",
+	}
+
+	var name, cidrv4, cidrv6, planeURL string
+	createCmd := &cobra.Command{
+		Use:   "create",
+		Short: "Create a new overlay network",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			netReq := map[string]string{
+				"name":      name,
+				"ipv4_cidr": cidrv4,
+				"ipv6_cidr": cidrv6,
+			}
+			body, _ := json.Marshal(netReq)
+			resp, err := http.Post(planeURL+"/api/v1/networks", "application/json", bytes.NewReader(body))
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusCreated {
+				return fmt.Errorf("failed to create network: status %d", resp.StatusCode)
+			}
+			var net core.Network
+			_ = json.NewDecoder(resp.Body).Decode(&net)
+			fmt.Printf("Created Network Successfully!\n")
+			fmt.Printf("Network ID:  %s (ZeroTier-style 16-hex)\n", net.ID)
+			fmt.Printf("Name:        %s\n", net.Name)
+			fmt.Printf("IPv4 CIDR:   %s\n", net.IPv4CIDR)
+			fmt.Printf("IPv6 CIDR:   %s\n", net.IPv6CIDR)
+			return nil
+		},
+	}
+	createCmd.Flags().StringVar(&name, "name", "My Mesh Network", "Network name")
+	createCmd.Flags().StringVar(&cidrv4, "cidr", "100.64.0.0/10", "IPv4 CIDR overlay space")
+	createCmd.Flags().StringVar(&cidrv6, "cidr-v6", "fd00:cafe::/64", "IPv6 CIDR overlay space")
+	createCmd.Flags().StringVar(&planeURL, "plane", "http://localhost:8443", "Control Plane URL")
+
+	cmd.AddCommand(createCmd)
+	return cmd
+}
+
+func newSocksCmd() *cobra.Command {
+	var listenAddr string
+	cmd := &cobra.Command{
+		Use:   "socks",
+		Short: "Run the built-in SOCKS5 proxy server for tunneling any application",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			srv := tunnel.NewSOCKS5Server(nil)
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
+			go func() {
+				if err := srv.ListenAndServe(listenAddr); err != nil && err != http.ErrServerClosed {
+					slog.Error("SOCKS5 server error", "error", err)
+				}
+			}()
+
+			<-ctx.Done()
+			slog.Info("Stopping SOCKS5 server...")
+			return srv.Close()
+		},
+	}
+	cmd.Flags().StringVarP(&listenAddr, "listen", "l", ":1080", "Listen address for SOCKS5 proxy")
 	return cmd
 }

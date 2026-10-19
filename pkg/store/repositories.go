@@ -67,7 +67,7 @@ func (r *networkRepo) Create(ctx context.Context, network *core.Network) error {
 	return r.db.WithContext(ctx).Create(network).Error
 }
 
-func (r *networkRepo) GetByID(ctx context.Context, id uuid.UUID) (*core.Network, error) {
+func (r *networkRepo) GetByID(ctx context.Context, id string) (*core.Network, error) {
 	var net core.Network
 	if err := r.db.WithContext(ctx).Preload("Nodes").Preload("ACLRules").Preload("Routes").First(&net, "id = ?", id).Error; err != nil {
 		return nil, err
@@ -85,7 +85,7 @@ func (r *networkRepo) Update(ctx context.Context, network *core.Network) error {
 	return r.db.WithContext(ctx).Save(network).Error
 }
 
-func (r *networkRepo) Delete(ctx context.Context, id uuid.UUID) error {
+func (r *networkRepo) Delete(ctx context.Context, id string) error {
 	return r.db.WithContext(ctx).Delete(&core.Network{}, "id = ?", id).Error
 }
 
@@ -169,7 +169,7 @@ func (r *nodeRepo) GetByPublicKey(ctx context.Context, pubKey string) (*core.Nod
 	return &node, nil
 }
 
-func (r *nodeRepo) ListByNetworkID(ctx context.Context, networkID uuid.UUID) ([]core.Node, error) {
+func (r *nodeRepo) ListByNetworkID(ctx context.Context, networkID string) ([]core.Node, error) {
 	var nodes []core.Node
 	err := r.db.WithContext(ctx).Preload("AssignedPoP").Where("network_id = ?", networkID).Find(&nodes).Error
 	return nodes, err
@@ -189,7 +189,7 @@ func (r *nodeRepo) Delete(ctx context.Context, id uuid.UUID) error {
 	return r.db.WithContext(ctx).Delete(&core.Node{}, "id = ?", id).Error
 }
 
-func (r *nodeRepo) ListAllocatedIPs(ctx context.Context, networkID uuid.UUID) ([]string, error) {
+func (r *nodeRepo) ListAllocatedIPs(ctx context.Context, networkID string) ([]string, error) {
 	var ips []string
 	err := r.db.WithContext(ctx).Model(&core.Node{}).Where("network_id = ?", networkID).Pluck("overlay_ipv4", &ips).Error
 	return ips, err
@@ -217,7 +217,7 @@ func (r *aclRepo) GetByID(ctx context.Context, id uuid.UUID) (*core.ACLRule, err
 	return &rule, nil
 }
 
-func (r *aclRepo) ListByNetworkID(ctx context.Context, networkID uuid.UUID) ([]core.ACLRule, error) {
+func (r *aclRepo) ListByNetworkID(ctx context.Context, networkID string) ([]core.ACLRule, error) {
 	var rules []core.ACLRule
 	err := r.db.WithContext(ctx).Where("network_id = ?", networkID).Order("priority asc").Find(&rules).Error
 	return rules, err
@@ -249,7 +249,7 @@ func (r *routeRepo) GetByID(ctx context.Context, id uuid.UUID) (*core.Route, err
 	return &route, nil
 }
 
-func (r *routeRepo) ListByNetworkID(ctx context.Context, networkID uuid.UUID) ([]core.Route, error) {
+func (r *routeRepo) ListByNetworkID(ctx context.Context, networkID string) ([]core.Route, error) {
 	var routes []core.Route
 	err := r.db.WithContext(ctx).Where("network_id = ?", networkID).Find(&routes).Error
 	return routes, err

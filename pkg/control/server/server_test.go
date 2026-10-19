@@ -45,7 +45,7 @@ func TestServerEnrollmentFlow(t *testing.T) {
 	_ = db.Tenants.Create(ctx, tenant)
 
 	network := &core.Network{
-		ID:        uuid.New(),
+		ID:        core.GenerateNetworkID(),
 		TenantID:  tenant.ID,
 		Name:      "Prod Mesh",
 		Slug:      "prod",
@@ -93,7 +93,7 @@ func TestServerEnrollmentFlow(t *testing.T) {
 
 	// 3. Test Enroll Node
 	kp, _ := crypto.GenerateKeyPair()
-	token := crypto.GenerateEnrollmentToken(secretKey, network.ID.String(), "node-kh-01", 10*time.Minute)
+	token := crypto.GenerateEnrollmentToken(secretKey, network.ID, "node-kh-01", 10*time.Minute, kp.PublicKey)
 
 	enrollReq := EnrollRequest{
 		Token:     token,

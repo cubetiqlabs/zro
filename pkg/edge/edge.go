@@ -1,6 +1,7 @@
 package edge
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -113,7 +114,7 @@ func (e *PoPDaemon) Start(ctx context.Context) error {
 		}
 	}
 
-	// Launch Control Plane config synchronization loop
+	// Launch Control Plane config synchronization and registration loop
 	e.wg.Add(1)
 	go e.syncWorker(ctx)
 
@@ -162,11 +163,46 @@ func (e *PoPDaemon) stunServerLoop(ctx context.Context) {
 	}
 }
 
+func (e *PoPDaemon) registerWithControlPlane(ctx context.Context) bool {
+	regPayload := map[string]any{
+		"pop_code":        e.cfg.PoPCode,
+		"region":          e.cfg.Region,
+		"public_endpoint": e.cfg.PublicEndpoint,
+		"public_key":      e.keyPair.PublicKey,
+		"weight":          100,
+		"is_anycast":      e.cfg.IsAnycast,
+	}
+
+	body, err := json.Marshal(regPayload)
+	if err != nil {
+		return false
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", e.cfg.PlaneEndpoint+"/api/v1/edge/register", bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := e.httpClient.Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+		slog.Info("Registered Edge PoP with Control Plane", "pop_code", e.cfg.PoPCode, "plane", e.cfg.PlaneEndpoint)
+		return true
+	}
+	slog.Warn("Failed registration with Control Plane (will retry in background)", "pop_code", e.cfg.PoPCode, "error", err)
+	return false
+}
+
 func (e *PoPDaemon) syncWorker(ctx context.Context) {
 	defer e.wg.Done()
 
-	// Sync Edge PoP backbone topology with other PoPs
-	ticker := time.NewTicker(30 * time.Second)
+	registered := e.registerWithControlPlane(ctx)
+	if registered {
+		e.syncMeshTopology(ctx)
+	}
+
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -174,13 +210,18 @@ func (e *PoPDaemon) syncWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			e.syncOtherPoPs(ctx)
+			if !registered {
+				registered = e.registerWithControlPlane(ctx)
+			}
+			if registered {
+				e.syncMeshTopology(ctx)
+			}
 		}
 	}
 }
 
-func (e *PoPDaemon) syncOtherPoPs(ctx context.Context) {
-	req, err := http.NewRequestWithContext(ctx, "GET", e.cfg.PlaneEndpoint+"/api/v1/pops", nil)
+func (e *PoPDaemon) syncMeshTopology(ctx context.Context) {
+	req, err := http.NewRequestWithContext(ctx, "GET", e.cfg.PlaneEndpoint+"/api/v1/edge/sync", nil)
 	if err != nil {
 		return
 	}
@@ -191,19 +232,43 @@ func (e *PoPDaemon) syncOtherPoPs(ctx context.Context) {
 	}
 	defer resp.Body.Close()
 
-	var pops []core.EdgePoP
-	if err := json.NewDecoder(resp.Body).Decode(&pops); err != nil {
+	var syncData struct {
+		PoPs  []core.EdgePoP `json:"pops"`
+		Nodes []core.Node    `json:"nodes"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&syncData); err != nil {
 		return
 	}
 
-	// Establish backbone mesh with other PoPs
-	for _, p := range pops {
+	// 1. Establish backbone mesh with other PoPs
+	for _, p := range syncData.PoPs {
 		if p.PoPCode != e.cfg.PoPCode && p.PublicKey != "" {
 			_ = e.wgManager.ApplyPeer(wireguard.PeerConfig{
 				PublicKey:           p.PublicKey,
 				Endpoint:            p.PublicEndpoint,
 				AllowedIPs:          []string{"100.64.0.0/10", "fd00:cafe::/64"},
 				PersistentKeepalive: 20 * time.Second,
+			})
+		}
+	}
+
+	// 2. Configure routing for active nodes
+	for _, n := range syncData.Nodes {
+		if n.PublicKey != "" && n.OverlayIPv4 != "" {
+			var ep string
+			if len(n.Endpoints) > 0 {
+				ep = n.Endpoints[0]
+			}
+			_ = e.wgManager.ApplyPeer(wireguard.PeerConfig{
+				PublicKey:           n.PublicKey,
+				Endpoint:            ep,
+				AllowedIPs:          []string{n.OverlayIPv4 + "/32"},
+				PersistentKeepalive: 25 * time.Second,
+			})
+			e.routingTable.SetRoute(n.OverlayIPv4, router.RouteTarget{
+				PublicKey: n.PublicKey,
+				Endpoint:  ep,
 			})
 		}
 	}

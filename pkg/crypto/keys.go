@@ -84,15 +84,21 @@ func GenerateRandomHex(n int) (string, error) {
 
 // EnrollmentTokenPayload carries node enrollment claims.
 type EnrollmentTokenPayload struct {
-	NetworkID string
-	Hostname  string
-	ExpiresAt time.Time
+	NetworkID      string
+	Hostname       string
+	ExpiresAt      time.Time
+	BoundPublicKey string
 }
 
-// GenerateEnrollmentToken creates a signed, time-bound node enrollment token.
-func GenerateEnrollmentToken(secretKey string, networkID, hostname string, duration time.Duration) string {
+// GenerateEnrollmentToken creates a signed, time-bound node enrollment token, optionally bound to a WireGuard public key.
+func GenerateEnrollmentToken(secretKey string, networkID, hostname string, duration time.Duration, boundPubKey ...string) string {
 	exp := time.Now().Add(duration).Unix()
-	payload := fmt.Sprintf("%s:%s:%d", networkID, hostname, exp)
+	var pubKey string
+	if len(boundPubKey) > 0 {
+		pubKey = boundPubKey[0]
+	}
+
+	payload := fmt.Sprintf("%s:%s:%d:%s", networkID, hostname, exp, pubKey)
 	mac := hmac.New(sha256.New, []byte(secretKey))
 	mac.Write([]byte(payload))
 	sig := hex.EncodeToString(mac.Sum(nil))
@@ -100,8 +106,8 @@ func GenerateEnrollmentToken(secretKey string, networkID, hostname string, durat
 	return fmt.Sprintf("zro_tok_%s.%s", encodedPayload, sig)
 }
 
-// VerifyEnrollmentToken validates a signed node enrollment token.
-func VerifyEnrollmentToken(secretKey, token string) (*EnrollmentTokenPayload, error) {
+// VerifyEnrollmentToken validates a signed node enrollment token and checks public key binding if bound.
+func VerifyEnrollmentToken(secretKey, token string, clientPubKey ...string) (*EnrollmentTokenPayload, error) {
 	if !strings.HasPrefix(token, "zro_tok_") {
 		return nil, errors.New("invalid token format")
 	}
@@ -124,7 +130,7 @@ func VerifyEnrollmentToken(secretKey, token string) (*EnrollmentTokenPayload, er
 	}
 
 	subParts := strings.Split(string(rawPayload), ":")
-	if len(subParts) != 3 {
+	if len(subParts) < 3 {
 		return nil, errors.New("invalid payload elements")
 	}
 
@@ -138,9 +144,22 @@ func VerifyEnrollmentToken(secretKey, token string) (*EnrollmentTokenPayload, er
 		return nil, errors.New("token expired")
 	}
 
+	var boundKey string
+	if len(subParts) >= 4 {
+		boundKey = subParts[3]
+	}
+
+	// If token was bound to a specific WireGuard public key, enforce match
+	if boundKey != "" && len(clientPubKey) > 0 && clientPubKey[0] != "" {
+		if boundKey != clientPubKey[0] {
+			return nil, fmt.Errorf("token bound to public key %s, received %s", boundKey, clientPubKey[0])
+		}
+	}
+
 	return &EnrollmentTokenPayload{
-		NetworkID: subParts[0],
-		Hostname:  subParts[1],
-		ExpiresAt: exp,
+		NetworkID:      subParts[0],
+		Hostname:       subParts[1],
+		ExpiresAt:      exp,
+		BoundPublicKey: boundKey,
 	}, nil
 }

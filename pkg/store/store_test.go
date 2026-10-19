@@ -32,7 +32,7 @@ func TestStoreRepositories(t *testing.T) {
 
 	// 2. Create Network
 	net := &core.Network{
-		ID:        uuid.New(),
+		ID:        core.GenerateNetworkID(),
 		TenantID:  tenant.ID,
 		Name:      "Production Mesh",
 		Slug:      "prod",

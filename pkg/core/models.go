@@ -1,13 +1,22 @@
 package core
 
 import (
+	"crypto/rand"
 	"database/sql/driver"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// GenerateNetworkID generates a 16-hex character ZeroTier-styled network ID (e.g. "8056c2e21c000001").
+func GenerateNetworkID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
 
 // StringList is a JSON-serialized slice of strings for tags, metadata, etc.
 type StringList []string
@@ -51,8 +60,9 @@ type Tenant struct {
 }
 
 // Network represents a virtual private overlay network (VPC/Ether-switch space).
+// ID uses ZeroTier-style 16-hex characters (e.g. "8056c2e21c000001").
 type Network struct {
-	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	ID        string    `gorm:"size:16;primaryKey" json:"id"`
 	TenantID  uuid.UUID `gorm:"type:uuid;not null;index" json:"tenant_id"`
 	Name      string    `gorm:"size:255;not null" json:"name"`
 	Slug      string    `gorm:"size:100;not null" json:"slug"`
@@ -97,7 +107,7 @@ const (
 // Node represents an IPless client, agent, internal service, or gateway in the mesh.
 type Node struct {
 	ID             uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
-	NetworkID      uuid.UUID  `gorm:"type:uuid;not null;index" json:"network_id"`
+	NetworkID      string     `gorm:"size:16;not null;index" json:"network_id"`
 	Hostname       string     `gorm:"size:255;not null" json:"hostname"`
 	PublicKey      string     `gorm:"size:64;not null;index" json:"public_key"`
 	OverlayIPv4    string     `gorm:"size:50;not null;index" json:"overlay_ipv4"`
@@ -127,7 +137,7 @@ const (
 // ACLRule defines microsegmentation and access control within a network.
 type ACLRule struct {
 	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
-	NetworkID uuid.UUID `gorm:"type:uuid;not null;index" json:"network_id"`
+	NetworkID string    `gorm:"size:16;not null;index" json:"network_id"`
 	Priority  int       `gorm:"default:100;not null" json:"priority"`
 	SourceTag string    `gorm:"size:100;not null" json:"source_tag"` // e.g. "tag:web" or "*"
 	DestTag   string    `gorm:"size:100;not null" json:"dest_tag"`   // e.g. "tag:db" or "*"
@@ -141,7 +151,7 @@ type ACLRule struct {
 // Route defines subnet router advertisements inside the overlay mesh.
 type Route struct {
 	ID              uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
-	NetworkID       uuid.UUID `gorm:"type:uuid;not null;index" json:"network_id"`
+	NetworkID       string    `gorm:"size:16;not null;index" json:"network_id"`
 	NodeID          uuid.UUID `gorm:"type:uuid;not null;index" json:"node_id"`
 	DestinationCIDR string    `gorm:"size:50;not null" json:"destination_cidr"` // e.g. "192.168.1.0/24"
 	Metric          int       `gorm:"default:10" json:"metric"`

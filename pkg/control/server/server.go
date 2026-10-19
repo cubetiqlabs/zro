@@ -23,7 +23,7 @@ type Server struct {
 	cfg        *config.ControlPlaneConfig
 	db         *store.DB
 	delegator  *delegation.Engine
-	ipamCache  map[uuid.UUID]*ipam.IPAM
+	ipamCache  map[string]*ipam.IPAM // network ID (16-hex) -> IPAM allocator
 	ipamMu     sync.RWMutex
 	httpServer *http.Server
 	mux        *http.ServeMux
@@ -42,120 +42,13 @@ func NewServer(cfg *config.ControlPlaneConfig, db *store.DB) *Server {
 		cfg:         cfg,
 		db:          db,
 		delegator:   delegator,
-		ipamCache:   make(map[uuid.UUID]*ipam.IPAM),
+		ipamCache:   make(map[string]*ipam.IPAM),
 		mux:         mux,
 		subscribers: make(map[chan []byte]bool),
 	}
 
 	s.registerRoutes()
 	return s
-}
-
-// SeedDefaultData bootstraps default tenant, network, and edge PoPs if database is empty.
-func (s *Server) SeedDefaultData(ctx context.Context) error {
-	tenants, err := s.db.Tenants.List(ctx)
-	if err != nil {
-		return err
-	}
-	if len(tenants) > 0 {
-		return nil // already seeded
-	}
-
-	slog.Info("Seeding initial ZRO cluster configuration...")
-
-	tenantID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	tenant := &core.Tenant{
-		ID:        tenantID,
-		Name:      "Cubis Tech",
-		Slug:      "cubis",
-		APIKey:    "cubis-root-api-key-9999",
-		IsActive:  true,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	if err := s.db.Tenants.Create(ctx, tenant); err != nil {
-		return err
-	}
-
-	netID := uuid.MustParse("00000000-0000-0000-0000-000000000002")
-	network := &core.Network{
-		ID:        netID,
-		TenantID:  tenantID,
-		Name:      "Global Mesh",
-		Slug:      "global-mesh",
-		IPv4CIDR:  s.cfg.DefaultCIDRv4,
-		IPv6CIDR:  s.cfg.DefaultCIDRv6,
-		DNSDomain: "zro.internal",
-		MTU:       1420,
-		IsActive:  true,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	if err := s.db.Networks.Create(ctx, network); err != nil {
-		return err
-	}
-
-	pops := []core.EdgePoP{
-		{
-			ID:             uuid.New(),
-			PoPCode:        "KH",
-			Region:         "Asia/Phnom_Penh",
-			PublicEndpoint: "173.1.1.1:51820",
-			PublicKey:      "kh-edge-key-public-base64=",
-			Weight:         100,
-			IsHealthy:      true,
-			LastSeenAt:     time.Now(),
-		},
-		{
-			ID:             uuid.New(),
-			PoPCode:        "SG",
-			Region:         "Asia/Singapore",
-			PublicEndpoint: "123.1.1.1:51820",
-			PublicKey:      "sg-edge-key-public-base64=",
-			Weight:         95,
-			IsHealthy:      true,
-			LastSeenAt:     time.Now(),
-		},
-		{
-			ID:             uuid.New(),
-			PoPCode:        "US",
-			Region:         "NorthAmerica/US_East",
-			PublicEndpoint: "145.1.1.1:51820",
-			PublicKey:      "us-edge-key-public-base64=",
-			Weight:         90,
-			IsHealthy:      true,
-			LastSeenAt:     time.Now(),
-		},
-		{
-			ID:             uuid.New(),
-			PoPCode:        "HK",
-			Region:         "Asia/Hong_Kong",
-			PublicEndpoint: "173.1.1.1:51820",
-			PublicKey:      "hk-edge-key-public-base64=",
-			Weight:         92,
-			IsHealthy:      true,
-			LastSeenAt:     time.Now(),
-		},
-		{
-			ID:             uuid.New(),
-			PoPCode:        "DE",
-			Region:         "Europe/Frankfurt",
-			PublicEndpoint: "133.1.1.1:51820",
-			PublicKey:      "de-edge-key-public-base64=",
-			Weight:         88,
-			IsHealthy:      true,
-			LastSeenAt:     time.Now(),
-		},
-	}
-
-	for _, p := range pops {
-		p.CreatedAt = time.Now()
-		p.UpdatedAt = time.Now()
-		_ = s.db.EdgePoPs.Create(ctx, &p)
-	}
-
-	slog.Info("ZRO cluster initial seeding complete", "tenant", tenant.Name, "network_id", network.ID, "pops", len(pops))
-	return nil
 }
 
 // Start begins listening on the configured address.
@@ -186,10 +79,22 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /health", s.handleHealth)
+
+	// Network Management (ZeroTier-styled 16-hex Network ID)
+	s.mux.HandleFunc("POST /api/v1/networks", s.handleCreateNetwork)
+	s.mux.HandleFunc("GET /api/v1/networks", s.handleListNetworks)
+
+	// Edge PoPs & Dynamic Registration
 	s.mux.HandleFunc("GET /api/v1/pops", s.handleListPoPs)
+	s.mux.HandleFunc("POST /api/v1/edge/register", s.handleRegisterEdgePoP)
+	s.mux.HandleFunc("GET /api/v1/edge/sync", s.handleEdgeSync)
+
+	// Node Enrollment & Mesh Coordination
 	s.mux.HandleFunc("POST /api/v1/enroll", s.handleEnrollNode)
 	s.mux.HandleFunc("POST /api/v1/probes", s.handleReportProbes)
 	s.mux.HandleFunc("GET /api/v1/network/{id}/peers", s.handleGetPeers)
+
+	// Ingress & Tunneling
 	s.mux.HandleFunc("POST /api/v1/tunnels", s.handleRegisterTunnel)
 	s.mux.HandleFunc("GET /api/v1/events", s.handleEventStream)
 }
@@ -203,6 +108,99 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// CreateNetworkRequest defines parameters for creating an overlay network.
+type CreateNetworkRequest struct {
+	Name      string `json:"name"`
+	IPv4CIDR  string `json:"ipv4_cidr"`
+	IPv6CIDR  string `json:"ipv6_cidr"`
+	DNSDomain string `json:"dns_domain"`
+}
+
+func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
+	var req CreateNetworkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.IPv4CIDR == "" {
+		req.IPv4CIDR = s.cfg.DefaultCIDRv4
+	}
+	if req.IPv6CIDR == "" {
+		req.IPv6CIDR = s.cfg.DefaultCIDRv6
+	}
+	if req.DNSDomain == "" {
+		req.DNSDomain = "zro.internal"
+	}
+	if req.Name == "" {
+		req.Name = "Mesh Network"
+	}
+
+	netID := core.GenerateNetworkID() // ZeroTier-style 16-hex character ID
+
+	// Default tenant if none exists
+	tenants, _ := s.db.Tenants.List(r.Context())
+	var tenantID uuid.UUID
+	if len(tenants) > 0 {
+		tenantID = tenants[0].ID
+	} else {
+		tenant := &core.Tenant{
+			ID:        uuid.New(),
+			Name:      "Default Organization",
+			Slug:      "default-org",
+			APIKey:    "zro_key_" + netID,
+			IsActive:  true,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+		_ = s.db.Tenants.Create(r.Context(), tenant)
+		tenantID = tenant.ID
+	}
+
+	network := &core.Network{
+		ID:        netID,
+		TenantID:  tenantID,
+		Name:      req.Name,
+		Slug:      req.Name,
+		IPv4CIDR:  req.IPv4CIDR,
+		IPv6CIDR:  req.IPv6CIDR,
+		DNSDomain: req.DNSDomain,
+		MTU:       1420,
+		IsActive:  true,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+
+	if err := s.db.Networks.Create(r.Context(), network); err != nil {
+		http.Error(w, fmt.Sprintf("failed to create network: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("Created new overlay network", "id", network.ID, "name", network.Name, "cidr", network.IPv4CIDR)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(network)
+}
+
+func (s *Server) handleListNetworks(w http.ResponseWriter, r *http.Request) {
+	tenants, err := s.db.Tenants.List(r.Context())
+	if err != nil || len(tenants) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]core.Network{})
+		return
+	}
+
+	networks, err := s.db.Networks.ListByTenantID(r.Context(), tenants[0].ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(networks)
+}
+
 func (s *Server) handleListPoPs(w http.ResponseWriter, r *http.Request) {
 	pops, err := s.db.EdgePoPs.ListHealthy(r.Context())
 	if err != nil {
@@ -213,27 +211,123 @@ func (s *Server) handleListPoPs(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(pops)
 }
 
+// RegisterEdgePoPRequest defines dynamic registration payload from an Edge Data Plane node.
+type RegisterEdgePoPRequest struct {
+	PoPCode        string `json:"pop_code"`        // e.g. "KH", "SG", "US", "HK", "DE"
+	Region         string `json:"region"`
+	PublicEndpoint string `json:"public_endpoint"` // e.g. "173.1.1.1:51820"
+	PublicKey      string `json:"public_key"`      // Curve25519 public key
+	Weight         int    `json:"weight"`
+	IsAnycast      bool   `json:"is_anycast"`
+}
+
+func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
+	var req RegisterEdgePoPRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.PoPCode == "" || req.PublicEndpoint == "" || req.PublicKey == "" {
+		http.Error(w, "pop_code, public_endpoint, and public_key are required", http.StatusBadRequest)
+		return
+	}
+
+	if req.Weight <= 0 {
+		req.Weight = 100
+	}
+
+	existing, _ := s.db.EdgePoPs.GetByPoPCode(r.Context(), req.PoPCode)
+	var pop core.EdgePoP
+	if existing != nil {
+		pop = *existing
+		pop.PublicEndpoint = req.PublicEndpoint
+		pop.PublicKey = req.PublicKey
+		pop.Region = req.Region
+		pop.Weight = req.Weight
+		pop.IsHealthy = true
+		pop.LastSeenAt = time.Now()
+		pop.UpdatedAt = time.Now()
+		_ = s.db.EdgePoPs.Update(r.Context(), &pop)
+	} else {
+		pop = core.EdgePoP{
+			ID:             uuid.New(),
+			PoPCode:        req.PoPCode,
+			Region:         req.Region,
+			PublicEndpoint: req.PublicEndpoint,
+			PublicKey:      req.PublicKey,
+			Weight:         req.Weight,
+			IsAnycast:      req.IsAnycast,
+			IsHealthy:      true,
+			LastSeenAt:     time.Now(),
+			CreatedAt:      time.Now(),
+			UpdatedAt:      time.Now(),
+		}
+		_ = s.db.EdgePoPs.Create(r.Context(), &pop)
+	}
+
+	slog.Info("Edge Data Plane PoP registered dynamically", "pop_code", pop.PoPCode, "endpoint", pop.PublicEndpoint, "pubkey", pop.PublicKey)
+
+	// Broadcast edge update
+	s.broadcastDelta(map[string]any{
+		"event":    "edge_registered",
+		"pop_code": pop.PoPCode,
+		"endpoint": pop.PublicEndpoint,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(pop)
+}
+
+// EdgeSyncResponse returns data plane synchronization state.
+type EdgeSyncResponse struct {
+	PoPs  []core.EdgePoP `json:"pops"`
+	Nodes []core.Node    `json:"nodes"`
+}
+
+func (s *Server) handleEdgeSync(w http.ResponseWriter, r *http.Request) {
+	pops, _ := s.db.EdgePoPs.ListHealthy(r.Context())
+	var allNodes []core.Node
+
+	// List nodes across networks
+	tenants, _ := s.db.Tenants.List(r.Context())
+	if len(tenants) > 0 {
+		nets, _ := s.db.Networks.ListByTenantID(r.Context(), tenants[0].ID)
+		for _, n := range nets {
+			nodes, _ := s.db.Nodes.ListByNetworkID(r.Context(), n.ID)
+			allNodes = append(allNodes, nodes...)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(EdgeSyncResponse{
+		PoPs:  pops,
+		Nodes: allNodes,
+	})
+}
+
 // EnrollRequest payload sent by a new node attempting to join a network.
 type EnrollRequest struct {
-	Token       string          `json:"token"`
-	PublicKey   string          `json:"public_key"`
-	Hostname    string          `json:"hostname"`
-	NodeType    core.NodeType   `json:"node_type"`
-	Tags        core.StringList `json:"tags"`
-	Endpoints   core.StringList `json:"endpoints"` // STUN reflexive endpoints
+	Token     string          `json:"token"`
+	PublicKey string          `json:"public_key"`
+	Hostname  string          `json:"hostname"`
+	NodeType  core.NodeType   `json:"node_type"`
+	Tags      core.StringList `json:"tags"`
+	Endpoints core.StringList `json:"endpoints"` // STUN reflexive endpoints
 }
 
 // EnrollResponse payload returned to the newly enrolled node.
 type EnrollResponse struct {
-	NodeID       uuid.UUID                `json:"node_id"`
-	NetworkID    uuid.UUID                `json:"network_id"`
-	OverlayIPv4  string                   `json:"overlay_ipv4"`
-	OverlayIPv6  string                   `json:"overlay_ipv6"`
-	DNSDomain    string                   `json:"dns_domain"`
-	MTU          int                      `json:"mtu"`
-	PrimaryPoP   core.EdgePoP             `json:"primary_pop"`
-	SecondaryPoP *core.EdgePoP            `json:"secondary_pop,omitempty"`
-	Peers        []core.Node              `json:"peers"`
+	NodeID       uuid.UUID    `json:"node_id"`
+	NetworkID    string       `json:"network_id"` // ZeroTier-style 16-hex ID
+	OverlayIPv4  string       `json:"overlay_ipv4"`
+	OverlayIPv6  string       `json:"overlay_ipv6"`
+	DNSDomain    string       `json:"dns_domain"`
+	MTU          int          `json:"mtu"`
+	PrimaryPoP   core.EdgePoP `json:"primary_pop"`
+	SecondaryPoP *core.EdgePoP `json:"secondary_pop,omitempty"`
+	Peers        []core.Node  `json:"peers"`
 }
 
 func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
@@ -243,21 +337,16 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload, err := crypto.VerifyEnrollmentToken(s.cfg.SecretKey, req.Token)
+	// High security: Verify token with public key binding
+	payload, err := crypto.VerifyEnrollmentToken(s.cfg.SecretKey, req.Token, req.PublicKey)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("invalid or expired token: %v", err), http.StatusUnauthorized)
+		http.Error(w, fmt.Sprintf("enrollment rejected (authentication failure): %v", err), http.StatusUnauthorized)
 		return
 	}
 
-	netUUID, err := uuid.Parse(payload.NetworkID)
+	network, err := s.db.Networks.GetByID(r.Context(), payload.NetworkID)
 	if err != nil {
-		http.Error(w, "invalid network ID in token", http.StatusBadRequest)
-		return
-	}
-
-	network, err := s.db.Networks.GetByID(r.Context(), netUUID)
-	if err != nil {
-		http.Error(w, "network not found", http.StatusNotFound)
+		http.Error(w, fmt.Sprintf("network %s not found", payload.NetworkID), http.StatusNotFound)
 		return
 	}
 
@@ -284,7 +373,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 	nodeID := uuid.New()
 	node := &core.Node{
 		ID:          nodeID,
-		NetworkID:   netUUID,
+		NetworkID:   network.ID,
 		Hostname:    req.Hostname,
 		PublicKey:   req.PublicKey,
 		OverlayIPv4: v4,
@@ -316,11 +405,11 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fetch other peers in this network
-	peers, _ := s.db.Nodes.ListByNetworkID(r.Context(), netUUID)
+	peers, _ := s.db.Nodes.ListByNetworkID(r.Context(), network.ID)
 
 	resp := EnrollResponse{
 		NodeID:      node.ID,
-		NetworkID:   netUUID,
+		NetworkID:   network.ID,
 		OverlayIPv4: v4,
 		OverlayIPv6: v6,
 		DNSDomain:   network.DNSDomain,
@@ -335,10 +424,11 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 
 	// Notify all connected edge nodes and peers of new member
 	s.broadcastDelta(map[string]any{
-		"event":   "node_joined",
-		"node_id": node.ID,
-		"ipv4":    node.OverlayIPv4,
-		"pubkey":  node.PublicKey,
+		"event":      "node_joined",
+		"network_id": network.ID,
+		"node_id":    node.ID,
+		"ipv4":       node.OverlayIPv4,
+		"pubkey":     node.PublicKey,
 	})
 
 	w.Header().Set("Content-Type", "application/json")
@@ -360,13 +450,12 @@ func (s *Server) handleReportProbes(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetPeers(w http.ResponseWriter, r *http.Request) {
 	netIDStr := r.PathValue("id")
-	netUUID, err := uuid.Parse(netIDStr)
-	if err != nil {
-		http.Error(w, "invalid network ID", http.StatusBadRequest)
+	if netIDStr == "" {
+		http.Error(w, "network ID required", http.StatusBadRequest)
 		return
 	}
 
-	peers, err := s.db.Nodes.ListByNetworkID(r.Context(), netUUID)
+	peers, err := s.db.Nodes.ListByNetworkID(r.Context(), netIDStr)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -393,10 +482,10 @@ func (s *Server) handleRegisterTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.broadcastDelta(map[string]any{
-		"event":           "tunnel_registered",
-		"hostname":        tunnel.PublicHostname,
-		"local_address":   tunnel.LocalAddress,
-		"node_id":         tunnel.NodeID,
+		"event":          "tunnel_registered",
+		"hostname":       tunnel.PublicHostname,
+		"local_address":  tunnel.LocalAddress,
+		"node_id":        tunnel.NodeID,
 	})
 
 	w.Header().Set("Content-Type", "application/json")

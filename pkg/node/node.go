@@ -31,7 +31,7 @@ type Daemon struct {
 	cfg          *config.NodeConfig
 	keyPair      *crypto.KeyPair
 	nodeID       uuid.UUID
-	networkID    uuid.UUID
+	networkID    string // ZeroTier-style 16-hex network ID
 	overlayIPv4  string
 	overlayIPv6  string
 	primaryPoP   core.EdgePoP
