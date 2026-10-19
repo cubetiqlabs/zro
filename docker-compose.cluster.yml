@@ -1,0 +1,69 @@
+# Production Cluster Deployment (Cloud / Multi-Server Topology)
+# Usage:
+#   docker compose -f docker-compose.cluster.yml --profile plane up -d
+#   docker compose -f docker-compose.cluster.yml --profile edge up -d
+#   docker compose -f docker-compose.cluster.yml --profile gateway up -d
+
+services:
+  # Standalone / Clustered Control Plane (Behind Cloud Load Balancer)
+  plane:
+    profiles: ["plane"]
+    image: ${ZRO_IMAGE:-cubis/zro:latest}
+    restart: always
+    command: ["plane", "--auto-seed=true"]
+    environment:
+      ZRO_MODE: plane
+      ZRO_LOG_LEVEL: ${LOG_LEVEL:-info}
+      ZRO_CONTROL_PLANE_LISTEN_ADDR: ":8443"
+      ZRO_CONTROL_PLANE_PUBLIC_URL: "${PUBLIC_URL:-https://zro-plane.cubis.tech:443}"
+      ZRO_CONTROL_PLANE_DATABASE_DRIVER: postgres
+      ZRO_CONTROL_PLANE_DATABASE_DSN: "${DATABASE_DSN}" # External Cloud DB (RDS / Cloud SQL)
+      ZRO_CONTROL_PLANE_SECRET_KEY: "${CLUSTER_SECRET}"
+    ports:
+      - "8443:8443"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8443/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Standalone Edge PoP (Runs directly on VPS / Bare-Metal with Public IP)
+  # Uses host networking to eliminate Docker bridge NAT overhead and achieve line-rate WireGuard throughput.
+  edge:
+    profiles: ["edge"]
+    image: ${ZRO_IMAGE:-cubis/zro:latest}
+    restart: always
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    command: ["edge"]
+    environment:
+      ZRO_MODE: edge
+      ZRO_EDGE_POP_CODE: "${POP_CODE}" # e.g. KH, SG, US, HK, DE
+      ZRO_EDGE_REGION: "${REGION}"
+      ZRO_EDGE_PUBLIC_ENDPOINT: "${PUBLIC_ENDPOINT}" # e.g. 173.1.1.1:51820
+      ZRO_EDGE_LISTEN_PORT: ${LISTEN_PORT:-51820}
+      ZRO_EDGE_WIREGUARD_PRIVATE_KEY: "${WIREGUARD_PRIVATE_KEY:-}"
+      ZRO_EDGE_PLANE_ENDPOINT: "${PLANE_ENDPOINT:-https://zro-plane.cubis.tech:443}"
+      ZRO_EDGE_IS_ANYCAST: "${IS_ANYCAST:-false}"
+
+  # Standalone Ingress Gateway (L4/L7 Reverse Proxy & Load Balancer)
+  gateway:
+    profiles: ["gateway"]
+    image: ${ZRO_IMAGE:-cubis/zro:latest}
+    restart: always
+    network_mode: host
+    command: ["gw"]
+    environment:
+      ZRO_MODE: gw
+      ZRO_GATEWAY_LISTEN_HTTP: ":80"
+      ZRO_GATEWAY_LISTEN_HTTPS: ":443"
+      ZRO_GATEWAY_AUTO_TLS: "${AUTO_TLS:-true}"
+      ZRO_GATEWAY_DOMAIN: "${GATEWAY_DOMAIN}"
+      ZRO_GATEWAY_CERT_DIR: "/var/lib/zro/certs"
+    volumes:
+      - certs:/var/lib/zro/certs
+
+volumes:
+  certs:
+    name: zro-cluster-certs

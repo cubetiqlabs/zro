@@ -51,6 +51,113 @@ func NewServer(cfg *config.ControlPlaneConfig, db *store.DB) *Server {
 	return s
 }
 
+// SeedDefaultData bootstraps default tenant, network, and edge PoPs if database is empty.
+func (s *Server) SeedDefaultData(ctx context.Context) error {
+	tenants, err := s.db.Tenants.List(ctx)
+	if err != nil {
+		return err
+	}
+	if len(tenants) > 0 {
+		return nil // already seeded
+	}
+
+	slog.Info("Seeding initial ZRO cluster configuration...")
+
+	tenantID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	tenant := &core.Tenant{
+		ID:        tenantID,
+		Name:      "Cubis Tech",
+		Slug:      "cubis",
+		APIKey:    "cubis-root-api-key-9999",
+		IsActive:  true,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := s.db.Tenants.Create(ctx, tenant); err != nil {
+		return err
+	}
+
+	netID := uuid.MustParse("00000000-0000-0000-0000-000000000002")
+	network := &core.Network{
+		ID:        netID,
+		TenantID:  tenantID,
+		Name:      "Global Mesh",
+		Slug:      "global-mesh",
+		IPv4CIDR:  s.cfg.DefaultCIDRv4,
+		IPv6CIDR:  s.cfg.DefaultCIDRv6,
+		DNSDomain: "zro.internal",
+		MTU:       1420,
+		IsActive:  true,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := s.db.Networks.Create(ctx, network); err != nil {
+		return err
+	}
+
+	pops := []core.EdgePoP{
+		{
+			ID:             uuid.New(),
+			PoPCode:        "KH",
+			Region:         "Asia/Phnom_Penh",
+			PublicEndpoint: "173.1.1.1:51820",
+			PublicKey:      "kh-edge-key-public-base64=",
+			Weight:         100,
+			IsHealthy:      true,
+			LastSeenAt:     time.Now(),
+		},
+		{
+			ID:             uuid.New(),
+			PoPCode:        "SG",
+			Region:         "Asia/Singapore",
+			PublicEndpoint: "123.1.1.1:51820",
+			PublicKey:      "sg-edge-key-public-base64=",
+			Weight:         95,
+			IsHealthy:      true,
+			LastSeenAt:     time.Now(),
+		},
+		{
+			ID:             uuid.New(),
+			PoPCode:        "US",
+			Region:         "NorthAmerica/US_East",
+			PublicEndpoint: "145.1.1.1:51820",
+			PublicKey:      "us-edge-key-public-base64=",
+			Weight:         90,
+			IsHealthy:      true,
+			LastSeenAt:     time.Now(),
+		},
+		{
+			ID:             uuid.New(),
+			PoPCode:        "HK",
+			Region:         "Asia/Hong_Kong",
+			PublicEndpoint: "173.1.1.1:51820",
+			PublicKey:      "hk-edge-key-public-base64=",
+			Weight:         92,
+			IsHealthy:      true,
+			LastSeenAt:     time.Now(),
+		},
+		{
+			ID:             uuid.New(),
+			PoPCode:        "DE",
+			Region:         "Europe/Frankfurt",
+			PublicEndpoint: "133.1.1.1:51820",
+			PublicKey:      "de-edge-key-public-base64=",
+			Weight:         88,
+			IsHealthy:      true,
+			LastSeenAt:     time.Now(),
+		},
+	}
+
+	for _, p := range pops {
+		p.CreatedAt = time.Now()
+		p.UpdatedAt = time.Now()
+		_ = s.db.EdgePoPs.Create(ctx, &p)
+	}
+
+	slog.Info("ZRO cluster initial seeding complete", "tenant", tenant.Name, "network_id", network.ID, "pops", len(pops))
+	return nil
+}
+
 // Start begins listening on the configured address.
 func (s *Server) Start() error {
 	s.httpServer = &http.Server{

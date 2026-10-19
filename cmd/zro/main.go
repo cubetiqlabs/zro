@@ -51,7 +51,8 @@ func main() {
 }
 
 func newPlaneCmd() *cobra.Command {
-	return &cobra.Command{
+	var autoSeed bool
+	cmd := &cobra.Command{
 		Use:   "plane",
 		Short: "Run the ZRO Control Plane API server",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -67,6 +68,12 @@ func newPlaneCmd() *cobra.Command {
 			}
 
 			srv := server.NewServer(&cfg.ControlPlane, db)
+
+			if autoSeed {
+				if err := srv.SeedDefaultData(cmd.Context()); err != nil {
+					slog.Warn("Auto-seeding encountered an issue", "error", err)
+				}
+			}
 
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
@@ -84,6 +91,8 @@ func newPlaneCmd() *cobra.Command {
 			return srv.Shutdown(shutdownCtx)
 		},
 	}
+	cmd.Flags().BoolVar(&autoSeed, "auto-seed", true, "Automatically seed default tenant, network, and edge PoPs if empty")
+	return cmd
 }
 
 func newEdgeCmd() *cobra.Command {

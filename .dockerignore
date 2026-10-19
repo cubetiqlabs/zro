@@ -1,0 +1,9 @@
+.git
+.github
+bin/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.DS_Store
+.env

@@ -57,14 +57,44 @@ go build -o bin/zro ./cmd/zro
 
 ---
 
-## Configuration
+## Docker & Production Deployment
 
-See [`zro.example.yaml`](zro.example.yaml) for full configuration parameters. All options can also be overridden using environment variables prefixed with `ZRO_` (e.g. `ZRO_CONTROL_PLANE_DATABASE_DSN`).
+### 1. Local / Standalone Mesh Simulation (Docker Compose)
+Starts PostgreSQL, Control Plane (`:8443`), Edge PoPs in Cambodia (`:51820/udp`) and Singapore (`:51821/udp`), and Ingress Gateway (`:8080`):
+```bash
+docker compose up -d
+```
+
+### 2. Run Production Smoke Tests
+Automated validation of all components running in Docker:
+```bash
+./scripts/smoke_test.sh
+```
+
+### 3. Production Cloud Cluster Deployment
+For multi-server topologies (AWS, DigitalOcean, GCP, Bare-Metal):
+- **Deploy Control Plane** (behind cloud load balancer connected to managed PostgreSQL):
+  ```bash
+  docker compose -f docker-compose.cluster.yml --profile plane up -d
+  ```
+- **Deploy Standalone Edge PoP** on a VPS with a public IP (uses host networking for line-rate WireGuard performance):
+  ```bash
+  POP_CODE=KH REGION=Asia/Phnom_Penh PUBLIC_ENDPOINT=173.1.1.1:51820 \
+  docker compose -f docker-compose.cluster.yml --profile edge up -d
+  ```
+- **Deploy Ingress Gateway** with automatic TLS termination:
+  ```bash
+  docker compose -f docker-compose.cluster.yml --profile gateway up -d
+  ```
 
 ---
 
 ## Running Tests
 
 ```bash
+# Unit & integration tests
 go test -v -race ./...
+
+# End-to-end full mesh smoke test
+go test -v ./test/smoke/...
 ```
