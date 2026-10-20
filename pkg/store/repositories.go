@@ -300,9 +300,21 @@ func (r *tunnelRepo) GetByHostname(ctx context.Context, hostname string) (*core.
 	return &tunnel, nil
 }
 
+func (r *tunnelRepo) ListByHostname(ctx context.Context, hostname string) ([]core.Tunnel, error) {
+	var tunnels []core.Tunnel
+	err := r.db.WithContext(ctx).Where("public_hostname = ?", hostname).Find(&tunnels).Error
+	return tunnels, err
+}
+
 func (r *tunnelRepo) ListByNodeID(ctx context.Context, nodeID uuid.UUID) ([]core.Tunnel, error) {
 	var tunnels []core.Tunnel
 	err := r.db.WithContext(ctx).Where("node_id = ?", nodeID).Find(&tunnels).Error
+	return tunnels, err
+}
+
+func (r *tunnelRepo) ListAll(ctx context.Context) ([]core.Tunnel, error) {
+	var tunnels []core.Tunnel
+	err := r.db.WithContext(ctx).Find(&tunnels).Error
 	return tunnels, err
 }
 

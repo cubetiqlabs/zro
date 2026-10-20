@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -14,19 +16,22 @@ import (
 	"github.com/cubis/zro/pkg/control/ipam"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
+	"github.com/cubis/zro/pkg/gateway/balancer"
+	"github.com/cubis/zro/pkg/gateway/proxy"
 	"github.com/cubis/zro/pkg/store"
 	"github.com/google/uuid"
 )
 
 // Server is the HTTP/REST Control Plane API server for ZRO.
 type Server struct {
-	cfg        *config.ControlPlaneConfig
-	db         *store.DB
-	delegator  *delegation.Engine
-	ipamCache  map[string]*ipam.IPAM // network ID (16-hex) -> IPAM allocator
-	ipamMu     sync.RWMutex
-	httpServer *http.Server
-	mux        *http.ServeMux
+	cfg          *config.ControlPlaneConfig
+	db           *store.DB
+	delegator    *delegation.Engine
+	ipamCache    map[string]*ipam.IPAM // network ID (16-hex) -> IPAM allocator
+	ipamMu       sync.RWMutex
+	httpServer   *http.Server
+	mux          *http.ServeMux
+	gatewayProxy *proxy.Engine
 
 	// Notification subscribers for delta updates
 	subscribersMu sync.RWMutex
@@ -45,6 +50,10 @@ func NewServer(cfg *config.ControlPlaneConfig, db *store.DB) *Server {
 		ipamCache:   make(map[string]*ipam.IPAM),
 		mux:         mux,
 		subscribers: make(map[chan []byte]bool),
+	}
+
+	if cfg.EnableGateway {
+		s.gatewayProxy = proxy.NewEngine()
 	}
 
 	s.registerRoutes()
@@ -97,7 +106,12 @@ func (s *Server) registerRoutes() {
 
 	// Ingress & Tunneling
 	s.mux.HandleFunc("POST /api/v1/tunnels", s.handleRegisterTunnel)
+	s.mux.HandleFunc("GET /api/v1/gateway/routes", s.handleGetGatewayRoutes)
 	s.mux.HandleFunc("GET /api/v1/events", s.handleEventStream)
+
+	if s.cfg.EnableGateway {
+		s.mux.HandleFunc("/", s.handleGatewayFallback)
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -580,8 +594,12 @@ func (s *Server) handleRegisterTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.cfg.EnableGateway {
+		_ = s.syncInternalGateway(r.Context())
+	}
+
 	s.broadcastDelta(map[string]any{
-		"event":          "tunnel_registered",
+		"event":          "gateway_routes_updated",
 		"hostname":       tunnel.PublicHostname,
 		"local_address":  tunnel.LocalAddress,
 		"node_id":        tunnel.NodeID,
@@ -670,4 +688,128 @@ func (s *Server) getOrCreateIPAM(ctx context.Context, net *core.Network) (*ipam.
 
 	s.ipamCache[net.ID] = allocator
 	return allocator, nil
+}
+
+// GatewayBackendItem represents a single mesh node target for an exposed service.
+type GatewayBackendItem struct {
+	Address      string    `json:"address"` // e.g. "100.64.0.10:3000"
+	NodeID       uuid.UUID `json:"node_id"`
+	NodeHostname string    `json:"node_hostname"`
+	Weight       int       `json:"weight"`
+	Healthy      bool      `json:"healthy"`
+}
+
+// GatewayRouteItem represents a public hostname routed to a pool of mesh backends.
+type GatewayRouteItem struct {
+	Hostname string               `json:"hostname"`
+	Protocol string               `json:"protocol"`
+	Backends []GatewayBackendItem `json:"backends"`
+}
+
+// GatewayRoutesResponse returns all active routes for ingress gateways.
+type GatewayRoutesResponse struct {
+	Routes []GatewayRouteItem `json:"routes"`
+}
+
+func (s *Server) handleGetGatewayRoutes(w http.ResponseWriter, r *http.Request) {
+	routes, err := s.buildGatewayRoutes(r.Context())
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to build gateway routes: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(GatewayRoutesResponse{Routes: routes})
+}
+
+func (s *Server) buildGatewayRoutes(ctx context.Context) ([]GatewayRouteItem, error) {
+	tunnels, err := s.db.Tunnels.ListAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	routesMap := make(map[string]*GatewayRouteItem)
+
+	for _, t := range tunnels {
+		node, err := s.db.Nodes.GetByID(ctx, t.NodeID)
+		if err != nil || node == nil || !node.IsActive || node.OverlayIPv4 == "" {
+			continue
+		}
+
+		port := extractPort(t.LocalAddress)
+		targetAddr := net.JoinHostPort(node.OverlayIPv4, port)
+
+		route, exists := routesMap[t.PublicHostname]
+		if !exists {
+			proto := t.Protocol
+			if proto == "" {
+				proto = "http"
+			}
+			route = &GatewayRouteItem{
+				Hostname: t.PublicHostname,
+				Protocol: proto,
+				Backends: make([]GatewayBackendItem, 0, 2),
+			}
+			routesMap[t.PublicHostname] = route
+		}
+
+		route.Backends = append(route.Backends, GatewayBackendItem{
+			Address:      targetAddr,
+			NodeID:       node.ID,
+			NodeHostname: node.Hostname,
+			Weight:       100,
+			Healthy:      true,
+		})
+	}
+
+	res := make([]GatewayRouteItem, 0, len(routesMap))
+	for _, r := range routesMap {
+		res = append(res, *r)
+	}
+	return res, nil
+}
+
+func (s *Server) syncInternalGateway(ctx context.Context) error {
+	if s.gatewayProxy == nil {
+		return nil
+	}
+	routes, err := s.buildGatewayRoutes(ctx)
+	if err != nil {
+		return err
+	}
+	for _, r := range routes {
+		var bList []*balancer.Backend
+		for _, b := range r.Backends {
+			bList = append(bList, &balancer.Backend{
+				Address: b.Address,
+				Weight:  b.Weight,
+				Healthy: b.Healthy,
+			})
+		}
+		bal := balancer.NewBalancer(balancer.StrategyLatency, bList)
+		s.gatewayProxy.RegisterRoute(r.Hostname, bal)
+	}
+	return nil
+}
+
+func (s *Server) handleGatewayFallback(w http.ResponseWriter, r *http.Request) {
+	if s.gatewayProxy != nil {
+		s.gatewayProxy.ServeHTTP(w, r)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func extractPort(addr string) string {
+	if addr == "" {
+		return "80"
+	}
+	if _, err := strconv.Atoi(addr); err == nil {
+		return addr
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err == nil && port != "" {
+		return port
+	}
+	return "80"
 }

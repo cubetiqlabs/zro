@@ -70,6 +70,8 @@ type TunnelRepository interface {
 	Create(ctx context.Context, tunnel *Tunnel) error
 	GetByID(ctx context.Context, id uuid.UUID) (*Tunnel, error)
 	GetByHostname(ctx context.Context, hostname string) (*Tunnel, error)
+	ListByHostname(ctx context.Context, hostname string) ([]Tunnel, error)
 	ListByNodeID(ctx context.Context, nodeID uuid.UUID) ([]Tunnel, error)
+	ListAll(ctx context.Context) ([]Tunnel, error)
 	Delete(ctx context.Context, id uuid.UUID) error
 }

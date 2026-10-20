@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -22,14 +23,27 @@ type RouteMapping struct {
 
 // Engine serves as the core reverse proxy gateway.
 type Engine struct {
-	mu     sync.RWMutex
-	routes map[string]*balancer.Balancer // hostname -> balancer
+	mu        sync.RWMutex
+	routes    map[string]*balancer.Balancer // hostname -> balancer
+	Transport *http.Transport
 }
 
 // NewEngine creates a new reverse proxy gateway engine.
 func NewEngine() *Engine {
 	return &Engine{
 		routes: make(map[string]*balancer.Balancer),
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   5 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
 	}
 }
 
@@ -38,6 +52,25 @@ func (e *Engine) RegisterRoute(hostname string, bal *balancer.Balancer) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.routes[hostname] = bal
+}
+
+// GetRoute retrieves a balancer for a given hostname.
+func (e *Engine) GetRoute(hostname string) (*balancer.Balancer, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	b, ok := e.routes[hostname]
+	return b, ok
+}
+
+// ListRoutes returns a snapshot of all registered routes.
+func (e *Engine) ListRoutes() map[string]*balancer.Balancer {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	res := make(map[string]*balancer.Balancer, len(e.routes))
+	for k, v := range e.routes {
+		res[k] = v
+	}
+	return res
 }
 
 // UnregisterRoute removes a hostname mapping.
@@ -82,8 +115,12 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	if e.Transport != nil {
+		proxy.Transport = e.Transport
+	}
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
 		slog.Error("Proxy error forwarding to mesh backend", "backend", backend.Address, "error", proxyErr)
+		backend.Healthy = false // Instant failover mark
 		rw.WriteHeader(http.StatusBadGateway)
 		_, _ = rw.Write([]byte("502 Bad Gateway - Target mesh node unreachable\n"))
 	}
@@ -127,11 +164,25 @@ func (h *HealthChecker) Check(ctx context.Context, b *balancer.Backend, healthPa
 
 	start := time.Now()
 	resp, err := h.client.Do(req)
-	if err != nil || resp.StatusCode >= 500 {
+	if err != nil {
+		// Fallback to TCP dial probe
+		var d net.Dialer
+		conn, dialErr := d.DialContext(ctx, "tcp", b.Address)
+		if dialErr != nil {
+			b.Healthy = false
+			return false
+		}
+		_ = conn.Close()
+		b.Healthy = true
+		b.Latency = time.Since(start)
+		return true
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 500 {
 		b.Healthy = false
 		return false
 	}
-	_ = resp.Body.Close()
 
 	b.Healthy = true
 	b.Latency = time.Since(start)

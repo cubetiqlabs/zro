@@ -27,6 +27,7 @@ type ControlPlaneConfig struct {
 	DefaultCIDRv4  string `mapstructure:"default_cidr_v4"`
 	DefaultCIDRv6  string `mapstructure:"default_cidr_v6"`
 	SyncIntervalMs int    `mapstructure:"sync_interval_ms"`
+	EnableGateway  bool   `mapstructure:"enable_gateway"`
 }
 
 // EdgeConfig configures a global Edge Data Plane PoP.
@@ -64,14 +65,32 @@ type NodeConfig struct {
 	Tunnels         []LocalTunnelConfig `mapstructure:"tunnels"`
 }
 
+// StaticRouteConfig defines pre-configured upstream routes in zro.yaml.
+type StaticRouteConfig struct {
+	Hostname string   `mapstructure:"hostname"`
+	Strategy string   `mapstructure:"strategy"` // "round_robin", "least_conn", "latency"
+	Backends []string `mapstructure:"backends"` // e.g. ["100.64.0.10:3000", "100.64.0.11:3000"]
+}
+
 // GatewayConfig configures the reverse proxy and cloud-native load balancer.
 type GatewayConfig struct {
-	ListenHTTP   string `mapstructure:"listen_http"`
-	ListenHTTPS  string `mapstructure:"listen_https"`
-	AutoTLS      bool   `mapstructure:"auto_tls"`
-	Domain       string `mapstructure:"domain"`
-	CertDir      string `mapstructure:"cert_dir"`
-	DefaultPoP   string `mapstructure:"default_pop"`
+	Hostname              string              `mapstructure:"hostname"`
+	PlaneEndpoint         string              `mapstructure:"plane_endpoint"`
+	EnrollmentToken       string              `mapstructure:"enrollment_token"`
+	NetworkID             string              `mapstructure:"network_id"`
+	InterfaceName         string              `mapstructure:"interface_name"`
+	MTU                   int                 `mapstructure:"mtu"`
+	Strategy              string              `mapstructure:"strategy"` // "round_robin", "least_conn", "latency"
+	HealthCheckPath       string              `mapstructure:"health_check_path"`
+	HealthCheckIntervalMs int                 `mapstructure:"health_check_interval_ms"`
+	SyncIntervalMs        int                 `mapstructure:"sync_interval_ms"`
+	ListenHTTP            string              `mapstructure:"listen_http"`
+	ListenHTTPS           string              `mapstructure:"listen_https"`
+	AutoTLS               bool                `mapstructure:"auto_tls"`
+	Domain                string              `mapstructure:"domain"`
+	CertDir               string              `mapstructure:"cert_dir"`
+	DefaultPoP            string              `mapstructure:"default_pop"`
+	StaticRoutes          []StaticRouteConfig `mapstructure:"static_routes"`
 }
 
 // Load loads configuration from an optional file path and merges with environment variables.
@@ -91,6 +110,7 @@ func Load(cfgFile string) (*AppConfig, error) {
 	v.SetDefault("control_plane.default_cidr_v4", "100.64.0.0/10")
 	v.SetDefault("control_plane.default_cidr_v6", "fd00:cafe::/64")
 	v.SetDefault("control_plane.sync_interval_ms", 1000)
+	v.SetDefault("control_plane.enable_gateway", false)
 
 	// Edge defaults
 	v.SetDefault("edge.pop_code", "KH")
@@ -109,6 +129,14 @@ func Load(cfgFile string) (*AppConfig, error) {
 	v.SetDefault("node.plane_endpoint", "https://zro-plane.cubis.tech:443")
 
 	// Gateway defaults
+	v.SetDefault("gateway.hostname", "gw1")
+	v.SetDefault("gateway.plane_endpoint", "https://zro-plane.cubis.tech:443")
+	v.SetDefault("gateway.interface_name", "zro-gw")
+	v.SetDefault("gateway.mtu", 1420)
+	v.SetDefault("gateway.strategy", "latency")
+	v.SetDefault("gateway.health_check_path", "/health")
+	v.SetDefault("gateway.health_check_interval_ms", 3000)
+	v.SetDefault("gateway.sync_interval_ms", 3000)
 	v.SetDefault("gateway.listen_http", ":80")
 	v.SetDefault("gateway.listen_https", ":443")
 	v.SetDefault("gateway.auto_tls", false)

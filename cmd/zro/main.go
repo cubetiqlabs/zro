@@ -17,9 +17,7 @@ import (
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/edge"
-	"github.com/cubis/zro/pkg/gateway/acme"
-	"github.com/cubis/zro/pkg/gateway/balancer"
-	"github.com/cubis/zro/pkg/gateway/proxy"
+	"github.com/cubis/zro/pkg/gateway"
 	"github.com/cubis/zro/pkg/node"
 	"github.com/cubis/zro/pkg/store"
 	"github.com/cubis/zro/pkg/tunnel"
@@ -59,13 +57,19 @@ func main() {
 }
 
 func newPlaneCmd() *cobra.Command {
-	return &cobra.Command{
+	var enableGatewayFlag bool
+
+	cmd := &cobra.Command{
 		Use:   "plane",
 		Short: "Run the ZRO Control Plane API server",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(cfgFile)
 			if err != nil {
 				return err
+			}
+
+			if enableGatewayFlag {
+				cfg.ControlPlane.EnableGateway = true
 			}
 
 			slog.Info("Initializing Control Plane database", "driver", cfg.ControlPlane.DatabaseDriver)
@@ -92,6 +96,9 @@ func newPlaneCmd() *cobra.Command {
 			return srv.Shutdown(shutdownCtx)
 		},
 	}
+
+	cmd.Flags().BoolVar(&enableGatewayFlag, "enable-gateway", false, "Enable in-process Ingress Gateway on Control Plane")
+	return cmd
 }
 
 func newEdgeCmd() *cobra.Command {
@@ -180,7 +187,10 @@ func newNodeCmd() *cobra.Command {
 }
 
 func newGatewayCmd() *cobra.Command {
-	return &cobra.Command{
+	var planeFlag, tokenFlag, hostnameFlag string
+	var listenHTTPFlag, listenHTTPSFlag string
+
+	cmd := &cobra.Command{
 		Use:   "gw",
 		Short: "Run the Cloud-Native Ingress Gateway and Load Balancer",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -189,63 +199,46 @@ func newGatewayCmd() *cobra.Command {
 				return err
 			}
 
-			proxyEngine := proxy.NewEngine()
-
-			// Configure test reverse proxy route if specified
-			if cfg.Gateway.Domain != "" {
-				backends := []*balancer.Backend{
-					{Address: "127.0.0.1:8080", Healthy: true, Weight: 10},
-				}
-				bal := balancer.NewBalancer(balancer.StrategyRoundRobin, backends)
-				proxyEngine.RegisterRoute(cfg.Gateway.Domain, bal)
+			if planeFlag != "" {
+				cfg.Gateway.PlaneEndpoint = planeFlag
+			}
+			if tokenFlag != "" {
+				cfg.Gateway.EnrollmentToken = tokenFlag
+			}
+			if hostnameFlag != "" {
+				cfg.Gateway.Hostname = hostnameFlag
+			}
+			if listenHTTPFlag != "" {
+				cfg.Gateway.ListenHTTP = listenHTTPFlag
+			}
+			if listenHTTPSFlag != "" {
+				cfg.Gateway.ListenHTTPS = listenHTTPSFlag
 			}
 
-			// Automated ACME TLS termination if enabled
-			if cfg.Gateway.AutoTLS && cfg.Gateway.Domain != "" {
-				acmeMgr, err := acme.NewManager(acme.Config{
-					Enabled: true,
-					Domains: []string{cfg.Gateway.Domain},
-					CertDir: cfg.Gateway.CertDir,
-				})
-				if err == nil {
-					httpsServer := &http.Server{
-						Addr:         cfg.Gateway.ListenHTTPS,
-						Handler:      proxyEngine,
-						TLSConfig:    acmeMgr.TLSConfig(),
-						ReadTimeout:  15 * time.Second,
-						WriteTimeout: 15 * time.Second,
-					}
-					go func() {
-						slog.Info("ZRO Ingress Gateway HTTPS listening with AutoTLS", "addr", cfg.Gateway.ListenHTTPS, "domain", cfg.Gateway.Domain)
-						_ = httpsServer.ListenAndServeTLS("", "")
-					}()
-				}
-			}
-
-			httpServer := &http.Server{
-				Addr:         cfg.Gateway.ListenHTTP,
-				Handler:      proxyEngine,
-				ReadTimeout:  15 * time.Second,
-				WriteTimeout: 15 * time.Second,
+			gwDaemon, err := gateway.NewDaemon(&cfg.Gateway)
+			if err != nil {
+				return err
 			}
 
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 
-			go func() {
-				slog.Info("ZRO Ingress Gateway listening", "addr", cfg.Gateway.ListenHTTP)
-				if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-					slog.Error("Gateway server error", "error", err)
-				}
-			}()
+			if err := gwDaemon.Start(ctx); err != nil {
+				return err
+			}
 
 			<-ctx.Done()
 			slog.Info("Stopping Ingress Gateway...")
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			return httpServer.Shutdown(shutdownCtx)
+			return gwDaemon.Stop()
 		},
 	}
+
+	cmd.Flags().StringVar(&planeFlag, "plane", "", "Control Plane API URL")
+	cmd.Flags().StringVar(&tokenFlag, "token", "", "Enrollment token")
+	cmd.Flags().StringVar(&hostnameFlag, "hostname", "", "Gateway hostname")
+	cmd.Flags().StringVar(&listenHTTPFlag, "listen-http", "", "HTTP listen address")
+	cmd.Flags().StringVar(&listenHTTPSFlag, "listen-https", "", "HTTPS listen address")
+	return cmd
 }
 
 func newKeygenCmd() *cobra.Command {

@@ -49,11 +49,41 @@ func NewBalancer(strategy Strategy, backends []*Backend) *Balancer {
 	}
 }
 
-// UpdateBackends updates the backend pool.
+// UpdateBackends updates the backend pool while preserving state of existing backends.
 func (b *Balancer) UpdateBackends(backends []*Backend) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	existing := make(map[string]*Backend)
+	for _, old := range b.backends {
+		existing[old.Address] = old
+	}
+
+	for _, nb := range backends {
+		if old, ok := existing[nb.Address]; ok {
+			nb.Healthy = old.Healthy
+			nb.Latency = old.Latency
+			atomic.StoreInt64(&nb.ActiveConns, atomic.LoadInt64(&old.ActiveConns))
+		}
+	}
+
 	b.backends = backends
+}
+
+// GetBackends returns a snapshot of all backends.
+func (b *Balancer) GetBackends() []*Backend {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	res := make([]*Backend, len(b.backends))
+	copy(res, b.backends)
+	return res
+}
+
+// Strategy returns the configured balancing strategy.
+func (b *Balancer) Strategy() Strategy {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.strategy
 }
 
 // Pick selects a backend according to the chosen strategy.

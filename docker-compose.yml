@@ -96,7 +96,7 @@ services:
     networks:
       - zro-mesh
 
-  # Ingress Gateway & Load Balancer
+  # Ingress Gateway & Load Balancer 1 (gw1)
   zro-gw:
     build:
       context: .
@@ -109,10 +109,34 @@ services:
         condition: service_healthy
     environment:
       ZRO_MODE: gw
+      ZRO_GATEWAY_HOSTNAME: "gw1"
+      ZRO_GATEWAY_PLANE_ENDPOINT: "http://zro-plane:8443"
       ZRO_GATEWAY_LISTEN_HTTP: ":80"
       ZRO_GATEWAY_DOMAIN: "app.cubis.internal"
     ports:
       - "${GATEWAY_PORT:-8080}:80"
+    networks:
+      - zro-mesh
+
+  # Ingress Gateway & Load Balancer 2 (gw2 for HA clustering / failover)
+  zro-gw2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zro-gw2
+    restart: unless-stopped
+    command: ["gw"]
+    depends_on:
+      zro-plane:
+        condition: service_healthy
+    environment:
+      ZRO_MODE: gw
+      ZRO_GATEWAY_HOSTNAME: "gw2"
+      ZRO_GATEWAY_PLANE_ENDPOINT: "http://zro-plane:8443"
+      ZRO_GATEWAY_LISTEN_HTTP: ":80"
+      ZRO_GATEWAY_DOMAIN: "app.cubis.internal"
+    ports:
+      - "${GATEWAY_PORT_2:-8081}:80"
     networks:
       - zro-mesh
 

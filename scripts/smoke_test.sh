@@ -179,7 +179,51 @@ else
     exit 1
 fi
 
-# Step 9: Gateway Status
+# Step 9: Multi-Node Clustered Service Exposure (Cloudflared-style Tunnels)
+echo -n "Registering multi-node clustered tunnels for myapp-api.example.com (Node 1 & Node 2)... "
+TUNNEL1_PAYLOAD=$(cat <<EOF
+{
+  "node_id": "$NODE1_ID",
+  "name": "myapp-api-node1",
+  "local_address": "127.0.0.1:3000",
+  "public_hostname": "myapp-api.example.com",
+  "protocol": "http"
+}
+EOF
+)
+TUN1_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$TUNNEL1_PAYLOAD" "$PLANE_URL/api/v1/tunnels")
+
+TUNNEL2_PAYLOAD=$(cat <<EOF
+{
+  "node_id": "$NODE2_ID",
+  "name": "myapp-api-node2",
+  "local_address": "127.0.0.1:3000",
+  "public_hostname": "myapp-api.example.com",
+  "protocol": "http"
+}
+EOF
+)
+TUN2_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$TUNNEL2_PAYLOAD" "$PLANE_URL/api/v1/tunnels")
+
+if [ "$TUN1_CODE" -eq 201 ] && [ "$TUN2_CODE" -eq 201 ]; then
+    echo -e "${GREEN}OK (Clustered Tunnels Registered)${NC}"
+else
+    echo -e "${RED}FAILED: Tunnel registration rejected (Node1: $TUN1_CODE, Node2: $TUN2_CODE)${NC}"
+    exit 1
+fi
+
+# Step 10: Control Plane Gateway Dynamic Routes Aggregation
+echo -n "Fetching aggregated dynamic routes for Ingress Gateways ($PLANE_URL/api/v1/gateway/routes)... "
+GW_ROUTES_RESP=$(curl -s "$PLANE_URL/api/v1/gateway/routes")
+if echo "$GW_ROUTES_RESP" | grep -q "myapp-api.example.com" && echo "$GW_ROUTES_RESP" | grep -q "$NODE1_IP" && echo "$GW_ROUTES_RESP" | grep -q "$NODE2_IP"; then
+    echo -e "${GREEN}OK (Aggregated backends: $NODE1_IP:3000, $NODE2_IP:3000)${NC}"
+else
+    echo -e "${RED}FAILED: Dynamic routes missing cluster backends${NC}"
+    echo "$GW_ROUTES_RESP"
+    exit 1
+fi
+
+# Step 11: Gateway Status & Route Verification
 echo -n "Checking Ingress Gateway ($GW_URL)... "
 GW_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$GW_URL" || true)
 if [ "$GW_CODE" -ne 000 ]; then
