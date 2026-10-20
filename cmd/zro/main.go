@@ -95,13 +95,33 @@ func newPlaneCmd() *cobra.Command {
 }
 
 func newEdgeCmd() *cobra.Command {
-	return &cobra.Command{
+	var endpointFlag, popCodeFlag, planeFlag string
+	var listenPortFlag int
+	var usePrivateIPFlag bool
+
+	cmd := &cobra.Command{
 		Use:   "edge",
 		Short: "Run the ZRO Edge Data Plane PoP",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(cfgFile)
 			if err != nil {
 				return err
+			}
+
+			if endpointFlag != "" {
+				cfg.Edge.PublicEndpoint = endpointFlag
+			}
+			if usePrivateIPFlag {
+				cfg.Edge.UsePrivateIP = true
+			}
+			if listenPortFlag > 0 {
+				cfg.Edge.ListenPort = listenPortFlag
+			}
+			if popCodeFlag != "" {
+				cfg.Edge.PoPCode = popCodeFlag
+			}
+			if planeFlag != "" {
+				cfg.Edge.PlaneEndpoint = planeFlag
 			}
 
 			pop, err := edge.NewPoPDaemon(&cfg.Edge)
@@ -121,6 +141,13 @@ func newEdgeCmd() *cobra.Command {
 			return pop.Stop()
 		},
 	}
+
+	cmd.Flags().StringVar(&endpointFlag, "endpoint", "", "Edge public/private endpoint ('auto', 'private', or host:port)")
+	cmd.Flags().BoolVar(&usePrivateIPFlag, "private-ip", false, "Force using local private IP for internal/standalone testing")
+	cmd.Flags().IntVarP(&listenPortFlag, "port", "p", 0, "Edge UDP listen port")
+	cmd.Flags().StringVar(&popCodeFlag, "pop-code", "", "Edge PoP code (e.g. KH, SG, US)")
+	cmd.Flags().StringVar(&planeFlag, "plane", "", "Control Plane API URL")
+	return cmd
 }
 
 func newNodeCmd() *cobra.Command {

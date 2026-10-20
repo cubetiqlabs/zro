@@ -17,6 +17,7 @@ import (
 	"github.com/cubis/zro/pkg/dataplane/derp"
 	"github.com/cubis/zro/pkg/dataplane/router"
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
+	"github.com/cubis/zro/pkg/netutil"
 	"github.com/cubis/zro/pkg/p2p/stun"
 )
 
@@ -60,6 +61,14 @@ func NewPoPDaemon(cfg *config.EdgeConfig) (*PoPDaemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to init wireguard manager: %w", err)
 	}
+
+	// Resolve public or private endpoint dynamically (auto discovery, env override, or internal mode)
+	resolvedEndpoint := netutil.ResolveEndpoint(cfg.PublicEndpoint, cfg.ListenPort, cfg.UsePrivateIP)
+	slog.Info("Edge endpoint configuration resolved",
+		"configured", cfg.PublicEndpoint,
+		"resolved", resolvedEndpoint,
+		"use_private_ip", cfg.UsePrivateIP)
+	cfg.PublicEndpoint = resolvedEndpoint
 
 	return &PoPDaemon{
 		cfg:          cfg,

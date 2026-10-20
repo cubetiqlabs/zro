@@ -8,6 +8,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-zro}
+      PGDATA: /var/lib/postgresql/docker/18
     volumes:
       - pgdata:/var/lib/postgresql/docker/18
     healthcheck:
@@ -64,7 +65,7 @@ services:
       ZRO_MODE: edge
       ZRO_EDGE_POP_CODE: "KH"
       ZRO_EDGE_REGION: "Asia/Phnom_Penh"
-      ZRO_EDGE_PUBLIC_ENDPOINT: "173.1.1.1:51820"
+      ZRO_EDGE_PUBLIC_ENDPOINT: "${ZRO_EDGE_KH_ENDPOINT:-auto}"
       ZRO_EDGE_LISTEN_PORT: 51820
       ZRO_EDGE_PLANE_ENDPOINT: "http://zro-plane:8443"
     ports:
@@ -87,7 +88,7 @@ services:
       ZRO_MODE: edge
       ZRO_EDGE_POP_CODE: "SG"
       ZRO_EDGE_REGION: "Asia/Singapore"
-      ZRO_EDGE_PUBLIC_ENDPOINT: "123.1.1.1:51821"
+      ZRO_EDGE_PUBLIC_ENDPOINT: "${ZRO_EDGE_SG_ENDPOINT:-auto}"
       ZRO_EDGE_LISTEN_PORT: 51821
       ZRO_EDGE_PLANE_ENDPOINT: "http://zro-plane:8443"
     ports:

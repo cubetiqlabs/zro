@@ -33,12 +33,13 @@ type ControlPlaneConfig struct {
 type EdgeConfig struct {
 	PoPCode             string `mapstructure:"pop_code"`        // "KH", "SG", "US", "HK", "DE"
 	Region              string `mapstructure:"region"`
-	PublicEndpoint      string `mapstructure:"public_endpoint"` // "173.1.1.1:51820"
+	PublicEndpoint      string `mapstructure:"public_endpoint"` // "auto", "private", or "173.1.1.1:51820"
 	ListenPort          int    `mapstructure:"listen_port"`
 	WireGuardPrivateKey string `mapstructure:"wireguard_private_key"`
 	PlaneEndpoint       string `mapstructure:"plane_endpoint"`
 	EdgeAPIKey          string `mapstructure:"edge_api_key"`
 	IsAnycast           bool   `mapstructure:"is_anycast"`
+	UsePrivateIP        bool   `mapstructure:"use_private_ip"`
 }
 
 // LocalTunnelConfig defines a service exposed by a node.
@@ -95,7 +96,8 @@ func Load(cfgFile string) (*AppConfig, error) {
 	v.SetDefault("edge.pop_code", "KH")
 	v.SetDefault("edge.region", "Asia/Phnom_Penh")
 	v.SetDefault("edge.listen_port", 51820)
-	v.SetDefault("edge.public_endpoint", "173.1.1.1:51820")
+	v.SetDefault("edge.public_endpoint", "auto")
+	v.SetDefault("edge.use_private_ip", false)
 	v.SetDefault("edge.plane_endpoint", "https://zro-plane.cubis.tech:443")
 	v.SetDefault("edge.is_anycast", false)
 
