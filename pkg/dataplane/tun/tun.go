@@ -128,9 +128,15 @@ func (m *MemoryDevice) EjectPacket() ([]byte, error) {
 	return pkt, nil
 }
 
+var ensureDevNetTun func()
+
 // CreateTUN attempts to create a real kernel TUN adapter.
 // If running without root/admin privileges, it gracefully falls back to MemoryDevice.
 func CreateTUN(name string, mtu int) (Device, error) {
+	if ensureDevNetTun != nil {
+		ensureDevNetTun()
+	}
+
 	if mtu <= 0 {
 		mtu = 1420
 	}

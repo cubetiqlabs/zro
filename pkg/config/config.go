@@ -28,6 +28,7 @@ type ControlPlaneConfig struct {
 	DefaultCIDRv6  string `mapstructure:"default_cidr_v6"`
 	SyncIntervalMs int    `mapstructure:"sync_interval_ms"`
 	EnableGateway  bool   `mapstructure:"enable_gateway"`
+	GRPCListenAddr string `mapstructure:"grpc_listen_addr"`
 }
 
 // EdgeConfig configures a global Edge Data Plane PoP.
@@ -111,6 +112,7 @@ func Load(cfgFile string) (*AppConfig, error) {
 	v.SetDefault("control_plane.default_cidr_v6", "fd00:cafe::/64")
 	v.SetDefault("control_plane.sync_interval_ms", 1000)
 	v.SetDefault("control_plane.enable_gateway", false)
+	v.SetDefault("control_plane.grpc_listen_addr", ":9443")
 
 	// Edge defaults
 	v.SetDefault("edge.pop_code", "KH")

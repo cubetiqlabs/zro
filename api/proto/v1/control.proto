@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package zro.control.v1;
+
+option go_package = "github.com/cubis/zro/api/proto/v1;v1";
+
+// ControlPlaneService coordinates global mesh routing, enrollment, dynamic routes, and real-time events.
+service ControlPlaneService {
+  // Enrolls a node, edge, or gateway with cryptographic token verification
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+
+  // High-frequency telemetry intake for smart routing
+  rpc ReportProbes(ProbeReportRequest) returns (ProbeReportResponse);
+
+  // Real-time P2P coordination and NAT hole punching signal exchange
+  rpc DiscoverP2P(P2PDiscoverRequest) returns (P2PDiscoverResponse);
+
+  // Mesh topology synchronization for Edge Data Plane
+  rpc SyncEdgeMesh(EdgeSyncRequest) returns (EdgeSyncResponse);
+
+  // Dynamic route discovery for Ingress Gateways
+  rpc GetGatewayRoutes(GatewayRoutesRequest) returns (GatewayRoutesResponse);
+
+  // Real-time bidirectional/streaming event bus for instant updates (zero polling)
+  rpc StreamMeshEvents(StreamEventsRequest) returns (stream MeshEvent);
+}
+
+message LatencyProbe {
+  string pop_code = 1;
+  int64 rtt_ns = 2;
+  double packet_loss = 3;
+}
+
+message EnrollRequest {
+  string token = 1;
+  string public_key = 2;
+  string hostname = 3;
+  string node_type = 4;
+  repeated string tags = 5;
+  repeated string endpoints = 6;
+  repeated LatencyProbe probes = 7;
+}
+
+message EdgePoP {
+  string id = 1;
+  string pop_code = 2;
+  string region = 3;
+  string public_endpoint = 4;
+  string public_key = 5;
+  bool is_anycast = 6;
+  int32 weight = 7;
+}
+
+message Node {
+  string id = 1;
+  string hostname = 2;
+  string public_key = 3;
+  string overlay_ipv4 = 4;
+  string overlay_ipv6 = 5;
+  string node_type = 6;
+  repeated string tags = 7;
+  repeated string allowed_ips = 8;
+  repeated string endpoints = 9;
+}
+
+message EnrollResponse {
+  string node_id = 1;
+  string network_id = 2;
+  string overlay_ipv4 = 3;
+  string overlay_ipv6 = 4;
+  string dns_domain = 5;
+  int32 mtu = 6;
+  EdgePoP primary_pop = 7;
+  EdgePoP secondary_pop = 8;
+  repeated Node peers = 9;
+}
+
+message ProbeReportRequest {
+  string node_id = 1;
+  string pop_code = 2;
+  int64 rtt_ns = 3;
+  double packet_loss = 4;
+}
+
+message ProbeReportResponse {
+  bool accepted = 1;
+  string primary_pop_code = 2;
+}
+
+message P2PDiscoverRequest {
+  string initiator_node_id = 1;
+  string target_overlay_ip = 2;
+  repeated string initiator_endpoints = 3;
+}
+
+message P2PDiscoverResponse {
+  string target_node_id = 1;
+  string target_hostname = 2;
+  string target_public_key = 3;
+  string target_overlay_ipv4 = 4;
+  repeated string target_endpoints = 5;
+  EdgePoP primary_pop = 6;
+}
+
+message EdgeSyncRequest {
+  string pop_code = 1;
+}
+
+message EdgeSyncResponse {
+  repeated EdgePoP pops = 1;
+  repeated Node nodes = 2;
+}
+
+message GatewayRoutesRequest {
+  string gateway_hostname = 1;
+}
+
+message GatewayBackend {
+  string address = 1;
+  string node_id = 2;
+  string node_hostname = 3;
+  int32 weight = 4;
+  bool healthy = 5;
+}
+
+message GatewayRoute {
+  string hostname = 1;
+  string protocol = 2;
+  repeated GatewayBackend backends = 3;
+}
+
+message GatewayRoutesResponse {
+  repeated GatewayRoute routes = 1;
+}
+
+message StreamEventsRequest {
+  string subscriber_id = 1;
+  string role = 2;
+}
+
+message MeshEvent {
+  string event_type = 1;
+  int64 timestamp = 2;
+  string payload_json = 3;
+}

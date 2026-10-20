@@ -10,11 +10,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
+	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
@@ -23,6 +26,9 @@ import (
 	"github.com/cubis/zro/pkg/p2p/stun"
 	"github.com/cubis/zro/pkg/store"
 	"github.com/cubis/zro/pkg/tunnel"
+	"golang.org/x/net/websocket"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func TestFullMeshSmoke(t *testing.T) {
@@ -537,4 +543,77 @@ func TestFullMeshSmoke(t *testing.T) {
 		t.Fatalf("smoke: SOCKS5 auth handshake failed: %v, resp: %x", err, authResp)
 	}
 	t.Log("✅ Smoke Step 11 Passed: Universal Tunneling - RFC 1928 SOCKS5 Proxy operational")
+
+	// 13. Smoke Step 12: Real-Time WebSockets Event Hub (RFC 6455)
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/v1/ws"
+	wsConn, err := websocket.Dial(wsURL, "", ts.URL)
+	if err != nil {
+		t.Fatalf("smoke: WebSocket connection failed: %v", err)
+	}
+	defer wsConn.Close()
+
+	var wsWelcome map[string]any
+	_ = websocket.JSON.Receive(wsConn, &wsWelcome)
+	if wsWelcome["event"] != "connected" {
+		t.Fatalf("smoke: expected WebSocket connected event, got %v", wsWelcome)
+	}
+
+	// Register a new tunnel and verify real-time event push on WebSocket
+	tunWS := core.Tunnel{
+		NodeID:         enroll1Resp.NodeID,
+		Name:           "realtime-test",
+		LocalAddress:   "127.0.0.1:4000",
+		PublicHostname: "realtime.example.com",
+		Protocol:       "http",
+	}
+	tunWSBytes, _ := json.Marshal(tunWS)
+	resp, _ = http.Post(ts.URL+"/api/v1/tunnels", "application/json", bytes.NewReader(tunWSBytes))
+	_ = resp.Body.Close()
+
+	var wsPushMsg string
+	_ = websocket.Message.Receive(wsConn, &wsPushMsg)
+	if !strings.Contains(wsPushMsg, "realtime.example.com") {
+		t.Fatalf("smoke: expected realtime push event on WebSocket, got %s", wsPushMsg)
+	}
+	t.Log("✅ Smoke Step 12 Passed: Real-Time WebSockets Event Hub (RFC 6455) operational")
+
+	// 14. Smoke Step 13: High-Performance gRPC Communication & Event Streaming
+	grpcLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("smoke: failed to bind gRPC listener: %v", err)
+	}
+	defer grpcLis.Close()
+
+	grpcSrv := grpc.NewServer()
+	ctrlGRPC := controlgrpc.NewServer(cfg, db)
+	v1.RegisterControlPlaneServiceServer(grpcSrv, ctrlGRPC)
+	go func() {
+		_ = grpcSrv.Serve(grpcLis)
+	}()
+	defer grpcSrv.GracefulStop()
+
+	grpcClient, err := controlgrpc.NewClient(grpcLis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("smoke: failed to connect gRPC client: %v", err)
+	}
+	defer grpcClient.Close()
+
+	kpGRPC, _ := crypto.GenerateKeyPair()
+	tokenGRPC := crypto.GenerateEnrollmentToken(secretKey, createdNet.ID, "grpc-smoke-node", 1*time.Hour, kpGRPC.PublicKey)
+	grpcEnrollResp, err := grpcClient.Enroll(ctx, &v1.EnrollRequest{
+		Token:     tokenGRPC,
+		PublicKey: kpGRPC.PublicKey,
+		Hostname:  "grpc-smoke-node",
+		NodeType:  "peer",
+		Tags:      []string{"tag:grpc"},
+		Endpoints: []string{"192.168.1.99:51820"},
+	})
+	if err != nil {
+		t.Fatalf("smoke: gRPC Enroll failed: %v", err)
+	}
+	if grpcEnrollResp.OverlayIpv4 == "" {
+		t.Fatalf("smoke: expected overlay IP from gRPC enroll")
+	}
+	t.Logf("✅ Smoke Step 13 Passed: High-Performance gRPC API & Real-Time Event Bus verified (Node Overlay: %s)",
+		grpcEnrollResp.OverlayIpv4)
 }

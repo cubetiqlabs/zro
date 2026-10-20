@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
 	"github.com/cubis/zro/pkg/netutil"
 	"github.com/cubis/zro/pkg/p2p/stun"
+	"golang.org/x/net/websocket"
 )
 
 // PoPDaemon is the edge data plane daemon running at public PoPs.
@@ -126,6 +128,10 @@ func (e *PoPDaemon) Start(ctx context.Context) error {
 	// Launch Control Plane config synchronization and registration loop
 	e.wg.Add(1)
 	go e.syncWorker(ctx)
+
+	// Launch real-time event listener for instant mesh updates
+	e.wg.Add(1)
+	go e.realtimeListener(ctx)
 
 	return nil
 }
@@ -286,4 +292,55 @@ func (e *PoPDaemon) syncMeshTopology(ctx context.Context) {
 // PublicKey returns the Edge PoP WireGuard public key.
 func (e *PoPDaemon) PublicKey() string {
 	return e.keyPair.PublicKey
+}
+
+func (e *PoPDaemon) realtimeListener(ctx context.Context) {
+	defer e.wg.Done()
+
+	wsURL := e.cfg.PlaneEndpoint + "/api/v1/ws"
+	if strings.HasPrefix(wsURL, "https://") {
+		wsURL = "wss://" + strings.TrimPrefix(wsURL, "https://")
+	} else if strings.HasPrefix(wsURL, "http://") {
+		wsURL = "ws://" + strings.TrimPrefix(wsURL, "http://")
+	}
+
+	origin := e.cfg.PlaneEndpoint
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			conn, err := websocket.Dial(wsURL, "", origin)
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+					continue
+				}
+			}
+
+			slog.Info("Edge PoP connected to Control Plane real-time WebSocket stream", "pop_code", e.cfg.PoPCode, "url", wsURL)
+
+			for {
+				var raw string
+				err := websocket.Message.Receive(conn, &raw)
+				if err != nil {
+					_ = conn.Close()
+					break
+				}
+
+				var evt struct {
+					Event string `json:"event"`
+				}
+				if err := json.Unmarshal([]byte(raw), &evt); err == nil {
+					if evt.Event == "node_enrolled" || evt.Event == "pop_registered" || evt.Event == "edge_sync" || evt.Event == "delta" {
+						slog.Info("Real-time topology update event received at Edge PoP", "pop_code", e.cfg.PoPCode, "event", evt.Event)
+						e.syncMeshTopology(ctx)
+					}
+				}
+			}
+		}
+	}
 }

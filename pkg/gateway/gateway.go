@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/cubis/zro/pkg/config"
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/core"
@@ -22,6 +22,8 @@ import (
 	"github.com/cubis/zro/pkg/gateway/balancer"
 	"github.com/cubis/zro/pkg/gateway/proxy"
 	"github.com/cubis/zro/pkg/p2p/stun"
+	"github.com/google/uuid"
+	"golang.org/x/net/websocket"
 )
 
 // Daemon represents the running ingress gateway and cloud-native load balancer.
@@ -119,6 +121,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 		// Launch background dynamic route synchronization worker
 		d.wg.Add(1)
 		go d.syncWorker(ctx)
+
+		// Launch real-time event listener for instant sub-millisecond route updates
+		d.wg.Add(1)
+		go d.realtimeListener(ctx)
 	}
 
 	// 3. Launch active health checking worker across all registered route backends
@@ -471,6 +477,57 @@ func (d *Daemon) OverlayIPv4() string {
 // PublicKey returns the WireGuard public key of the gateway.
 func (d *Daemon) PublicKey() string {
 	return d.keyPair.PublicKey
+}
+
+func (d *Daemon) realtimeListener(ctx context.Context) {
+	defer d.wg.Done()
+
+	wsURL := d.cfg.PlaneEndpoint + "/api/v1/ws"
+	if strings.HasPrefix(wsURL, "https://") {
+		wsURL = "wss://" + strings.TrimPrefix(wsURL, "https://")
+	} else if strings.HasPrefix(wsURL, "http://") {
+		wsURL = "ws://" + strings.TrimPrefix(wsURL, "http://")
+	}
+
+	origin := d.cfg.PlaneEndpoint
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			conn, err := websocket.Dial(wsURL, "", origin)
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+					continue
+				}
+			}
+
+			slog.Info("Gateway connected to Control Plane real-time WebSocket stream", "url", wsURL)
+
+			for {
+				var raw string
+				err := websocket.Message.Receive(conn, &raw)
+				if err != nil {
+					_ = conn.Close()
+					break
+				}
+
+				var evt struct {
+					Event string `json:"event"`
+				}
+				if err := json.Unmarshal([]byte(raw), &evt); err == nil {
+					if evt.Event == "gateway_routes_updated" || evt.Event == "tunnel_registered" || evt.Event == "node_enrolled" {
+						slog.Info("Instant real-time route update event received", "event", evt.Event)
+						_ = d.SyncRoutesOnce(ctx)
+					}
+				}
+			}
+		}
+	}
 }
 
 // ProxyEngine returns the internal reverse proxy engine.

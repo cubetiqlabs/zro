@@ -11,15 +11,19 @@ import (
 	"sync"
 	"time"
 
+	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
 	"github.com/cubis/zro/pkg/control/delegation"
+	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
 	"github.com/cubis/zro/pkg/control/ipam"
+	"github.com/cubis/zro/pkg/control/ws"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/gateway/balancer"
 	"github.com/cubis/zro/pkg/gateway/proxy"
 	"github.com/cubis/zro/pkg/store"
 	"github.com/google/uuid"
+	"google.golang.org/grpc"
 )
 
 // Server is the HTTP/REST Control Plane API server for ZRO.
@@ -32,6 +36,12 @@ type Server struct {
 	httpServer   *http.Server
 	mux          *http.ServeMux
 	gatewayProxy *proxy.Engine
+
+	// High-performance Realtime Communication
+	wsHub      *ws.Hub
+	grpcServer *grpc.Server
+	grpcCtrl   *controlgrpc.Server
+	grpcLis    net.Listener
 
 	// Notification subscribers for delta updates
 	subscribersMu sync.RWMutex
@@ -50,6 +60,8 @@ func NewServer(cfg *config.ControlPlaneConfig, db *store.DB) *Server {
 		ipamCache:   make(map[string]*ipam.IPAM),
 		mux:         mux,
 		subscribers: make(map[chan []byte]bool),
+		wsHub:       ws.NewHub(),
+		grpcCtrl:    controlgrpc.NewServer(cfg, db),
 	}
 
 	if cfg.EnableGateway {
@@ -62,6 +74,22 @@ func NewServer(cfg *config.ControlPlaneConfig, db *store.DB) *Server {
 
 // Start begins listening on the configured address.
 func (s *Server) Start() error {
+	// Start gRPC server in background if configured
+	if s.cfg.GRPCListenAddr != "" {
+		lis, err := net.Listen("tcp", s.cfg.GRPCListenAddr)
+		if err == nil {
+			s.grpcLis = lis
+			s.grpcServer = grpc.NewServer()
+			v1.RegisterControlPlaneServiceServer(s.grpcServer, s.grpcCtrl)
+			go func() {
+				slog.Info("ZRO Control Plane gRPC server listening", "addr", s.cfg.GRPCListenAddr)
+				_ = s.grpcServer.Serve(lis)
+			}()
+		} else {
+			slog.Warn("Failed to bind gRPC listener (skipping gRPC server)", "addr", s.cfg.GRPCListenAddr, "error", err)
+		}
+	}
+
 	s.httpServer = &http.Server{
 		Addr:         s.cfg.ListenAddr,
 		Handler:      s.mux,
@@ -75,6 +103,12 @@ func (s *Server) Start() error {
 
 // Shutdown gracefully stops the server.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.grpcServer != nil {
+		s.grpcServer.GracefulStop()
+	}
+	if s.grpcLis != nil {
+		_ = s.grpcLis.Close()
+	}
 	if s.httpServer != nil {
 		return s.httpServer.Shutdown(ctx)
 	}
@@ -108,6 +142,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/tunnels", s.handleRegisterTunnel)
 	s.mux.HandleFunc("GET /api/v1/gateway/routes", s.handleGetGatewayRoutes)
 	s.mux.HandleFunc("GET /api/v1/events", s.handleEventStream)
+
+	// Real-Time WebSockets Event Hub (RFC 6455)
+	s.mux.Handle("/api/v1/ws", s.wsHub.Handler())
+	s.mux.Handle("/ws/v1/events", s.wsHub.Handler())
 
 	if s.cfg.EnableGateway {
 		s.mux.HandleFunc("/", s.handleGatewayFallback)
@@ -657,14 +695,33 @@ func (s *Server) broadcastDelta(data any) {
 		return
 	}
 
+	// 1. Broadcast to SSE subscribers
 	s.subscribersMu.RLock()
-	defer s.subscribersMu.RUnlock()
-
 	for ch := range s.subscribers {
 		select {
 		case ch <- bytes:
 		default:
 		}
+	}
+	s.subscribersMu.RUnlock()
+
+	// 2. Broadcast to real-time WebSockets hub
+	var evtName string
+	if m, ok := data.(map[string]any); ok {
+		if ev, exists := m["event"].(string); exists {
+			evtName = ev
+		}
+	}
+	if evtName == "" {
+		evtName = "delta"
+	}
+	if s.wsHub != nil {
+		s.wsHub.Broadcast(evtName, data)
+	}
+
+	// 3. Broadcast to real-time gRPC event streams
+	if s.grpcCtrl != nil {
+		s.grpcCtrl.BroadcastEvent(evtName, data)
 	}
 }
 

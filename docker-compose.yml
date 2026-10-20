@@ -40,8 +40,10 @@ services:
       ZRO_CONTROL_PLANE_SECRET_KEY: "${CLUSTER_SECRET:-change-me-cluster-super-secret}"
       ZRO_CONTROL_PLANE_DEFAULT_CIDR_V4: "100.64.0.0/10"
       ZRO_CONTROL_PLANE_DEFAULT_CIDR_V6: "fd00:cafe::/64"
+      ZRO_CONTROL_PLANE_GRPC_LISTEN_ADDR: ":9443"
     ports:
       - "8443:8443"
+      - "9443:9443"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8443/health"]
       interval: 5s
@@ -61,6 +63,11 @@ services:
     depends_on:
       zro-plane:
         condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
     environment:
       ZRO_MODE: edge
       ZRO_EDGE_POP_CODE: "KH"
@@ -84,6 +91,11 @@ services:
     depends_on:
       zro-plane:
         condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
     environment:
       ZRO_MODE: edge
       ZRO_EDGE_POP_CODE: "SG"
@@ -107,6 +119,11 @@ services:
     depends_on:
       zro-plane:
         condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
     environment:
       ZRO_MODE: gw
       ZRO_GATEWAY_HOSTNAME: "gw1"
@@ -129,6 +146,11 @@ services:
     depends_on:
       zro-plane:
         condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
     environment:
       ZRO_MODE: gw
       ZRO_GATEWAY_HOSTNAME: "gw2"
