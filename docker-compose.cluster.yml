@@ -10,17 +10,19 @@ services:
     profiles: ["plane"]
     image: ${ZRO_IMAGE:-cubis/zro:latest}
     restart: always
-    command: ["plane", "--auto-seed=true"]
+    command: ["plane"]
     environment:
       ZRO_MODE: plane
       ZRO_LOG_LEVEL: ${LOG_LEVEL:-info}
       ZRO_CONTROL_PLANE_LISTEN_ADDR: ":8443"
+      ZRO_CONTROL_PLANE_GRPC_LISTEN_ADDR: ":9443"
       ZRO_CONTROL_PLANE_PUBLIC_URL: "${PUBLIC_URL:-https://zro-plane.cubis.tech:443}"
       ZRO_CONTROL_PLANE_DATABASE_DRIVER: postgres
       ZRO_CONTROL_PLANE_DATABASE_DSN: "${DATABASE_DSN}" # External Cloud DB (RDS / Cloud SQL)
       ZRO_CONTROL_PLANE_SECRET_KEY: "${CLUSTER_SECRET}"
     ports:
       - "8443:8443"
+      - "9443:9443"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8443/health"]
       interval: 10s

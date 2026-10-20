@@ -5,6 +5,7 @@ log_level: info
 # Control Plane Configuration (HA Ready, GORM + PostgreSQL)
 control_plane:
   listen_addr: ":8443"
+  grpc_listen_addr: ":9443"
   public_url: "https://zro-plane.cubis.tech:443"
   database_driver: "postgres" # Options: postgres, sqlite
   database_dsn: "postgres://postgres:postgres@localhost:5432/zro?sslmode=disable"
@@ -17,7 +18,7 @@ control_plane:
 edge:
   pop_code: "KH" # e.g. KH, SG, US, HK, DE
   region: "Asia/Phnom_Penh"
-  public_endpoint: "173.1.1.1:51820"
+  public_endpoint: "auto" # "auto" detects public IP, or specify "173.1.1.1:51820"
   listen_port: 51820
   wireguard_private_key: "" # Leave empty for auto-generation or specify base64 key
   plane_endpoint: "https://zro-plane.cubis.tech:443"
@@ -26,13 +27,16 @@ edge:
 # Client / Peer Node Configuration (IPless, P2P Mesh & Ingress Tunnels)
 node:
   hostname: "app-node-01"
-  network_id: "00000000-0000-0000-0000-000000000000"
+  network_id: "8056c2e21c000001" # ZeroTier-style 16-hex Network ID
   enrollment_token: "zro_tok_..."
   plane_endpoint: "https://zro-plane.cubis.tech:443"
   interface_mode: "tun" # Options: tun, netstack
   interface_name: "zro0"
   mtu: 1420
   enable_p2p: true
+  default_deny: true # Zero-Trust default deny all inbound traffic
+  allowed_inbound_ports:
+    - "5432/tcp" # e.g. expose Postgres service to mesh peers
   tags:
     - "tag:web"
     - "env:prod"
@@ -45,8 +49,15 @@ node:
 
 # Cloud-Native Ingress Gateway & Load Balancer
 gateway:
+  hostname: "gw1"
+  plane_endpoint: "https://zro-plane.cubis.tech:443"
+  enrollment_token: "zro_tok_..."
+  network_id: "8056c2e21c000001"
   listen_http: ":80"
   listen_https: ":443"
   auto_tls: true
   domain: "cubis.tech"
   cert_dir: "./certs"
+  strategy: "latency" # round_robin, least_conn, latency
+  health_check_path: "/health"
+  health_check_interval_ms: 5000
