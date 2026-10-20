@@ -93,6 +93,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/enroll", s.handleEnrollNode)
 	s.mux.HandleFunc("POST /api/v1/probes", s.handleReportProbes)
 	s.mux.HandleFunc("GET /api/v1/network/{id}/peers", s.handleGetPeers)
+	s.mux.HandleFunc("POST /api/v1/p2p/discover", s.handleP2PDiscover)
 
 	// Ingress & Tunneling
 	s.mux.HandleFunc("POST /api/v1/tunnels", s.handleRegisterTunnel)
@@ -309,12 +310,13 @@ func (s *Server) handleEdgeSync(w http.ResponseWriter, r *http.Request) {
 
 // EnrollRequest payload sent by a new node attempting to join a network.
 type EnrollRequest struct {
-	Token     string          `json:"token"`
-	PublicKey string          `json:"public_key"`
-	Hostname  string          `json:"hostname"`
-	NodeType  core.NodeType   `json:"node_type"`
-	Tags      core.StringList `json:"tags"`
-	Endpoints core.StringList `json:"endpoints"` // STUN reflexive endpoints
+	Token     string               `json:"token"`
+	PublicKey string               `json:"public_key"`
+	Hostname  string               `json:"hostname"`
+	NodeType  core.NodeType        `json:"node_type"`
+	Tags      core.StringList      `json:"tags"`
+	Endpoints core.StringList      `json:"endpoints"` // STUN reflexive endpoints
+	Probes    []core.LatencySample `json:"probes,omitempty"` // Parallel pre-enrollment RTT probe telemetry to PoPs
 }
 
 // EnrollResponse payload returned to the newly enrolled node.
@@ -371,6 +373,16 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nodeID := uuid.New()
+
+	// Record any initial parallel probe samples sent during enrollment for smart delegation
+	for _, p := range req.Probes {
+		p.NodeID = nodeID
+		if p.Timestamp.IsZero() {
+			p.Timestamp = time.Now()
+		}
+		s.delegator.RecordProbe(p)
+	}
+
 	node := &core.Node{
 		ID:          nodeID,
 		NetworkID:   network.ID,
@@ -430,6 +442,93 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 		"ipv4":       node.OverlayIPv4,
 		"pubkey":     node.PublicKey,
 	})
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// P2PDiscoverRequest initiates peer-to-peer discovery and NAT reflexive signaling.
+type P2PDiscoverRequest struct {
+	InitiatorNodeID    uuid.UUID       `json:"initiator_node_id"`
+	TargetOverlayIP    string          `json:"target_overlay_ip,omitempty"`
+	TargetHostname     string          `json:"target_hostname,omitempty"`
+	TargetNodeID       *uuid.UUID      `json:"target_node_id,omitempty"`
+	InitiatorEndpoints core.StringList `json:"initiator_endpoints,omitempty"`
+}
+
+// P2PDiscoverResponse returns resolved target coordinates and fallback PoP relay info.
+type P2PDiscoverResponse struct {
+	TargetNodeID      uuid.UUID       `json:"target_node_id"`
+	TargetHostname    string          `json:"target_hostname"`
+	TargetPublicKey   string          `json:"target_public_key"`
+	TargetOverlayIPv4 string          `json:"target_overlay_ipv4"`
+	TargetOverlayIPv6 string          `json:"target_overlay_ipv6"`
+	TargetEndpoints   core.StringList `json:"target_endpoints"`
+	PrimaryPoP        *core.EdgePoP   `json:"primary_pop,omitempty"`
+	SecondaryPoP      *core.EdgePoP   `json:"secondary_pop,omitempty"`
+}
+
+func (s *Server) handleP2PDiscover(w http.ResponseWriter, r *http.Request) {
+	var req P2PDiscoverRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// 1. Fetch Initiator Node
+	initiator, err := s.db.Nodes.GetByID(r.Context(), req.InitiatorNodeID)
+	if err != nil {
+		http.Error(w, "initiator node not found", http.StatusNotFound)
+		return
+	}
+
+	// Update initiator's endpoints if newer endpoints were provided
+	if len(req.InitiatorEndpoints) > 0 {
+		initiator.Endpoints = req.InitiatorEndpoints
+		initiator.LastSeenAt = time.Now()
+		_ = s.db.Nodes.Update(r.Context(), initiator)
+	}
+
+	// 2. Resolve Target Node in the same network (by Overlay IP or NodeID)
+	var target *core.Node
+	if req.TargetOverlayIP != "" {
+		target, err = s.db.Nodes.GetByOverlayIP(r.Context(), initiator.NetworkID, req.TargetOverlayIP)
+	} else if req.TargetNodeID != nil {
+		target, err = s.db.Nodes.GetByID(r.Context(), *req.TargetNodeID)
+	}
+
+	if err != nil || target == nil {
+		http.Error(w, "target node not found in network", http.StatusNotFound)
+		return
+	}
+
+	// 3. Ensure both nodes belong to the same network (zero-trust security boundary)
+	if initiator.NetworkID != target.NetworkID {
+		http.Error(w, "nodes belong to different networks", http.StatusForbidden)
+		return
+	}
+
+	// 4. Signal target node via delta broadcast of P2P hole punch request
+	s.broadcastDelta(map[string]any{
+		"event":               "p2p_punch_requested",
+		"network_id":          target.NetworkID,
+		"target_node_id":      target.ID,
+		"initiator_node_id":   initiator.ID,
+		"initiator_pubkey":    initiator.PublicKey,
+		"initiator_endpoints": initiator.Endpoints,
+		"initiator_overlay":   initiator.OverlayIPv4,
+	})
+
+	// 5. Construct Response
+	resp := P2PDiscoverResponse{
+		TargetNodeID:      target.ID,
+		TargetHostname:    target.Hostname,
+		TargetPublicKey:   target.PublicKey,
+		TargetOverlayIPv4: target.OverlayIPv4,
+		TargetOverlayIPv6: target.OverlayIPv6,
+		TargetEndpoints:   target.Endpoints,
+		PrimaryPoP:        target.AssignedPoP,
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)

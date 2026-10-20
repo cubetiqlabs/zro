@@ -59,6 +59,24 @@ func DiscoverPublicEndpoint(localConn *net.UDPConn, serverAddr string, timeout t
 	return parseSTUNResponse(buf[:n], req[8:20])
 }
 
+// ProbeEndpoint contacts a STUN server (such as an Edge PoP) to measure round-trip latency (RTT)
+// and reflexively discover the client's public NAT address.
+func ProbeEndpoint(serverAddr string, timeout time.Duration) (time.Duration, *ReflexiveAddress, error) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to bind ephemeral probe socket: %w", err)
+	}
+	defer conn.Close()
+
+	start := time.Now()
+	addr, err := DiscoverPublicEndpoint(conn, serverAddr, timeout)
+	if err != nil {
+		return 0, nil, err
+	}
+	rtt := time.Since(start)
+	return rtt, addr, nil
+}
+
 // ServeSTUN runs a lightweight STUN responder on an incoming UDP connection.
 func ServeSTUN(conn *net.UDPConn, packet []byte, clientAddr *net.UDPAddr) error {
 	if len(packet) < 20 {

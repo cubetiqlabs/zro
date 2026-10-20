@@ -149,7 +149,7 @@ func TestFullMeshSmoke(t *testing.T) {
 	_ = rAttack.Body.Close()
 	t.Log("✅ Smoke Step 4a Passed: High-security enforced - Token hijacking rejected with 401")
 
-	// 5b. Legitimate enrollment with matching bound public key
+	// 5b. Legitimate enrollment with matching bound public key and pre-enrollment latency probes
 	enroll1Req := server.EnrollRequest{
 		Token:     token1,
 		PublicKey: kp1.PublicKey,
@@ -157,6 +157,10 @@ func TestFullMeshSmoke(t *testing.T) {
 		NodeType:  core.NodeTypePeer,
 		Tags:      core.StringList{"tag:web", "env:prod"},
 		Endpoints: core.StringList{"192.168.1.100:51820"},
+		Probes: []core.LatencySample{
+			{PoPCode: "KH", RTT: 4 * time.Millisecond, PacketLoss: 0.0, Timestamp: time.Now()},
+			{PoPCode: "SG", RTT: 35 * time.Millisecond, PacketLoss: 0.0, Timestamp: time.Now()},
+		},
 	}
 	body1, _ := json.Marshal(enroll1Req)
 	resp, err = http.Post(ts.URL+"/api/v1/enroll", "application/json", bytes.NewReader(body1))
@@ -174,10 +178,13 @@ func TestFullMeshSmoke(t *testing.T) {
 	if enroll1Resp.NetworkID != createdNet.ID {
 		t.Fatalf("smoke: expected network ID %s, got %s", createdNet.ID, enroll1Resp.NetworkID)
 	}
-	t.Logf("✅ Smoke Step 4b Passed: Node 1 successfully enrolled with IPless overlay %s in network %s",
-		enroll1Resp.OverlayIPv4, enroll1Resp.NetworkID)
+	if enroll1Resp.PrimaryPoP.PoPCode != "KH" {
+		t.Fatalf("smoke: expected PrimaryPoP KH (4ms vs 35ms), got %s", enroll1Resp.PrimaryPoP.PoPCode)
+	}
+	t.Logf("✅ Smoke Step 4b Passed: Node 1 successfully enrolled with IPless overlay %s, smart-delegated to Primary Edge PoP %s",
+		enroll1Resp.OverlayIPv4, enroll1Resp.PrimaryPoP.PoPCode)
 
-	// 6. Smoke Step 5: Enroll Node 2 (Singapore)
+	// 6. Smoke Step 5: Enroll Node 2 (Singapore) with probe telemetry
 	kp2, _ := crypto.GenerateKeyPair()
 	token2 := crypto.GenerateEnrollmentToken(secretKey, createdNet.ID, "db-node-sg", 1*time.Hour, kp2.PublicKey)
 
@@ -188,6 +195,10 @@ func TestFullMeshSmoke(t *testing.T) {
 		NodeType:  core.NodeTypePeer,
 		Tags:      core.StringList{"tag:db", "env:prod"},
 		Endpoints: core.StringList{"10.0.0.50:51820"},
+		Probes: []core.LatencySample{
+			{PoPCode: "KH", RTT: 41 * time.Millisecond, PacketLoss: 0.0, Timestamp: time.Now()},
+			{PoPCode: "SG", RTT: 3 * time.Millisecond, PacketLoss: 0.0, Timestamp: time.Now()},
+		},
 	}
 	body2, _ := json.Marshal(enroll2Req)
 	resp, err = http.Post(ts.URL+"/api/v1/enroll", "application/json", bytes.NewReader(body2))
@@ -202,7 +213,11 @@ func TestFullMeshSmoke(t *testing.T) {
 	if enroll2Resp.OverlayIPv4 != "100.64.0.3" {
 		t.Fatalf("smoke: expected node 2 IP 100.64.0.3, got %s", enroll2Resp.OverlayIPv4)
 	}
-	t.Logf("✅ Smoke Step 5 Passed: Node 2 successfully enrolled with IPless static overlay %s", enroll2Resp.OverlayIPv4)
+	if enroll2Resp.PrimaryPoP.PoPCode != "SG" {
+		t.Fatalf("smoke: expected PrimaryPoP SG (3ms vs 41ms), got %s", enroll2Resp.PrimaryPoP.PoPCode)
+	}
+	t.Logf("✅ Smoke Step 5 Passed: Node 2 successfully enrolled with IPless static overlay %s, smart-delegated to Primary Edge PoP %s",
+		enroll2Resp.OverlayIPv4, enroll2Resp.PrimaryPoP.PoPCode)
 
 	// 7. Smoke Step 6: Edge Mesh Synchronization
 	resp, err = http.Get(ts.URL + "/api/v1/edge/sync")
@@ -217,6 +232,30 @@ func TestFullMeshSmoke(t *testing.T) {
 		t.Fatalf("smoke: expected 5 PoPs and 2 nodes in sync data, got %d PoPs and %d nodes", len(syncData.PoPs), len(syncData.Nodes))
 	}
 	t.Logf("✅ Smoke Step 6 Passed: Edge sync verified across %d PoPs and %d nodes", len(syncData.PoPs), len(syncData.Nodes))
+
+	// 8. Smoke Step 7: Section 5 P2P Discovery & Signaling via Control Plane
+	p2pDiscReq := server.P2PDiscoverRequest{
+		InitiatorNodeID:    enroll1Resp.NodeID,
+		TargetOverlayIP:    enroll2Resp.OverlayIPv4,
+		InitiatorEndpoints: core.StringList{"192.168.1.100:51820"},
+	}
+	discBody, _ := json.Marshal(p2pDiscReq)
+	resp, err = http.Post(ts.URL+"/api/v1/p2p/discover", "application/json", bytes.NewReader(discBody))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("smoke: P2P discovery failed: status %d", resp.StatusCode)
+	}
+	var discResp server.P2PDiscoverResponse
+	_ = json.NewDecoder(resp.Body).Decode(&discResp)
+	_ = resp.Body.Close()
+
+	if discResp.TargetPublicKey != kp2.PublicKey {
+		t.Fatalf("smoke: target public key mismatch, got %s", discResp.TargetPublicKey)
+	}
+	if discResp.PrimaryPoP == nil || discResp.PrimaryPoP.PoPCode != "SG" {
+		t.Fatalf("smoke: expected target PrimaryPoP SG, got %v", discResp.PrimaryPoP)
+	}
+	t.Logf("✅ Smoke Step 7 Passed: Section 5 P2P Discovery signaled (Target: %s, Endpoints: %v, Fallback Relay: Edge %s)",
+		discResp.TargetHostname, discResp.TargetEndpoints, discResp.PrimaryPoP.PoPCode)
 
 	// 8. Smoke Step 7: Smart Routing Delegation (Probe Reporting)
 	probeSample := core.LatencySample{

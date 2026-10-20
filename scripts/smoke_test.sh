@@ -65,56 +65,105 @@ else
 fi
 
 # Step 4: Cryptographic Keygen & Public Key Bound Enrollment Token
-echo -n "Generating WireGuard keypair and cryptographically-bound token... "
+echo -n "Generating WireGuard keypair and cryptographically-bound token for Node 1... "
 if [ -f "./bin/zro" ]; then
-    PUBKEY=$(./bin/zro keygen | grep "Public Key:" | awk '{print $3}')
-    TOKEN=$(./bin/zro token --secret "$SECRET" --network-id "$NETWORK_ID" --hostname "smoke-node-01" --pubkey "$PUBKEY" | tail -n1)
+    PUBKEY1=$(./bin/zro keygen | grep "Public Key:" | awk '{print $3}')
+    TOKEN1=$(./bin/zro token --secret "$SECRET" --network-id "$NETWORK_ID" --hostname "smoke-node-kh" --pubkey "$PUBKEY1" | tail -n1)
+    PUBKEY2=$(./bin/zro keygen | grep "Public Key:" | awk '{print $3}')
+    TOKEN2=$(./bin/zro token --secret "$SECRET" --network-id "$NETWORK_ID" --hostname "smoke-node-sg" --pubkey "$PUBKEY2" | tail -n1)
 else
-    PUBKEY=$(go run ./cmd/zro keygen | grep "Public Key:" | awk '{print $3}')
-    TOKEN=$(go run ./cmd/zro token --secret "$SECRET" --network-id "$NETWORK_ID" --hostname "smoke-node-01" --pubkey "$PUBKEY" | tail -n1)
+    PUBKEY1=$(go run ./cmd/zro keygen | grep "Public Key:" | awk '{print $3}')
+    TOKEN1=$(go run ./cmd/zro token --secret "$SECRET" --network-id "$NETWORK_ID" --hostname "smoke-node-kh" --pubkey "$PUBKEY1" | tail -n1)
+    PUBKEY2=$(go run ./cmd/zro keygen | grep "Public Key:" | awk '{print $3}')
+    TOKEN2=$(go run ./cmd/zro token --secret "$SECRET" --network-id "$NETWORK_ID" --hostname "smoke-node-sg" --pubkey "$PUBKEY2" | tail -n1)
 fi
 
 echo -e "${GREEN}OK${NC}"
 
-# Step 5: Node Enrollment with Public Key Binding Verification
-echo -n "Enrolling node into mesh with static IPless assignment... "
-ENROLL_PAYLOAD=$(cat <<EOF
+# Step 5: Node Enrollment with Public Key Binding & Pre-Enrollment Latency Probes
+echo -n "Enrolling Node 1 (Cambodia) and Node 2 (Singapore) into overlay... "
+ENROLL1_PAYLOAD=$(cat <<EOF
 {
-  "token": "$TOKEN",
-  "public_key": "$PUBKEY",
-  "hostname": "smoke-node-01",
+  "token": "$TOKEN1",
+  "public_key": "$PUBKEY1",
+  "hostname": "smoke-node-kh",
   "node_type": "peer",
   "tags": ["tag:smoke", "env:production"],
-  "endpoints": ["127.0.0.1:51820"]
+  "endpoints": ["192.168.1.100:51820"],
+  "probes": [
+    {"pop_code": "KH", "rtt": 4000000, "packet_loss": 0.0},
+    {"pop_code": "SG", "rtt": 35000000, "packet_loss": 0.0}
+  ]
 }
 EOF
 )
 
-ENROLL_RESP=$(curl -s -X POST -H "Content-Type: application/json" -d "$ENROLL_PAYLOAD" "$PLANE_URL/api/v1/enroll")
-if echo "$ENROLL_RESP" | grep -q "overlay_ipv4"; then
-    ASSIGNED_IP=$(echo "$ENROLL_RESP" | grep -o '"overlay_ipv4":"[^"]*' | head -n1 | cut -d'"' -f4)
-    echo -e "${GREEN}OK (Assigned IPless Overlay: $ASSIGNED_IP)${NC}"
+ENROLL1_RESP=$(curl -s -X POST -H "Content-Type: application/json" -d "$ENROLL1_PAYLOAD" "$PLANE_URL/api/v1/enroll")
+NODE1_ID=$(echo "$ENROLL1_RESP" | grep -o '"node_id":"[^"]*' | head -n1 | cut -d'"' -f4)
+NODE1_IP=$(echo "$ENROLL1_RESP" | grep -o '"overlay_ipv4":"[^"]*' | head -n1 | cut -d'"' -f4)
+
+ENROLL2_PAYLOAD=$(cat <<EOF
+{
+  "token": "$TOKEN2",
+  "public_key": "$PUBKEY2",
+  "hostname": "smoke-node-sg",
+  "node_type": "peer",
+  "tags": ["tag:smoke", "env:production"],
+  "endpoints": ["10.0.0.50:51820"],
+  "probes": [
+    {"pop_code": "KH", "rtt": 38000000, "packet_loss": 0.0},
+    {"pop_code": "SG", "rtt": 3000000, "packet_loss": 0.0}
+  ]
+}
+EOF
+)
+
+ENROLL2_RESP=$(curl -s -X POST -H "Content-Type: application/json" -d "$ENROLL2_PAYLOAD" "$PLANE_URL/api/v1/enroll")
+NODE2_ID=$(echo "$ENROLL2_RESP" | grep -o '"node_id":"[^"]*' | head -n1 | cut -d'"' -f4)
+NODE2_IP=$(echo "$ENROLL2_RESP" | grep -o '"overlay_ipv4":"[^"]*' | head -n1 | cut -d'"' -f4)
+
+if [ -n "$NODE1_IP" ] && [ -n "$NODE2_IP" ]; then
+    echo -e "${GREEN}OK (Node 1: $NODE1_IP, Node 2: $NODE2_IP)${NC}"
 else
-    echo -e "${RED}FAILED: Node enrollment rejected${NC}"
-    echo "$ENROLL_RESP"
+    echo -e "${RED}FAILED: Enrollment failed${NC}"
+    echo "$ENROLL1_RESP"
+    echo "$ENROLL2_RESP"
     exit 1
 fi
 
 # Step 6: Edge Mesh Synchronization
 echo -n "Checking Edge Data Plane Mesh Synchronization ($PLANE_URL/api/v1/edge/sync)... "
 SYNC_RESP=$(curl -s "$PLANE_URL/api/v1/edge/sync")
-if echo "$SYNC_RESP" | grep -q "smoke-node-01"; then
+if echo "$SYNC_RESP" | grep -q "smoke-node-kh"; then
     echo -e "${GREEN}OK (Synchronized across Data Plane PoPs)${NC}"
 else
     echo -e "${YELLOW}Sync received, node state propagated${NC}"
 fi
 
-# Step 7: Latency Probe Report (Smart Routing)
+# Step 7: Section 5 P2P Discovery Signaling
+echo -n "Requesting Section 5 P2P Discovery & Signaling ($PLANE_URL/api/v1/p2p/discover)... "
+P2P_PAYLOAD=$(cat <<EOF
+{
+  "initiator_node_id": "$NODE1_ID",
+  "target_overlay_ip": "$NODE2_IP",
+  "initiator_endpoints": ["192.168.1.100:51820"]
+}
+EOF
+)
+P2P_RESP=$(curl -s -X POST -H "Content-Type: application/json" -d "$P2P_PAYLOAD" "$PLANE_URL/api/v1/p2p/discover")
+if echo "$P2P_RESP" | grep -q "$PUBKEY2"; then
+    echo -e "${GREEN}OK (P2P Discovery coordinates returned for Node 2)${NC}"
+else
+    echo -e "${RED}FAILED: P2P discovery rejected${NC}"
+    echo "$P2P_RESP"
+    exit 1
+fi
+
+# Step 8: Latency Probe Report (Smart Routing)
 echo -n "Submitting smart routing latency probe to Control Plane... "
-NODE_ID=$(echo "$ENROLL_RESP" | grep -o '"node_id":"[^"]*' | cut -d'"' -f4)
 PROBE_PAYLOAD=$(cat <<EOF
 {
-  "node_id": "$NODE_ID",
+  "node_id": "$NODE1_ID",
   "pop_code": "KH",
   "rtt": 4000000,
   "packet_loss": 0.0
@@ -130,7 +179,7 @@ else
     exit 1
 fi
 
-# Step 8: Gateway Status
+# Step 9: Gateway Status
 echo -n "Checking Ingress Gateway ($GW_URL)... "
 GW_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$GW_URL" || true)
 if [ "$GW_CODE" -ne 000 ]; then

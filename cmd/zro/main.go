@@ -23,6 +23,7 @@ import (
 	"github.com/cubis/zro/pkg/node"
 	"github.com/cubis/zro/pkg/store"
 	"github.com/cubis/zro/pkg/tunnel"
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 )
 
@@ -47,6 +48,7 @@ func init() {
 	rootCmd.AddCommand(newTokenCmd())
 	rootCmd.AddCommand(newNetworkCmd())
 	rootCmd.AddCommand(newSocksCmd())
+	rootCmd.AddCommand(newP2PCmd())
 }
 
 func main() {
@@ -329,5 +331,61 @@ func newSocksCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVarP(&listenAddr, "listen", "l", ":1080", "Listen address for SOCKS5 proxy")
+	return cmd
+}
+
+func newP2PCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "p2p",
+		Short: "P2P discovery, NAT traversal, and smart routing coordination",
+	}
+
+	var planeURL, nodeIDStr string
+	discoverCmd := &cobra.Command{
+		Use:   "discover <target_overlay_ip>",
+		Short: "Perform P2P discovery & coordinate direct hole punch to target",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			targetIP := args[0]
+			nodeID, err := uuid.Parse(nodeIDStr)
+			if err != nil {
+				return fmt.Errorf("invalid --node-id: %w", err)
+			}
+
+			discReq := server.P2PDiscoverRequest{
+				InitiatorNodeID: nodeID,
+				TargetOverlayIP: targetIP,
+			}
+			body, _ := json.Marshal(discReq)
+			resp, err := http.Post(planeURL+"/api/v1/p2p/discover", "application/json", bytes.NewReader(body))
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				return fmt.Errorf("p2p discovery failed with status %d", resp.StatusCode)
+			}
+
+			var discResp server.P2PDiscoverResponse
+			_ = json.NewDecoder(resp.Body).Decode(&discResp)
+
+			fmt.Println("P2P Discovery Successful!")
+			fmt.Printf("Target Hostname:  %s\n", discResp.TargetHostname)
+			fmt.Printf("Target Node ID:   %s\n", discResp.TargetNodeID)
+			fmt.Printf("Overlay IPv4:     %s\n", discResp.TargetOverlayIPv4)
+			fmt.Printf("Public Key:       %s\n", discResp.TargetPublicKey)
+			fmt.Printf("NAT Endpoints:    %v\n", discResp.TargetEndpoints)
+			if discResp.PrimaryPoP != nil {
+				fmt.Printf("Relay Fallback:   Edge %s (%s)\n", discResp.PrimaryPoP.PoPCode, discResp.PrimaryPoP.PublicEndpoint)
+			}
+			return nil
+		},
+	}
+	discoverCmd.Flags().StringVar(&planeURL, "plane", "http://localhost:8443", "Control Plane URL")
+	discoverCmd.Flags().StringVar(&nodeIDStr, "node-id", "", "Initiator Node UUID")
+	_ = discoverCmd.MarkFlagRequired("node-id")
+
+	cmd.AddCommand(discoverCmd)
 	return cmd
 }

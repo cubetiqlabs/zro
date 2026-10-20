@@ -36,7 +36,9 @@ type Daemon struct {
 	overlayIPv6  string
 	primaryPoP   core.EdgePoP
 	secondaryPoP *core.EdgePoP
+	popMu        sync.RWMutex
 	peers        map[string]core.Node // pubKey -> node
+	peersMu      sync.RWMutex
 
 	tunDev       tun.Device
 	wgManager    *wireguard.Manager
@@ -95,14 +97,20 @@ func (d *Daemon) Start(ctx context.Context) error {
 
 	slog.Info("ZRO Node agent initialized", "pubkey", d.keyPair.PublicKey, "local_udp", udpConn.LocalAddr().String())
 
-	// 2. Discover reflexive STUN endpoint if plane is reachable
+	// Launch UDP packet listener for incoming STUN, Disco, and P2P hole punch packets
+	d.wg.Add(1)
+	go d.udpPacketListener(ctx)
+
+	// 2. Section 5.1 Step 2: Fetch PoP catalog and conduct parallel UDP RTT probes
+	pops, _ := d.fetchPoPs(ctx)
+	probes, bestReflexive := d.probePoPs(ctx, pops)
+
 	var endpoints []string
-	discovered, err := stun.DiscoverPublicEndpoint(udpConn, "127.0.0.1:51820", 1*time.Second)
-	if err == nil && discovered != nil {
-		endpoints = append(endpoints, discovered.String())
+	if bestReflexive != "" {
+		endpoints = append(endpoints, bestReflexive)
 	}
 
-	// 3. Enroll with Control Plane
+	// 3. Section 5.1 Steps 3-4: Enroll with Control Plane and report probe telemetry for Smart Delegation
 	enrollReq := server.EnrollRequest{
 		Token:     d.cfg.EnrollmentToken,
 		PublicKey: d.keyPair.PublicKey,
@@ -110,6 +118,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		NodeType:  core.NodeTypePeer,
 		Tags:      core.StringList(d.cfg.Tags),
 		Endpoints: core.StringList(endpoints),
+		Probes:    probes,
 	}
 
 	bodyBytes, err := json.Marshal(enrollReq)
@@ -142,8 +151,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.networkID = enrollResp.NetworkID
 	d.overlayIPv4 = enrollResp.OverlayIPv4
 	d.overlayIPv6 = enrollResp.OverlayIPv6
+
+	d.popMu.Lock()
 	d.primaryPoP = enrollResp.PrimaryPoP
 	d.secondaryPoP = enrollResp.SecondaryPoP
+	d.popMu.Unlock()
 
 	slog.Info("Enrolled into overlay mesh",
 		"overlay_ipv4", d.overlayIPv4,
@@ -151,7 +163,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		"delegated_pop", d.primaryPoP.PoPCode,
 		"pop_endpoint", d.primaryPoP.PublicEndpoint)
 
-	// 4. Connect to Delegated Primary Edge PoP
+	// 4. Section 5.1 Step 5: Connect to Delegated Primary Edge PoP
 	if err := d.connectToEdgePoP(d.primaryPoP); err != nil {
 		slog.Warn("Failed to establish primary Edge PoP tunnel", "error", err)
 	}
@@ -169,6 +181,110 @@ func (d *Daemon) Start(ctx context.Context) error {
 	go d.tunnelWorker(ctx)
 
 	return nil
+}
+
+func (d *Daemon) fetchPoPs(ctx context.Context) ([]core.EdgePoP, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", d.cfg.PlaneEndpoint+"/api/v1/pops", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var pops []core.EdgePoP
+	if err := json.NewDecoder(resp.Body).Decode(&pops); err != nil {
+		return nil, err
+	}
+	return pops, nil
+}
+
+func (d *Daemon) probePoPs(ctx context.Context, pops []core.EdgePoP) ([]core.LatencySample, string) {
+	if len(pops) == 0 {
+		return nil, ""
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var samples []core.LatencySample
+	var bestReflexive string
+	bestRTT := time.Duration(1<<62 - 1)
+
+	for _, pop := range pops {
+		if pop.PublicEndpoint == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(p core.EdgePoP) {
+			defer wg.Done()
+			rtt, refAddr, err := stun.ProbeEndpoint(p.PublicEndpoint, 1200*time.Millisecond)
+			mu.Lock()
+			defer mu.Unlock()
+
+			if err == nil {
+				samples = append(samples, core.LatencySample{
+					PoPCode:    p.PoPCode,
+					RTT:        rtt,
+					PacketLoss: 0.0,
+					Timestamp:  time.Now(),
+				})
+				if rtt < bestRTT && refAddr != nil {
+					bestRTT = rtt
+					bestReflexive = refAddr.String()
+				}
+			} else {
+				// Failed probe penalty
+				samples = append(samples, core.LatencySample{
+					PoPCode:    p.PoPCode,
+					RTT:        500 * time.Millisecond,
+					PacketLoss: 1.0,
+					Timestamp:  time.Now(),
+				})
+			}
+		}(pop)
+	}
+
+	wg.Wait()
+	return samples, bestReflexive
+}
+
+func (d *Daemon) udpPacketListener(ctx context.Context) {
+	defer d.wg.Done()
+	buf := make([]byte, 2048)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			_ = d.udpConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			n, remoteAddr, err := d.udpConn.ReadFromUDP(buf)
+			if err != nil {
+				continue
+			}
+
+			packet := buf[:n]
+
+			// Handle P2P Hole Punching Pings
+			if bytes.Equal(packet, puncher.MagicPing) {
+				_, _ = d.udpConn.WriteToUDP(puncher.MagicPong, remoteAddr)
+				continue
+			}
+
+			// Handle STUN queries
+			if len(packet) >= 20 {
+				_ = stun.ServeSTUN(d.udpConn, packet, remoteAddr)
+			}
+
+			// Handle Disco protocol messages
+			if d.discoEngine != nil {
+				_, _ = d.discoEngine.HandlePacket(packet, remoteAddr)
+			}
+		}
+	}
 }
 
 // Stop terminates the node daemon.
@@ -206,59 +322,164 @@ func (d *Daemon) connectToEdgePoP(pop core.EdgePoP) error {
 	})
 }
 
-func (d *Daemon) connectPeer(ctx context.Context, peer core.Node) {
-	d.peers[peer.PublicKey] = peer
+// DiscoverAndConnectPeer implements Section 5 Packet Flow & Smart Routing:
+// 1. Requests P2P discovery coordinates from Control Plane (Target Reflexive Addrs & delegated PoP)
+// 2. Attempts simultaneous direct UDP hole punch (RFC 5128 / ICE style)
+// 3. If direct P2P succeeds -> Sets WireGuard direct peer path with zero relay latency
+// 4. If blocked by Symmetric NAT -> Falls back to Edge Backbone Mesh relay transit
+func (d *Daemon) DiscoverAndConnectPeer(ctx context.Context, targetOverlayIP string) (*router.RouteTarget, error) {
+	// 1. Request P2P discovery from Control Plane
+	var endpoints []string
+	if d.udpConn != nil {
+		endpoints = append(endpoints, d.udpConn.LocalAddr().String())
+	}
 
-	// Try P2P hole punch if peer has reflexive endpoints
+	discReq := server.P2PDiscoverRequest{
+		InitiatorNodeID:    d.nodeID,
+		TargetOverlayIP:    targetOverlayIP,
+		InitiatorEndpoints: core.StringList(endpoints),
+	}
+
+	body, err := json.Marshal(discReq)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", d.cfg.PlaneEndpoint+"/api/v1/p2p/discover", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("p2p discovery request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("p2p discovery rejected: status %d", resp.StatusCode)
+	}
+
+	var discResp server.P2PDiscoverResponse
+	if err := json.NewDecoder(resp.Body).Decode(&discResp); err != nil {
+		return nil, err
+	}
+
+	// 2. Attempt direct P2P Hole Punching if enabled and target endpoints exist
 	var directEndpoint string
-	if d.cfg.EnableP2P && len(peer.Endpoints) > 0 {
-		for _, ep := range peer.Endpoints {
+	if d.cfg.EnableP2P && len(discResp.TargetEndpoints) > 0 {
+		for _, ep := range discResp.TargetEndpoints {
 			punchRes, err := puncher.Punch(ctx, d.udpConn, ep, 500*time.Millisecond)
 			if err == nil && punchRes.Success {
 				directEndpoint = ep
-				slog.Info("Direct P2P tunnel established with peer", "peer", peer.Hostname, "endpoint", ep)
+				slog.Info("Direct P2P tunnel established with zero relay latency",
+					"target", discResp.TargetHostname,
+					"endpoint", ep,
+					"rtt", punchRes.RTT)
 				break
 			}
 		}
 	}
 
-	// Configure peer on WireGuard
-	isDirect := directEndpoint != ""
-	ep := directEndpoint
-	if !isDirect && peer.AssignedPoP != nil {
-		ep = peer.AssignedPoP.PublicEndpoint
+	// 3. Fallback logic according to Section 5 sequence diagram
+	var routeTarget router.RouteTarget
+	if directEndpoint != "" {
+		// Direct WireGuard P2P
+		_ = d.wgManager.ApplyPeer(wireguard.PeerConfig{
+			PublicKey:           discResp.TargetPublicKey,
+			Endpoint:            directEndpoint,
+			AllowedIPs:          []string{discResp.TargetOverlayIPv4 + "/32"},
+			PersistentKeepalive: 20 * time.Second,
+		})
+
+		routeTarget = router.RouteTarget{
+			PublicKey:   discResp.TargetPublicKey,
+			Endpoint:    directEndpoint,
+			IsDirectP2P: true,
+			Metric:      10,
+		}
+	} else {
+		// Blocked by Symmetric NAT: Transit via Edge Backbone Mesh
+		d.popMu.RLock()
+		primaryPoP := d.primaryPoP
+		d.popMu.RUnlock()
+
+		relayEndpoint := primaryPoP.PublicEndpoint
+		if relayEndpoint == "" && discResp.PrimaryPoP != nil {
+			relayEndpoint = discResp.PrimaryPoP.PublicEndpoint
+		}
+
+		slog.Warn("P2P hole punch blocked by symmetric NAT; routing through Edge Backbone Mesh",
+			"target", discResp.TargetHostname,
+			"primary_pop", primaryPoP.PoPCode)
+
+		_ = d.wgManager.ApplyPeer(wireguard.PeerConfig{
+			PublicKey:           discResp.TargetPublicKey,
+			Endpoint:            relayEndpoint,
+			AllowedIPs:          []string{discResp.TargetOverlayIPv4 + "/32"},
+			PersistentKeepalive: 25 * time.Second,
+		})
+
+		routeTarget = router.RouteTarget{
+			PublicKey:   discResp.TargetPublicKey,
+			Endpoint:    relayEndpoint,
+			ViaPoPCode:  primaryPoP.PoPCode,
+			IsDirectP2P: false,
+			Metric:      100,
+		}
 	}
 
-	_ = d.wgManager.ApplyPeer(wireguard.PeerConfig{
-		PublicKey:           peer.PublicKey,
-		Endpoint:            ep,
-		AllowedIPs:          []string{peer.OverlayIPv4 + "/32"},
-		PersistentKeepalive: 25 * time.Second,
-	})
+	d.routingTable.SetRoute(discResp.TargetOverlayIPv4, routeTarget)
+	return &routeTarget, nil
+}
 
-	d.routingTable.SetRoute(peer.OverlayIPv4, router.RouteTarget{
-		PublicKey:   peer.PublicKey,
-		Endpoint:    ep,
-		IsDirectP2P: isDirect,
-	})
+func (d *Daemon) connectPeer(ctx context.Context, peer core.Node) {
+	d.peersMu.Lock()
+	d.peers[peer.PublicKey] = peer
+	d.peersMu.Unlock()
+
+	_, _ = d.DiscoverAndConnectPeer(ctx, peer.OverlayIPv4)
 }
 
 func (d *Daemon) probeWorker(ctx context.Context) {
 	defer d.wg.Done()
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+
+	var consecutiveFails int
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Send latency probe to delegated primary PoP
+			d.popMu.RLock()
+			primary := d.primaryPoP
+			secondary := d.secondaryPoP
+			d.popMu.RUnlock()
+
+			if primary.PublicEndpoint == "" {
+				continue
+			}
+
+			// Probe primary Edge PoP
+			rtt, _, err := stun.ProbeEndpoint(primary.PublicEndpoint, 1*time.Second)
+			loss := 0.0
+			if err != nil {
+				loss = 1.0
+				rtt = 500 * time.Millisecond
+				consecutiveFails++
+			} else {
+				consecutiveFails = 0
+			}
+
+			// Report probe telemetry to Control Plane
 			sample := core.LatencySample{
 				NodeID:     d.nodeID,
-				PoPCode:    d.primaryPoP.PoPCode,
-				RTT:        12 * time.Millisecond, // simulated probe measure
-				PacketLoss: 0.0,
+				PoPCode:    primary.PoPCode,
+				RTT:        rtt,
+				PacketLoss: loss,
 				Timestamp:  time.Now(),
 			}
 
@@ -270,6 +491,21 @@ func (d *Daemon) probeWorker(ctx context.Context) {
 				if err == nil {
 					_ = res.Body.Close()
 				}
+			}
+
+			// Failover to secondary Edge PoP if primary is unreachable (consecutive failures >= 2)
+			if consecutiveFails >= 2 && secondary != nil && secondary.PublicEndpoint != "" {
+				slog.Warn("Primary Edge PoP degraded/unreachable, failing over to secondary Edge PoP",
+					"old_primary", primary.PoPCode,
+					"new_primary", secondary.PoPCode)
+
+				d.popMu.Lock()
+				d.primaryPoP = *secondary
+				d.secondaryPoP = &primary
+				d.popMu.Unlock()
+
+				_ = d.connectToEdgePoP(*secondary)
+				consecutiveFails = 0
 			}
 		}
 	}
