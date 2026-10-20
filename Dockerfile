@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 # Stage 1: Statically compiled Go builder
-FROM golang:alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 WORKDIR /src
 
@@ -22,7 +22,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     ./cmd/zro
 
 # Stage 2: Production minimal runtime
-FROM alpine:3.21
+FROM alpine:3.23
 
 # Install runtime utilities for network interfaces & SSL
 RUN apk add --no-cache \

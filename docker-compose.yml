@@ -1,19 +1,17 @@
 services:
   # PostgreSQL Database for HA Control Plane
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: zro-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-zro}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-zro_cluster_secret}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-zro}
     volumes:
-      - pgdata:/var/lib/postgresql/data
-    ports:
-      - "${POSTGRES_PORT:-5439}:5432"
+      - pgdata:/var/lib/postgresql/docker/18
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-zro} -d ${POSTGRES_DB:-zro}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-zro}"]
       interval: 3s
       timeout: 3s
       retries: 5
@@ -37,7 +35,7 @@ services:
       ZRO_CONTROL_PLANE_LISTEN_ADDR: ":8443"
       ZRO_CONTROL_PLANE_PUBLIC_URL: "http://zro-plane:8443"
       ZRO_CONTROL_PLANE_DATABASE_DRIVER: postgres
-      ZRO_CONTROL_PLANE_DATABASE_DSN: "postgres://${POSTGRES_USER:-zro}:${POSTGRES_PASSWORD:-zro_cluster_secret}@postgres:5432/${POSTGRES_DB:-zro}?sslmode=disable"
+      ZRO_CONTROL_PLANE_DATABASE_DSN: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-zro}?sslmode=disable"
       ZRO_CONTROL_PLANE_SECRET_KEY: "${CLUSTER_SECRET:-change-me-cluster-super-secret}"
       ZRO_CONTROL_PLANE_DEFAULT_CIDR_V4: "100.64.0.0/10"
       ZRO_CONTROL_PLANE_DEFAULT_CIDR_V6: "fd00:cafe::/64"
