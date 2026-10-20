@@ -33,6 +33,8 @@ type PoPDaemon struct {
 	derpServer   *derp.Server
 	derpListener net.Listener
 	httpClient   *http.Client
+	peerCount    int
+	peersMu      sync.RWMutex
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -209,15 +211,46 @@ func (e *PoPDaemon) registerWithControlPlane(ctx context.Context) bool {
 	return false
 }
 
+func (e *PoPDaemon) sendHeartbeat(ctx context.Context) {
+	e.peersMu.RLock()
+	peersCount := e.peerCount
+	e.peersMu.RUnlock()
+
+	hbPayload := map[string]any{
+		"pop_code":        e.cfg.PoPCode,
+		"status":          "online",
+		"peers_count":     peersCount,
+		"public_endpoint": e.cfg.PublicEndpoint,
+		"timestamp":       time.Now(),
+	}
+
+	body, err := json.Marshal(hbPayload)
+	if err != nil {
+		return
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", e.cfg.PlaneEndpoint+"/api/v1/edge/heartbeat", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := e.httpClient.Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+	}
+}
+
 func (e *PoPDaemon) syncWorker(ctx context.Context) {
 	defer e.wg.Done()
 
 	registered := e.registerWithControlPlane(ctx)
 	if registered {
+		e.sendHeartbeat(ctx)
 		e.syncMeshTopology(ctx)
 	}
 
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(4 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -229,6 +262,7 @@ func (e *PoPDaemon) syncWorker(ctx context.Context) {
 				registered = e.registerWithControlPlane(ctx)
 			}
 			if registered {
+				e.sendHeartbeat(ctx)
 				e.syncMeshTopology(ctx)
 			}
 		}
@@ -255,6 +289,10 @@ func (e *PoPDaemon) syncMeshTopology(ctx context.Context) {
 	if err := json.NewDecoder(resp.Body).Decode(&syncData); err != nil {
 		return
 	}
+
+	e.peersMu.Lock()
+	e.peerCount = len(syncData.Nodes)
+	e.peersMu.Unlock()
 
 	// 1. Establish backbone mesh with other PoPs
 	for _, p := range syncData.PoPs {

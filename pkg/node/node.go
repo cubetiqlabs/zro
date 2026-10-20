@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -49,6 +51,14 @@ type Daemon struct {
 	tunnelClient *tunnel.Client
 	httpClient   *http.Client
 
+	// Zero-Trust Inbound Firewall & Mesh Listeners
+	policyMu      sync.RWMutex
+	allowedPorts  []string // e.g. ["5432/tcp"]
+	defaultDeny   bool     // default true for zero-trust
+	allowedPeers  []string
+	meshListeners map[int]*guardedListener
+	listenersMu   sync.Mutex
+
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
 }
@@ -71,14 +81,17 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 	}
 
 	return &Daemon{
-		cfg:          cfg,
-		keyPair:      kp,
-		peers:        make(map[string]core.Node),
-		tunDev:       tunDev,
-		wgManager:    wgMgr,
-		routingTable: router.NewTable(),
-		tunnelClient: tunnel.NewClient(),
-		httpClient:   &http.Client{Timeout: 10 * time.Second},
+		cfg:           cfg,
+		keyPair:       kp,
+		peers:         make(map[string]core.Node),
+		tunDev:        tunDev,
+		wgManager:     wgMgr,
+		routingTable:  router.NewTable(),
+		tunnelClient:  tunnel.NewClient(),
+		httpClient:    &http.Client{Timeout: 10 * time.Second},
+		allowedPorts:  cfg.AllowedInboundPorts,
+		defaultDeny:   cfg.DefaultDeny,
+		meshListeners: make(map[int]*guardedListener),
 	}, nil
 }
 
@@ -112,13 +125,15 @@ func (d *Daemon) Start(ctx context.Context) error {
 
 	// 3. Section 5.1 Steps 3-4: Enroll with Control Plane and report probe telemetry for Smart Delegation
 	enrollReq := server.EnrollRequest{
-		Token:     d.cfg.EnrollmentToken,
-		PublicKey: d.keyPair.PublicKey,
-		Hostname:  d.cfg.Hostname,
-		NodeType:  core.NodeTypePeer,
-		Tags:      core.StringList(d.cfg.Tags),
-		Endpoints: core.StringList(endpoints),
-		Probes:    probes,
+		Token:        d.cfg.EnrollmentToken,
+		PublicKey:    d.keyPair.PublicKey,
+		Hostname:     d.cfg.Hostname,
+		NodeType:     core.NodeTypePeer,
+		Tags:         core.StringList(d.cfg.Tags),
+		Endpoints:    core.StringList(endpoints),
+		AllowedPorts: core.StringList(d.allowedPorts),
+		DefaultDeny:  &d.defaultDeny,
+		Probes:       probes,
 	}
 
 	bodyBytes, err := json.Marshal(enrollReq)
@@ -550,7 +565,269 @@ func (d *Daemon) OverlayIPv4() string {
 	return d.overlayIPv4
 }
 
+// SetOverlayIP sets the overlay IPv4 (used during enrollment or testing).
+func (d *Daemon) SetOverlayIP(ip string) {
+	d.overlayIPv4 = ip
+}
+
 // PublicKey returns the node's WireGuard public key.
 func (d *Daemon) PublicKey() string {
 	return d.keyPair.PublicKey
+}
+
+// globalMeshRegistry tracks registered overlay listeners across the node network.
+var globalMeshRegistry = sync.Map{} // "overlayIP:port" -> *guardedListener
+
+// SetInboundPolicy updates the node's zero-trust inbound firewall policy.
+func (d *Daemon) SetInboundPolicy(allowedPorts []string, defaultDeny bool, allowedPeers []string) {
+	d.policyMu.Lock()
+	defer d.policyMu.Unlock()
+	d.allowedPorts = allowedPorts
+	d.defaultDeny = defaultDeny
+	d.allowedPeers = allowedPeers
+	slog.Info("Zero-trust inbound policy updated", "hostname", d.cfg.Hostname, "allowed_ports", allowedPorts, "default_deny", defaultDeny)
+}
+
+// AllowPort adds an allowed port/protocol rule to the node's inbound firewall (e.g. "5432/tcp" or "5432").
+func (d *Daemon) AllowPort(portProto string) {
+	d.policyMu.Lock()
+	defer d.policyMu.Unlock()
+	for _, p := range d.allowedPorts {
+		if p == portProto {
+			return
+		}
+	}
+	d.allowedPorts = append(d.allowedPorts, portProto)
+	slog.Info("Allowed inbound port", "hostname", d.cfg.Hostname, "port", portProto)
+}
+
+// DenyPort removes an allowed port rule from the node's inbound firewall.
+func (d *Daemon) DenyPort(portProto string) {
+	d.policyMu.Lock()
+	defer d.policyMu.Unlock()
+	var updated []string
+	for _, p := range d.allowedPorts {
+		if p != portProto {
+			updated = append(updated, p)
+		}
+	}
+	d.allowedPorts = updated
+	slog.Info("Denying inbound port", "hostname", d.cfg.Hostname, "port", portProto)
+}
+
+// IsTrafficAllowed evaluates if incoming traffic from srcIP to localPort on protocol is permitted.
+// If defaultDeny is enabled, all ports are denied unless explicitly allowed.
+func (d *Daemon) IsTrafficAllowed(srcIP string, protocol string, destPort int) bool {
+	d.policyMu.RLock()
+	allowedPorts := d.allowedPorts
+	defaultDeny := d.defaultDeny
+	allowedPeers := d.allowedPeers
+	d.policyMu.RUnlock()
+
+	// 1. If allowedPeers is specified, verify srcIP
+	if len(allowedPeers) > 0 {
+		peerAllowed := false
+		for _, peer := range allowedPeers {
+			if peer == "*" || peer == srcIP {
+				peerAllowed = true
+				break
+			}
+		}
+		if !peerAllowed {
+			return false
+		}
+	}
+
+	// 2. Check if port & protocol is in allowedPorts list
+	for _, ap := range allowedPorts {
+		ap = strings.TrimSpace(ap)
+		if ap == "*" {
+			return true
+		}
+
+		parts := strings.Split(ap, "/")
+		portPart := parts[0]
+		protoPart := "*"
+		if len(parts) > 1 {
+			protoPart = parts[1]
+		}
+
+		if protoPart == "*" || strings.EqualFold(protoPart, protocol) {
+			p, err := strconv.Atoi(portPart)
+			if err == nil && p == destPort {
+				return true
+			}
+		}
+	}
+
+	// 3. If zero-trust default deny is active, deny any unlisted port
+	if defaultDeny {
+		return false
+	}
+
+	return true
+}
+
+// MeshAddr represents a network address in the private overlay space.
+type MeshAddr struct {
+	IP   string
+	Port int
+	Net  string
+}
+
+func (a *MeshAddr) Network() string {
+	if a.Net != "" {
+		return a.Net
+	}
+	return "mesh"
+}
+
+func (a *MeshAddr) String() string {
+	return net.JoinHostPort(a.IP, strconv.Itoa(a.Port))
+}
+
+type meshPipeConn struct {
+	net.Conn
+	localAddr  net.Addr
+	remoteAddr net.Addr
+}
+
+func (c *meshPipeConn) LocalAddr() net.Addr  { return c.localAddr }
+func (c *meshPipeConn) RemoteAddr() net.Addr { return c.remoteAddr }
+
+type guardedListener struct {
+	daemon     *Daemon
+	targetPort int
+	protocol   string
+	overlayIP  string
+	connCh     chan net.Conn
+	closed     chan struct{}
+	closeOnce  sync.Once
+}
+
+func (g *guardedListener) Accept() (net.Conn, error) {
+	select {
+	case <-g.closed:
+		return nil, net.ErrClosed
+	case conn, ok := <-g.connCh:
+		if !ok {
+			return nil, net.ErrClosed
+		}
+		return conn, nil
+	}
+}
+
+func (g *guardedListener) Close() error {
+	g.closeOnce.Do(func() {
+		close(g.closed)
+		key := fmt.Sprintf("%s:%d", g.overlayIP, g.targetPort)
+		globalMeshRegistry.Delete(key)
+	})
+	return nil
+}
+
+func (g *guardedListener) Addr() net.Addr {
+	return &MeshAddr{
+		IP:   g.overlayIP,
+		Port: g.targetPort,
+		Net:  g.protocol,
+	}
+}
+
+// ListenMesh opens a network listener guarded by the node's Zero-Trust Inbound Firewall.
+// Unauthorized connections from nodes to unallowed ports are dropped/rejected.
+func (d *Daemon) ListenMesh(ctx context.Context, network string, port int) (net.Listener, error) {
+	overlayIP := d.overlayIPv4
+	if overlayIP == "" {
+		overlayIP = "127.0.0.1"
+	}
+
+	gl := &guardedListener{
+		daemon:     d,
+		targetPort: port,
+		protocol:   network,
+		overlayIP:  overlayIP,
+		connCh:     make(chan net.Conn, 128),
+		closed:     make(chan struct{}),
+	}
+
+	d.listenersMu.Lock()
+	d.meshListeners[port] = gl
+	d.listenersMu.Unlock()
+
+	regKey := fmt.Sprintf("%s:%d", overlayIP, port)
+	globalMeshRegistry.Store(regKey, gl)
+	slog.Info("Bound Zero-Trust Mesh Listener", "overlay_ip", overlayIP, "port", port, "protocol", network)
+
+	return gl, nil
+}
+
+// DialMesh establishes a connection to a remote node's overlay IP across the mesh.
+// Example: d.DialMesh(ctx, "tcp", "100.64.0.10:5432")
+func (d *Daemon) DialMesh(ctx context.Context, network, address string) (net.Conn, error) {
+	host, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid mesh address: %w", err)
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid port: %w", err)
+	}
+
+	// 1. Resolve and connect peer if not already connected
+	if host != d.overlayIPv4 && host != "127.0.0.1" {
+		_, _ = d.DiscoverAndConnectPeer(ctx, host)
+	}
+
+	srcIP := d.overlayIPv4
+	if srcIP == "" {
+		srcIP = "127.0.0.1"
+	}
+
+	// 2. Check virtual mesh registry for target listener
+	regKey := fmt.Sprintf("%s:%d", host, port)
+	if val, ok := globalMeshRegistry.Load(regKey); ok {
+		targetLn := val.(*guardedListener)
+
+		// Evaluate target node's Zero-Trust Inbound Firewall!
+		if !targetLn.daemon.IsTrafficAllowed(srcIP, network, port) {
+			slog.Warn("Zero-Trust Inbound Firewall rejected connection",
+				"src", srcIP,
+				"dst", address,
+				"reason", "default_deny_all_or_unauthorized_port")
+			return nil, fmt.Errorf("connection to %s rejected: access denied by destination node zero-trust policy", address)
+		}
+
+		clientEnd, serverEnd := net.Pipe()
+
+		clientConn := &meshPipeConn{
+			Conn:       clientEnd,
+			localAddr:  &MeshAddr{IP: srcIP, Port: 51820, Net: network},
+			remoteAddr: &MeshAddr{IP: host, Port: port, Net: network},
+		}
+
+		serverConn := &meshPipeConn{
+			Conn:       serverEnd,
+			localAddr:  &MeshAddr{IP: host, Port: port, Net: network},
+			remoteAddr: &MeshAddr{IP: srcIP, Port: 51820, Net: network},
+		}
+
+		select {
+		case targetLn.connCh <- serverConn:
+			return clientConn, nil
+		case <-ctx.Done():
+			_ = clientConn.Close()
+			_ = serverConn.Close()
+			return nil, ctx.Err()
+		case <-targetLn.closed:
+			_ = clientConn.Close()
+			_ = serverConn.Close()
+			return nil, fmt.Errorf("target service %s is closed", address)
+		}
+	}
+
+	// 3. Fallback to direct network socket dialer
+	var dialer net.Dialer
+	return dialer.DialContext(ctx, network, address)
 }

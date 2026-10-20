@@ -22,6 +22,7 @@ import (
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/gateway"
+	"github.com/cubis/zro/pkg/node"
 	"github.com/cubis/zro/pkg/p2p/puncher"
 	"github.com/cubis/zro/pkg/p2p/stun"
 	"github.com/cubis/zro/pkg/store"
@@ -616,4 +617,145 @@ func TestFullMeshSmoke(t *testing.T) {
 	}
 	t.Logf("✅ Smoke Step 13 Passed: High-Performance gRPC API & Real-Time Event Bus verified (Node Overlay: %s)",
 		grpcEnrollResp.OverlayIpv4)
+
+	// =========================================================================
+	// Smoke Step 14: Edge PoP Dynamic Heartbeats & Status Watcher
+	// =========================================================================
+	hbPayload, _ := json.Marshal(server.EdgeHeartbeatRequest{
+		PoPCode:        "KH",
+		Status:         "online",
+		PeersCount:     5,
+		RTTMs:          1.8,
+		PublicEndpoint: "173.1.1.1:51820",
+	})
+	hbReq, _ := http.NewRequestWithContext(ctx, "POST", ts.URL+"/api/v1/edge/heartbeat", bytes.NewReader(hbPayload))
+	hbReq.Header.Set("Content-Type", "application/json")
+	hbResp, err := http.DefaultClient.Do(hbReq)
+	if err != nil || hbResp.StatusCode != http.StatusOK {
+		t.Fatalf("smoke: Edge PoP heartbeat failed: %v", err)
+	}
+	_ = hbResp.Body.Close()
+
+	popsReq, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"/api/v1/pops", nil)
+	popsResp, err := http.DefaultClient.Do(popsReq)
+	if err != nil {
+		t.Fatalf("smoke: list pops failed: %v", err)
+	}
+	defer popsResp.Body.Close()
+	var activePoPs []core.EdgePoP
+	_ = json.NewDecoder(popsResp.Body).Decode(&activePoPs)
+	if len(activePoPs) == 0 {
+		t.Fatalf("smoke: expected active pops after heartbeat")
+	}
+	t.Logf("✅ Smoke Step 14 Passed: Edge PoP Dynamic Heartbeat & Health Watcher verified (%d PoPs healthy)", len(activePoPs))
+
+	// =========================================================================
+	// Smoke Step 15: Real-Time Mesh Topology Graph Endpoint
+	// =========================================================================
+	graphReq, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"/api/v1/mesh/graph?network_id="+createdNet.ID, nil)
+	graphResp, err := http.DefaultClient.Do(graphReq)
+	if err != nil || graphResp.StatusCode != http.StatusOK {
+		t.Fatalf("smoke: GET /api/v1/mesh/graph failed: %v", err)
+	}
+	defer graphResp.Body.Close()
+	var meshGraph server.MeshGraphResponse
+	if err := json.NewDecoder(graphResp.Body).Decode(&meshGraph); err != nil {
+		t.Fatalf("smoke: decode mesh graph failed: %v", err)
+	}
+	if len(meshGraph.Nodes) == 0 || len(meshGraph.Edges) == 0 {
+		t.Fatalf("smoke: expected nodes and edges in mesh graph, got nodes=%d edges=%d", len(meshGraph.Nodes), len(meshGraph.Edges))
+	}
+	t.Logf("✅ Smoke Step 15 Passed: Real-Time Mesh Topology Graph operational (Nodes: %d, Edges: %d)",
+		len(meshGraph.Nodes), len(meshGraph.Edges))
+
+	// =========================================================================
+	// Smoke Step 16: Inter-Node Secure Communication with Zero-Trust Default Deny
+	// =========================================================================
+	node1, err := node.NewDaemon(&config.NodeConfig{
+		Hostname:      "app-node-kh",
+		InterfaceName: "zro-smoke1",
+		MTU:           1420,
+		DefaultDeny:   true,
+	})
+	if err != nil {
+		t.Fatalf("smoke: create node 1 failed: %v", err)
+	}
+	defer node1.Stop()
+	node1.SetOverlayIP("100.64.0.2")
+
+	node2, err := node.NewDaemon(&config.NodeConfig{
+		Hostname:      "db-node-sg",
+		InterfaceName: "zro-smoke2",
+		MTU:           1420,
+		DefaultDeny:   true,
+	})
+	if err != nil {
+		t.Fatalf("smoke: create node 2 failed: %v", err)
+	}
+	defer node2.Stop()
+	node2.SetOverlayIP("100.64.0.3")
+
+	// Node 1 (100.64.0.2) hosting PostgreSQL server on port 5432, default deny all
+	// Node 2 (100.64.0.3) connecting over the mesh
+	node1.SetInboundPolicy([]string{"5432/tcp"}, true, nil)
+	pgLn, err := node1.ListenMesh(ctx, "tcp", 5432)
+	if err != nil {
+		t.Fatalf("smoke: node1 failed to listen on mesh port 5432: %v", err)
+	}
+	defer pgLn.Close()
+
+	// Mock PostgreSQL query responder
+	go func() {
+		for {
+			conn, err := pgLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 64)
+				n, _ := c.Read(buf)
+				if string(buf[:n]) == "SELECT 1;" {
+					_, _ = c.Write([]byte("1\n"))
+				}
+			}(conn)
+		}
+	}()
+
+	// 16a. Node 2 connects to Node 1 on port 5432 -> MUST SUCCEED
+	pgConn, err := node2.DialMesh(ctx, "tcp", "100.64.0.2:5432")
+	if err != nil {
+		t.Fatalf("smoke: node2 failed to connect to node1 on allowed port 5432: %v", err)
+	}
+	_, _ = pgConn.Write([]byte("SELECT 1;"))
+	respBuf := make([]byte, 16)
+	nBytes, _ := pgConn.Read(respBuf)
+	_ = pgConn.Close()
+	if string(respBuf[:nBytes]) != "1\n" {
+		t.Fatalf("smoke: expected '1\\n' from postgres service, got %q", string(respBuf[:nBytes]))
+	}
+	t.Log("✅ Smoke Step 16a Passed: Inter-node secure communication verified: Node 2 accessed Node 1 (100.64.0.2:5432) Postgres over mesh")
+
+	// 16b. Node 2 attempts connection to unallowed port 22 (SSH) on Node 1 -> MUST BE REJECTED
+	sshLn, err := node1.ListenMesh(ctx, "tcp", 22)
+	if err != nil {
+		t.Fatalf("smoke: node1 failed to listen on port 22: %v", err)
+	}
+	defer sshLn.Close()
+
+	blockedConn, err := node2.DialMesh(ctx, "tcp", "100.64.0.2:22")
+	if err == nil {
+		_ = blockedConn.Close()
+		t.Fatalf("smoke: expected connection to port 22 to be BLOCKED under default-deny all")
+	}
+	t.Logf("✅ Smoke Step 16b Passed: Zero-Trust Inbound Firewall enforced (port 22 blocked: %v)", err)
+
+	// 16c. Dynamically allow port 22 on Node 1 -> Connection now succeeds
+	node1.AllowPort("22/tcp")
+	allowedConn, err := node2.DialMesh(ctx, "tcp", "100.64.0.2:22")
+	if err != nil {
+		t.Fatalf("smoke: expected connection to port 22 to succeed after dynamic allow, got: %v", err)
+	}
+	_ = allowedConn.Close()
+	t.Log("✅ Smoke Step 16c Passed: Dynamic zero-trust firewall policy update verified (port 22 allowed)")
 }

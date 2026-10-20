@@ -116,6 +116,8 @@ type Node struct {
 	NodeType       NodeType   `gorm:"size:30;default:'peer'" json:"node_type"`
 	Tags           StringList `gorm:"type:text" json:"tags"`
 	AllowedIPs     StringList `gorm:"type:text" json:"allowed_ips"`
+	AllowedPorts   StringList `gorm:"type:text" json:"allowed_ports"` // e.g. ["5432/tcp", "80/tcp"]
+	DefaultDeny    bool       `gorm:"default:true" json:"default_deny"`
 	Endpoints      StringList `gorm:"type:text" json:"endpoints"` // reflexive/STUN public addresses
 	IsActive       bool       `gorm:"default:true" json:"is_active"`
 	LastSeenAt     time.Time  `json:"last_seen_at"`
@@ -139,6 +141,8 @@ type ACLRule struct {
 	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
 	NetworkID string    `gorm:"size:16;not null;index" json:"network_id"`
 	Priority  int       `gorm:"default:100;not null" json:"priority"`
+	SourceIP  string    `gorm:"size:50;default:'*'" json:"source_ip"`   // e.g. "100.64.0.11" or "*"
+	DestIP    string    `gorm:"size:50;default:'*'" json:"dest_ip"`     // e.g. "100.64.0.10" or "*"
 	SourceTag string    `gorm:"size:100;not null" json:"source_tag"` // e.g. "tag:web" or "*"
 	DestTag   string    `gorm:"size:100;not null" json:"dest_tag"`   // e.g. "tag:db" or "*"
 	Protocol  string    `gorm:"size:20;default:'*'" json:"protocol"` // "tcp", "udp", "icmp", "*"

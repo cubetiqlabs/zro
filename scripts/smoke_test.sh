@@ -232,6 +232,51 @@ else
     echo -e "${YELLOW}Warning: Gateway port not listening on $GW_URL (skip if not exposed)${NC}"
 fi
 
+# Step 12: Edge PoP Dynamic Heartbeat
+echo -n "Submitting Edge PoP Heartbeat ($PLANE_URL/api/v1/edge/heartbeat)... "
+HB_PAYLOAD='{"pop_code":"KH","status":"online","peers_count":3,"rtt_ms":1.2}'
+HB_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$HB_PAYLOAD" "$PLANE_URL/api/v1/edge/heartbeat")
+if [ "$HB_CODE" -eq 200 ]; then
+    echo -e "${GREEN}OK (Heartbeat acknowledged)${NC}"
+else
+    echo -e "${RED}FAILED ($HB_CODE)${NC}"
+    exit 1
+fi
+
+# Step 13: Zero-Trust Microsegmentation ACL Rule Creation
+echo -n "Configuring Zero-Trust ACL Rule for Node 2 -> Node 1 (port 5432 Postgres)... "
+ACL_PAYLOAD=$(cat <<EOF
+{
+  "network_id": "$NETWORK_ID",
+  "priority": 10,
+  "source_ip": "$NODE2_IP",
+  "dest_ip": "$NODE1_IP",
+  "protocol": "tcp",
+  "ports": "5432",
+  "action": "ALLOW"
+}
+EOF
+)
+ACL_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$ACL_PAYLOAD" "$PLANE_URL/api/v1/acl/rules")
+if [ "$ACL_CODE" -eq 201 ]; then
+    echo -e "${GREEN}OK (Rule 5432/tcp ALLOW created)${NC}"
+else
+    echo -e "${RED}FAILED ($ACL_CODE)${NC}"
+    exit 1
+fi
+
+# Step 14: Real-Time Mesh Topology Graph Verification
+echo -n "Querying Real-Time Mesh Topology Graph ($PLANE_URL/api/v1/mesh/graph)... "
+GRAPH_RESP=$(curl -s "$PLANE_URL/api/v1/mesh/graph?network_id=$NETWORK_ID")
+if echo "$GRAPH_RESP" | grep -q "nodes" && echo "$GRAPH_RESP" | grep -q "edges" && echo "$GRAPH_RESP" | grep -q "pop-KH"; then
+    NODE_COUNT=$(echo "$GRAPH_RESP" | grep -o '"id":"[^"]*' | wc -l | tr -d ' ')
+    echo -e "${GREEN}OK (Mesh graph active: $NODE_COUNT entities discovered)${NC}"
+else
+    echo -e "${RED}FAILED: Mesh graph incomplete${NC}"
+    echo "$GRAPH_RESP"
+    exit 1
+fi
+
 echo -e "${BLUE}====================================================${NC}"
 echo -e "${GREEN}   🎉 ALL ZRO PRODUCTION SMOKE TESTS PASSED!       ${NC}"
 echo -e "${BLUE}====================================================${NC}"

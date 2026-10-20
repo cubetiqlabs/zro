@@ -113,7 +113,7 @@ func (r *edgePoPRepo) GetByID(ctx context.Context, id uuid.UUID) (*core.EdgePoP,
 
 func (r *edgePoPRepo) GetByPoPCode(ctx context.Context, code string) (*core.EdgePoP, error) {
 	var pop core.EdgePoP
-	if err := r.db.WithContext(ctx).First(&pop, "pop_code = ?", code).Error; err != nil {
+	if err := r.db.WithContext(ctx).Where(&core.EdgePoP{PoPCode: code}).First(&pop).Error; err != nil {
 		return nil, err
 	}
 	return &pop, nil
@@ -127,7 +127,7 @@ func (r *edgePoPRepo) ListHealthy(ctx context.Context) ([]core.EdgePoP, error) {
 
 func (r *edgePoPRepo) ListAll(ctx context.Context) ([]core.EdgePoP, error) {
 	var pops []core.EdgePoP
-	err := r.db.WithContext(ctx).Order("pop_code asc").Find(&pops).Error
+	err := r.db.WithContext(ctx).Order("weight desc").Find(&pops).Error
 	return pops, err
 }
 

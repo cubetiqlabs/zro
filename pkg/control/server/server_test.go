@@ -268,3 +268,168 @@ func TestSmartRoutingAndP2PDiscovery(t *testing.T) {
 		t.Fatalf("expected target primary relay fallback to be SG, got %v", discResp.PrimaryPoP)
 	}
 }
+
+func TestMeshGraphAndEdgeHeartbeatsAndACLs(t *testing.T) {
+	db, err := store.NewDB("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to init db: %v", err)
+	}
+
+	secretKey := "test-secret"
+	cfg := &config.ControlPlaneConfig{
+		ListenAddr:    ":8443",
+		PublicURL:     "http://localhost:8443",
+		SecretKey:     secretKey,
+		DefaultCIDRv4: "100.64.0.0/16",
+		DefaultCIDRv6: "fd00:cafe::/64",
+	}
+
+	srv := NewServer(cfg, db)
+
+	// 1. Create Network
+	netReqBody, _ := json.Marshal(CreateNetworkRequest{
+		Name:     "Mesh Graph VPC",
+		IPv4CIDR: "100.64.0.0/10",
+		IPv6CIDR: "fd00:cafe::/64",
+	})
+	netReq := httptest.NewRequest("POST", "/api/v1/networks", bytes.NewReader(netReqBody))
+	netRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(netRec, netReq)
+	if netRec.Code != http.StatusCreated {
+		t.Fatalf("failed to create network: %s", netRec.Body.String())
+	}
+	var createdNet core.Network
+	_ = json.NewDecoder(netRec.Body).Decode(&createdNet)
+
+	// 2. Register Edge PoP and send Heartbeat
+	popReqBody, _ := json.Marshal(RegisterEdgePoPRequest{
+		PoPCode:        "KH",
+		Region:         "Cambodia",
+		PublicEndpoint: "173.1.1.1:51820",
+		PublicKey:      "kh-key=",
+		Weight:         100,
+	})
+	popReq := httptest.NewRequest("POST", "/api/v1/edge/register", bytes.NewReader(popReqBody))
+	popRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(popRec, popReq)
+	if popRec.Code != http.StatusOK {
+		t.Fatalf("failed to register edge pop: %s", popRec.Body.String())
+	}
+
+	hbBody, _ := json.Marshal(EdgeHeartbeatRequest{
+		PoPCode:        "KH",
+		Status:         "online",
+		PeersCount:     3,
+		RTTMs:          1.5,
+		PublicEndpoint: "173.1.1.1:51820",
+	})
+	hbReq := httptest.NewRequest("POST", "/api/v1/edge/heartbeat", bytes.NewReader(hbBody))
+	hbRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(hbRec, hbReq)
+	if hbRec.Code != http.StatusOK {
+		t.Fatalf("failed to process edge heartbeat: %s", hbRec.Body.String())
+	}
+
+	// 3. Test ACL API (Microsegmentation: Node 2 -> Node 1 on port 5432 ALLOW)
+	aclReqBody, _ := json.Marshal(CreateACLRuleRequest{
+		NetworkID: createdNet.ID,
+		Priority:  10,
+		SourceIP:  "100.64.0.11",
+		DestIP:    "100.64.0.10",
+		Protocol:  "tcp",
+		Ports:     "5432",
+		Action:    core.ACLActionAllow,
+	})
+	aclReq := httptest.NewRequest("POST", "/api/v1/acl/rules", bytes.NewReader(aclReqBody))
+	aclRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(aclRec, aclReq)
+	if aclRec.Code != http.StatusCreated {
+		t.Fatalf("failed to create ACL rule: %s", aclRec.Body.String())
+	}
+
+	listAclReq := httptest.NewRequest("GET", "/api/v1/acl/rules?network_id="+createdNet.ID, nil)
+	listAclRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(listAclRec, listAclReq)
+	var rules []core.ACLRule
+	_ = json.NewDecoder(listAclRec.Body).Decode(&rules)
+	if len(rules) != 1 || rules[0].Ports != "5432" {
+		t.Fatalf("expected 1 ACL rule on port 5432, got %v", rules)
+	}
+
+	// 4. Enroll Node 1 (hosts postgres: 5432/tcp) and Node 2
+	kp1, _ := crypto.GenerateKeyPair()
+	tok1 := crypto.GenerateEnrollmentToken(secretKey, createdNet.ID, "node1", 1*time.Hour, kp1.PublicKey)
+	enroll1Body, _ := json.Marshal(EnrollRequest{
+		Token:        tok1,
+		PublicKey:    kp1.PublicKey,
+		Hostname:     "node1",
+		NodeType:     core.NodeTypePeer,
+		AllowedPorts: core.StringList{"5432/tcp"},
+	})
+	eReq1 := httptest.NewRequest("POST", "/api/v1/enroll", bytes.NewReader(enroll1Body))
+	eRec1 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(eRec1, eReq1)
+	var eRes1 EnrollResponse
+	_ = json.NewDecoder(eRec1.Body).Decode(&eRes1)
+
+	kp2, _ := crypto.GenerateKeyPair()
+	tok2 := crypto.GenerateEnrollmentToken(secretKey, createdNet.ID, "node2", 1*time.Hour, kp2.PublicKey)
+	enroll2Body, _ := json.Marshal(EnrollRequest{
+		Token:     tok2,
+		PublicKey: kp2.PublicKey,
+		Hostname:  "node2",
+		NodeType:  core.NodeTypePeer,
+	})
+	eReq2 := httptest.NewRequest("POST", "/api/v1/enroll", bytes.NewReader(enroll2Body))
+	eRec2 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(eRec2, eReq2)
+	var eRes2 EnrollResponse
+	_ = json.NewDecoder(eRec2.Body).Decode(&eRes2)
+
+	// 5. Query Real-Time Mesh Topology Graph
+	graphReq := httptest.NewRequest("GET", "/api/v1/mesh/graph?network_id="+createdNet.ID, nil)
+	graphRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(graphRec, graphReq)
+
+	if graphRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for mesh graph, got %d: %s", graphRec.Code, graphRec.Body.String())
+	}
+
+	var graphResp MeshGraphResponse
+	if err := json.NewDecoder(graphRec.Body).Decode(&graphResp); err != nil {
+		t.Fatalf("failed to decode mesh graph response: %v", err)
+	}
+
+	if len(graphResp.Nodes) < 3 { // pop-KH, node1, node2
+		t.Fatalf("expected at least 3 nodes in graph, got %d", len(graphResp.Nodes))
+	}
+
+	var foundNode1, foundNode2, foundPoPKH bool
+	for _, n := range graphResp.Nodes {
+		if n.Hostname == "node1" {
+			foundNode1 = true
+			if len(n.AllowedPorts) == 0 || n.AllowedPorts[0] != "5432/tcp" {
+				t.Fatalf("expected node1 allowed port 5432/tcp, got %v", n.AllowedPorts)
+			}
+		}
+		if n.Hostname == "node2" {
+			foundNode2 = true
+		}
+		if n.Hostname == "pop-KH" {
+			foundPoPKH = true
+			if n.Status != "online" {
+				t.Fatalf("expected pop-KH to be online after heartbeat, got %s", n.Status)
+			}
+		}
+	}
+
+	if !foundNode1 || !foundNode2 || !foundPoPKH {
+		t.Fatalf("missing nodes in mesh graph (node1: %v, node2: %v, pop-KH: %v)", foundNode1, foundNode2, foundPoPKH)
+	}
+
+	// Check edges
+	if len(graphResp.Edges) == 0 {
+		t.Fatalf("expected edges in graph, got 0")
+	}
+	t.Logf("✅ Real-Time Mesh Topology Graph verified: %d nodes, %d edges", len(graphResp.Nodes), len(graphResp.Edges))
+}

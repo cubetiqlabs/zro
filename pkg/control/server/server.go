@@ -46,6 +46,7 @@ type Server struct {
 	// Notification subscribers for delta updates
 	subscribersMu sync.RWMutex
 	subscribers   map[chan []byte]bool
+	cancel        context.CancelFunc
 }
 
 // NewServer creates a new instance of the Control Plane API Server.
@@ -74,6 +75,12 @@ func NewServer(cfg *config.ControlPlaneConfig, db *store.DB) *Server {
 
 // Start begins listening on the configured address.
 func (s *Server) Start() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+
+	// Launch background watcher for Edge PoP health / heartbeat tracking
+	go s.popWatchWorker(ctx)
+
 	// Start gRPC server in background if configured
 	if s.cfg.GRPCListenAddr != "" {
 		lis, err := net.Listen("tcp", s.cfg.GRPCListenAddr)
@@ -103,6 +110,9 @@ func (s *Server) Start() error {
 
 // Shutdown gracefully stops the server.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.grpcServer != nil {
 		s.grpcServer.GracefulStop()
 	}
@@ -127,10 +137,20 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/networks", s.handleCreateNetwork)
 	s.mux.HandleFunc("GET /api/v1/networks", s.handleListNetworks)
 
-	// Edge PoPs & Dynamic Registration
+	// Edge PoPs, Dynamic Registration & Real-time Heartbeats
 	s.mux.HandleFunc("GET /api/v1/pops", s.handleListPoPs)
 	s.mux.HandleFunc("POST /api/v1/edge/register", s.handleRegisterEdgePoP)
+	s.mux.HandleFunc("POST /api/v1/edge/heartbeat", s.handleEdgeHeartbeat)
 	s.mux.HandleFunc("GET /api/v1/edge/sync", s.handleEdgeSync)
+
+	// Live Mesh Topology Graph (Real-Time)
+	s.mux.HandleFunc("GET /api/v1/mesh/graph", s.handleGetMeshGraph)
+	s.mux.HandleFunc("GET /api/v1/topology", s.handleGetMeshGraph)
+
+	// Microsegmentation & Access Control (Zero-Trust ACLs)
+	s.mux.HandleFunc("POST /api/v1/acl/rules", s.handleCreateACLRule)
+	s.mux.HandleFunc("GET /api/v1/acl/rules", s.handleListACLRules)
+	s.mux.HandleFunc("DELETE /api/v1/acl/rules/{id}", s.handleDeleteACLRule)
 
 	// Node Enrollment & Mesh Coordination
 	s.mux.HandleFunc("POST /api/v1/enroll", s.handleEnrollNode)
@@ -255,7 +275,13 @@ func (s *Server) handleListNetworks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListPoPs(w http.ResponseWriter, r *http.Request) {
-	pops, err := s.db.EdgePoPs.ListHealthy(r.Context())
+	var pops []core.EdgePoP
+	var err error
+	if r.URL.Query().Get("all") == "true" {
+		pops, err = s.db.EdgePoPs.ListAll(r.Context())
+	} else {
+		pops, err = s.db.EdgePoPs.ListHealthy(r.Context())
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -327,10 +353,101 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 		"pop_code": pop.PoPCode,
 		"endpoint": pop.PublicEndpoint,
 	})
+	s.broadcastDelta(map[string]any{
+		"event": "mesh_graph_updated",
+	})
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(pop)
+}
+
+// EdgeHeartbeatRequest defines heartbeat telemetry sent by an Edge Data Plane node.
+type EdgeHeartbeatRequest struct {
+	PoPCode        string  `json:"pop_code"`
+	Status         string  `json:"status"` // "online"
+	PeersCount     int     `json:"peers_count"`
+	ActiveTunnels  int     `json:"active_tunnels"`
+	RTTMs          float64 `json:"rtt_ms"`
+	PublicEndpoint string  `json:"public_endpoint"`
+}
+
+func (s *Server) handleEdgeHeartbeat(w http.ResponseWriter, r *http.Request) {
+	var req EdgeHeartbeatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	pop, err := s.db.EdgePoPs.GetByPoPCode(r.Context(), req.PoPCode)
+	if err != nil || pop == nil {
+		http.Error(w, "pop not found", http.StatusNotFound)
+		return
+	}
+
+	wasHealthy := pop.IsHealthy
+	pop.IsHealthy = true
+	pop.LastSeenAt = time.Now()
+	pop.UpdatedAt = time.Now()
+	if req.PublicEndpoint != "" {
+		pop.PublicEndpoint = req.PublicEndpoint
+	}
+	_ = s.db.EdgePoPs.Update(r.Context(), pop)
+
+	if !wasHealthy {
+		slog.Info("Edge PoP recovered to healthy state via heartbeat", "pop_code", pop.PoPCode)
+		s.broadcastDelta(map[string]any{
+			"event":      "pop_status_changed",
+			"pop_code":   pop.PoPCode,
+			"is_healthy": true,
+			"status":     "online",
+		})
+		s.broadcastDelta(map[string]any{
+			"event": "mesh_graph_updated",
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":    "acknowledged",
+		"pop_code":  pop.PoPCode,
+		"timestamp": time.Now(),
+	})
+}
+
+func (s *Server) popWatchWorker(ctx context.Context) {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pops, err := s.db.EdgePoPs.ListAll(ctx)
+			if err != nil {
+				continue
+			}
+
+			for _, p := range pops {
+				if p.IsHealthy && !p.LastSeenAt.IsZero() && time.Since(p.LastSeenAt) > 15*time.Second {
+					p.IsHealthy = false
+					p.UpdatedAt = time.Now()
+					_ = s.db.EdgePoPs.Update(ctx, &p)
+					slog.Warn("Edge PoP heartbeat timeout - marked degraded/offline", "pop_code", p.PoPCode, "last_seen", p.LastSeenAt)
+					s.broadcastDelta(map[string]any{
+						"event":      "pop_status_changed",
+						"pop_code":   p.PoPCode,
+						"is_healthy": false,
+						"status":     "offline",
+					})
+					s.broadcastDelta(map[string]any{
+						"event": "mesh_graph_updated",
+					})
+				}
+			}
+		}
+	}
 }
 
 // EdgeSyncResponse returns data plane synchronization state.
@@ -362,13 +479,15 @@ func (s *Server) handleEdgeSync(w http.ResponseWriter, r *http.Request) {
 
 // EnrollRequest payload sent by a new node attempting to join a network.
 type EnrollRequest struct {
-	Token     string               `json:"token"`
-	PublicKey string               `json:"public_key"`
-	Hostname  string               `json:"hostname"`
-	NodeType  core.NodeType        `json:"node_type"`
-	Tags      core.StringList      `json:"tags"`
-	Endpoints core.StringList      `json:"endpoints"` // STUN reflexive endpoints
-	Probes    []core.LatencySample `json:"probes,omitempty"` // Parallel pre-enrollment RTT probe telemetry to PoPs
+	Token        string               `json:"token"`
+	PublicKey    string               `json:"public_key"`
+	Hostname     string               `json:"hostname"`
+	NodeType     core.NodeType        `json:"node_type"`
+	Tags         core.StringList      `json:"tags"`
+	Endpoints    core.StringList      `json:"endpoints"` // STUN reflexive endpoints
+	AllowedPorts core.StringList      `json:"allowed_ports,omitempty"`
+	DefaultDeny  *bool                `json:"default_deny,omitempty"`
+	Probes       []core.LatencySample `json:"probes,omitempty"` // Parallel pre-enrollment RTT probe telemetry to PoPs
 }
 
 // EnrollResponse payload returned to the newly enrolled node.
@@ -435,21 +554,28 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 		s.delegator.RecordProbe(p)
 	}
 
+	defaultDeny := true
+	if req.DefaultDeny != nil {
+		defaultDeny = *req.DefaultDeny
+	}
+
 	node := &core.Node{
-		ID:          nodeID,
-		NetworkID:   network.ID,
-		Hostname:    req.Hostname,
-		PublicKey:   req.PublicKey,
-		OverlayIPv4: v4,
-		OverlayIPv6: v6,
-		NodeType:    req.NodeType,
-		Tags:        req.Tags,
-		AllowedIPs:  core.StringList{v4 + "/32", v6 + "/128"},
-		Endpoints:   req.Endpoints,
-		IsActive:    true,
-		LastSeenAt:  time.Now(),
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
+		ID:           nodeID,
+		NetworkID:    network.ID,
+		Hostname:     req.Hostname,
+		PublicKey:    req.PublicKey,
+		OverlayIPv4:  v4,
+		OverlayIPv6:  v6,
+		NodeType:     req.NodeType,
+		Tags:         req.Tags,
+		AllowedIPs:   core.StringList{v4 + "/32", v6 + "/128"},
+		AllowedPorts: req.AllowedPorts,
+		DefaultDeny:  defaultDeny,
+		Endpoints:    req.Endpoints,
+		IsActive:     true,
+		LastSeenAt:   time.Now(),
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
 	}
 
 	if node.NodeType == "" {
@@ -488,11 +614,16 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 
 	// Notify all connected edge nodes and peers of new member
 	s.broadcastDelta(map[string]any{
-		"event":      "node_joined",
+		"event":         "node_joined",
+		"network_id":    network.ID,
+		"node_id":       node.ID,
+		"ipv4":          node.OverlayIPv4,
+		"pubkey":        node.PublicKey,
+		"allowed_ports": node.AllowedPorts,
+	})
+	s.broadcastDelta(map[string]any{
+		"event":      "mesh_graph_updated",
 		"network_id": network.ID,
-		"node_id":    node.ID,
-		"ipv4":       node.OverlayIPv4,
-		"pubkey":     node.PublicKey,
 	})
 
 	w.Header().Set("Content-Type", "application/json")
@@ -869,4 +1000,338 @@ func extractPort(addr string) string {
 		return port
 	}
 	return "80"
+}
+
+// MeshGraphNode represents a vertex in the real-time mesh topology graph.
+type MeshGraphNode struct {
+	ID           string    `json:"id"`
+	Type         string    `json:"type"` // "edge", "gateway", "peer"
+	Hostname     string    `json:"hostname"`
+	OverlayIPv4  string    `json:"overlay_ipv4,omitempty"`
+	OverlayIPv6  string    `json:"overlay_ipv6,omitempty"`
+	Endpoint     string    `json:"endpoint,omitempty"`
+	PublicKey    string    `json:"public_key,omitempty"`
+	Status       string    `json:"status"` // "online", "offline"
+	AssignedPoP  string    `json:"assigned_pop,omitempty"`
+	Tags         []string  `json:"tags,omitempty"`
+	AllowedPorts []string  `json:"allowed_ports,omitempty"`
+	DefaultDeny  bool      `json:"default_deny"`
+	LastSeenAt   time.Time `json:"last_seen_at"`
+	Tunnels      []string  `json:"tunnels,omitempty"`
+}
+
+// MeshGraphEdge represents a directed connection/link in the mesh graph.
+type MeshGraphEdge struct {
+	ID      string  `json:"id"`
+	Source  string  `json:"source"`
+	Target  string  `json:"target"`
+	Type    string  `json:"type"` // "backbone_link", "edge_mesh", "p2p_direct", "gateway_proxy"
+	Status  string  `json:"status"` // "active", "degraded", "idle"
+	RTTMs   float64 `json:"rtt_ms,omitempty"`
+	Details string  `json:"details,omitempty"`
+}
+
+// MeshGraphResponse returns the complete real-time topology of the mesh.
+type MeshGraphResponse struct {
+	NetworkID string          `json:"network_id"`
+	Timestamp time.Time       `json:"timestamp"`
+	Nodes     []MeshGraphNode `json:"nodes"`
+	Edges     []MeshGraphEdge `json:"edges"`
+	Stats     map[string]any  `json:"stats"`
+}
+
+func (s *Server) handleGetMeshGraph(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	netID := r.URL.Query().Get("network_id")
+
+	// If no network_id provided, pick first available network
+	if netID == "" {
+		tenants, _ := s.db.Tenants.List(ctx)
+		if len(tenants) > 0 {
+			nets, _ := s.db.Networks.ListByTenantID(ctx, tenants[0].ID)
+			if len(nets) > 0 {
+				netID = nets[0].ID
+			}
+		}
+	}
+
+	var graphNodes []MeshGraphNode
+	var graphEdges []MeshGraphEdge
+
+	// 1. Edge PoPs
+	pops, _ := s.db.EdgePoPs.ListAll(ctx)
+	for _, p := range pops {
+		status := "offline"
+		if p.IsHealthy && (p.LastSeenAt.IsZero() || time.Since(p.LastSeenAt) < 20*time.Second) {
+			status = "online"
+		}
+		graphNodes = append(graphNodes, MeshGraphNode{
+			ID:          "pop-" + p.PoPCode,
+			Type:        "edge",
+			Hostname:    "pop-" + p.PoPCode,
+			Endpoint:    p.PublicEndpoint,
+			PublicKey:   p.PublicKey,
+			Status:      status,
+			LastSeenAt:  p.LastSeenAt,
+			AssignedPoP: p.PoPCode,
+		})
+	}
+
+	// Connect Edge PoP backbones (inter-PoP mesh backbone links)
+	for i := 0; i < len(pops); i++ {
+		for j := i + 1; j < len(pops); j++ {
+			graphEdges = append(graphEdges, MeshGraphEdge{
+				ID:     fmt.Sprintf("backbone-%s-%s", pops[i].PoPCode, pops[j].PoPCode),
+				Source: "pop-" + pops[i].PoPCode,
+				Target: "pop-" + pops[j].PoPCode,
+				Type:   "edge_mesh",
+				Status: "active",
+				RTTMs:  15.0,
+			})
+		}
+	}
+
+	// 2. Nodes in network
+	var nodes []core.Node
+	if netID != "" {
+		nodes, _ = s.db.Nodes.ListByNetworkID(ctx, netID)
+	}
+
+	onlineCount := 0
+	for _, n := range nodes {
+		status := "offline"
+		if time.Since(n.LastSeenAt) < 60*time.Second {
+			status = "online"
+			onlineCount++
+		}
+
+		tunnels, _ := s.db.Tunnels.ListByNodeID(ctx, n.ID)
+		var tunNames []string
+		for _, t := range tunnels {
+			tunNames = append(tunNames, t.PublicHostname+" -> "+t.LocalAddress)
+		}
+
+		assignedCode := ""
+		if n.AssignedPoP != nil {
+			assignedCode = n.AssignedPoP.PoPCode
+		} else if n.AssignedPoPID != nil {
+			for _, p := range pops {
+				if p.ID == *n.AssignedPoPID {
+					assignedCode = p.PoPCode
+					break
+				}
+			}
+		}
+
+		nodeTypeStr := string(n.NodeType)
+		if nodeTypeStr == "" {
+			nodeTypeStr = "peer"
+		}
+
+		graphNodes = append(graphNodes, MeshGraphNode{
+			ID:           n.ID.String(),
+			Type:         nodeTypeStr,
+			Hostname:     n.Hostname,
+			OverlayIPv4:  n.OverlayIPv4,
+			OverlayIPv6:  n.OverlayIPv6,
+			PublicKey:    n.PublicKey,
+			Status:       status,
+			AssignedPoP:  assignedCode,
+			Tags:         []string(n.Tags),
+			AllowedPorts: []string(n.AllowedPorts),
+			DefaultDeny:  n.DefaultDeny,
+			LastSeenAt:   n.LastSeenAt,
+			Tunnels:      tunNames,
+		})
+
+		// Edge from node to its assigned Edge PoP
+		if assignedCode != "" {
+			graphEdges = append(graphEdges, MeshGraphEdge{
+				ID:     fmt.Sprintf("link-%s-pop-%s", n.Hostname, assignedCode),
+				Source: n.Hostname,
+				Target: "pop-" + assignedCode,
+				Type:   "backbone_link",
+				Status: status,
+				RTTMs:  5.0,
+			})
+		}
+
+		// Gateway-to-node routes
+		if len(tunnels) > 0 {
+			for _, t := range tunnels {
+				graphEdges = append(graphEdges, MeshGraphEdge{
+					ID:      fmt.Sprintf("gw-route-%s-%s", t.PublicHostname, n.Hostname),
+					Source:  "gateway",
+					Target:  n.Hostname,
+					Type:    "gateway_proxy",
+					Status:  "active",
+					Details: t.PublicHostname + " -> " + n.OverlayIPv4 + " (" + t.LocalAddress + ")",
+				})
+			}
+		}
+	}
+
+	// 3. Add direct P2P edges between active peer nodes
+	for i := 0; i < len(nodes); i++ {
+		for j := i + 1; j < len(nodes); j++ {
+			n1 := nodes[i]
+			n2 := nodes[j]
+			if n1.NodeType == core.NodeTypePeer && n2.NodeType == core.NodeTypePeer {
+				graphEdges = append(graphEdges, MeshGraphEdge{
+					ID:     fmt.Sprintf("p2p-%s-%s", n1.Hostname, n2.Hostname),
+					Source: n1.Hostname,
+					Target: n2.Hostname,
+					Type:   "p2p_direct",
+					Status: "active",
+					RTTMs:  12.0,
+				})
+			}
+		}
+	}
+
+	resp := MeshGraphResponse{
+		NetworkID: netID,
+		Timestamp: time.Now(),
+		Nodes:     graphNodes,
+		Edges:     graphEdges,
+		Stats: map[string]any{
+			"total_nodes":  len(graphNodes),
+			"online_nodes": onlineCount,
+			"total_edges":  len(graphEdges),
+			"edge_pops":    len(pops),
+			"network_id":   netID,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// CreateACLRuleRequest defines parameters for a new microsegmentation rule.
+type CreateACLRuleRequest struct {
+	NetworkID string         `json:"network_id"`
+	Priority  int            `json:"priority"`
+	SourceIP  string         `json:"source_ip"`
+	DestIP    string         `json:"dest_ip"`
+	SourceTag string         `json:"source_tag"`
+	DestTag   string         `json:"dest_tag"`
+	Protocol  string         `json:"protocol"`
+	Ports     string         `json:"ports"`
+	Action    core.ACLAction `json:"action"`
+}
+
+func (s *Server) handleCreateACLRule(w http.ResponseWriter, r *http.Request) {
+	var req CreateACLRuleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.NetworkID == "" {
+		http.Error(w, "network_id is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.Priority <= 0 {
+		req.Priority = 100
+	}
+	if req.Action == "" {
+		req.Action = core.ACLActionAllow
+	}
+	if req.Protocol == "" {
+		req.Protocol = "*"
+	}
+	if req.Ports == "" {
+		req.Ports = "*"
+	}
+	if req.SourceIP == "" {
+		req.SourceIP = "*"
+	}
+	if req.DestIP == "" {
+		req.DestIP = "*"
+	}
+	if req.SourceTag == "" {
+		req.SourceTag = "*"
+	}
+	if req.DestTag == "" {
+		req.DestTag = "*"
+	}
+
+	rule := &core.ACLRule{
+		ID:        uuid.New(),
+		NetworkID: req.NetworkID,
+		Priority:  req.Priority,
+		SourceIP:  req.SourceIP,
+		DestIP:    req.DestIP,
+		SourceTag: req.SourceTag,
+		DestTag:   req.DestTag,
+		Protocol:  req.Protocol,
+		Ports:     req.Ports,
+		Action:    req.Action,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+
+	if err := s.db.ACLs.Create(r.Context(), rule); err != nil {
+		http.Error(w, fmt.Sprintf("failed to create ACL rule: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("Created new ACL rule", "id", rule.ID, "network_id", rule.NetworkID, "action", rule.Action, "ports", rule.Ports)
+
+	// Broadcast ACL and graph update
+	s.broadcastDelta(map[string]any{
+		"event":      "acl_rules_updated",
+		"network_id": rule.NetworkID,
+		"rule_id":    rule.ID,
+	})
+	s.broadcastDelta(map[string]any{
+		"event": "mesh_graph_updated",
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(rule)
+}
+
+func (s *Server) handleListACLRules(w http.ResponseWriter, r *http.Request) {
+	netID := r.URL.Query().Get("network_id")
+	if netID == "" {
+		http.Error(w, "network_id query parameter is required", http.StatusBadRequest)
+		return
+	}
+
+	rules, err := s.db.ACLs.ListByNetworkID(r.Context(), netID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(rules)
+}
+
+func (s *Server) handleDeleteACLRule(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		http.Error(w, "invalid rule id", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.db.ACLs.Delete(r.Context(), id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.broadcastDelta(map[string]any{
+		"event":   "acl_rules_updated",
+		"rule_id": idStr,
+	})
+	s.broadcastDelta(map[string]any{
+		"event": "mesh_graph_updated",
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
 }

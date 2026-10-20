@@ -54,16 +54,18 @@ type LocalTunnelConfig struct {
 
 // NodeConfig configures the zro-node client daemon.
 type NodeConfig struct {
-	Hostname        string              `mapstructure:"hostname"`
-	NetworkID       string              `mapstructure:"network_id"`
-	EnrollmentToken string              `mapstructure:"enrollment_token"`
-	PlaneEndpoint   string              `mapstructure:"plane_endpoint"`
-	InterfaceMode   string              `mapstructure:"interface_mode"` // "tun" or "netstack"
-	InterfaceName   string              `mapstructure:"interface_name"` // "zro0"
-	MTU             int                 `mapstructure:"mtu"`
-	EnableP2P       bool                `mapstructure:"enable_p2p"`
-	Tags            []string            `mapstructure:"tags"`
-	Tunnels         []LocalTunnelConfig `mapstructure:"tunnels"`
+	Hostname            string              `mapstructure:"hostname"`
+	NetworkID           string              `mapstructure:"network_id"`
+	EnrollmentToken     string              `mapstructure:"enrollment_token"`
+	PlaneEndpoint       string              `mapstructure:"plane_endpoint"`
+	InterfaceMode       string              `mapstructure:"interface_mode"` // "tun" or "netstack"
+	InterfaceName       string              `mapstructure:"interface_name"` // "zro0"
+	MTU                 int                 `mapstructure:"mtu"`
+	EnableP2P           bool                `mapstructure:"enable_p2p"`
+	Tags                []string            `mapstructure:"tags"`
+	AllowedInboundPorts []string            `mapstructure:"allowed_inbound_ports"` // e.g. ["5432/tcp"]
+	DefaultDeny         bool                `mapstructure:"default_deny"`           // zero-trust default deny all
+	Tunnels             []LocalTunnelConfig `mapstructure:"tunnels"`
 }
 
 // StaticRouteConfig defines pre-configured upstream routes in zro.yaml.
@@ -128,6 +130,7 @@ func Load(cfgFile string) (*AppConfig, error) {
 	v.SetDefault("node.interface_name", "zro0")
 	v.SetDefault("node.mtu", 1420)
 	v.SetDefault("node.enable_p2p", true)
+	v.SetDefault("node.default_deny", true)
 	v.SetDefault("node.plane_endpoint", "https://zro-plane.cubis.tech:443")
 
 	// Gateway defaults
