@@ -64,6 +64,10 @@ func NewDB(driverName, dsn string) (*DB, error) {
 		return nil, fmt.Errorf("failed to auto-migrate database schema: %w", err)
 	}
 
+	// Drop legacy UNIQUE index on tunnels(public_hostname) if present to allow multi-node clustering
+	_ = gormDB.Exec("DROP INDEX IF EXISTS idx_tunnels_public_hostname").Error
+	_ = gormDB.Exec("CREATE INDEX IF NOT EXISTS idx_tunnels_public_hostname ON tunnels(public_hostname)").Error
+
 	slog.Info("Database schema migrated successfully", "driver", driverName)
 
 	dbInstance := &DB{
