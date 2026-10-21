@@ -50,15 +50,22 @@ func TestIngressReachesLocalServiceOverWireGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	gwPort := gw.udpConn.LocalAddr().(*net.UDPAddr).Port
-	if err := n.AddDirectPeer(core.Node{PublicKey: gw.PublicKey(), OverlayIPv4: "100.64.0.31"}, fmt.Sprintf("127.0.0.1:%d", gwPort), true); err != nil {
-		t.Fatal(err)
-	}
+	// The responder (gateway) first, then the initiator (node), then wait for the session.
 	if err := gw.wgManager.ApplyPeer(wireguard.PeerConfig{
 		PublicKey:  n.PublicKey(),
 		Endpoint:   fmt.Sprintf("127.0.0.1:%d", n.UDPPort()),
 		AllowedIPs: []string{"100.64.0.30/32"},
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if err := n.AddDirectPeer(core.Node{PublicKey: gw.PublicKey(), OverlayIPv4: "100.64.0.31"}, fmt.Sprintf("127.0.0.1:%d", gwPort), true); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; !n.PeerHandshaken(gw.PublicKey()); i++ {
+		if i > 300 {
+			t.Fatal("WireGuard handshake never completed")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	if err := n.ExposeTunnel(ctx, svcAddr); err != nil {

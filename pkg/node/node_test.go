@@ -35,11 +35,21 @@ func linkNodes(t *testing.T, a, b *Daemon) {
 	t.Helper()
 	pa := core.Node{PublicKey: a.PublicKey(), OverlayIPv4: a.OverlayIPv4(), Hostname: a.cfg.Hostname}
 	pb := core.Node{PublicKey: b.PublicKey(), OverlayIPv4: b.OverlayIPv4(), Hostname: b.cfg.Hostname}
+	// The responder first, so it already knows the initiator when the handshake arrives.
+	if err := b.AddDirectPeer(pa, fmt.Sprintf("127.0.0.1:%d", a.UDPPort()), false); err != nil {
+		t.Fatal(err)
+	}
 	if err := a.AddDirectPeer(pb, fmt.Sprintf("127.0.0.1:%d", b.UDPPort()), true); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.AddDirectPeer(pa, fmt.Sprintf("127.0.0.1:%d", a.UDPPort()), false); err != nil {
-		t.Fatal(err)
+	// Dial only once the session is up: a SYN sent earlier would be lost and TCP
+	// retransmits back off exponentially.
+	deadline := time.Now().Add(15 * time.Second)
+	for !a.PeerHandshaken(b.PublicKey()) {
+		if time.Now().After(deadline) {
+			t.Fatal("WireGuard handshake between the nodes never completed")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

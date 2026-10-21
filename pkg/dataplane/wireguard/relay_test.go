@@ -109,3 +109,36 @@ func TestWireGuardOverRelay(t *testing.T) {
 		t.Fatal("no reply arrived through the relay")
 	}
 }
+
+// TestNudgeStartsHandshakeAfterRemoteLearnsUs: the initiator's first handshake
+// is dropped because the remote does not know it yet; once the remote adds the
+// peer, a nudge must complete the handshake without waiting for the 5s retry.
+func TestNudgeStartsHandshakeAfterRemoteLearnsUs(t *testing.T) {
+	a, b := newSide(t, "nudge-a"), newSide(t, "nudge-b")
+	bAddr := b.udp.LocalAddr().(*net.UDPAddr)
+	aAddr := a.udp.LocalAddr().(*net.UDPAddr)
+
+	if err := a.mgr.ApplyPeer(PeerConfig{PublicKey: b.kp.PublicKey, Endpoint: bAddr.String(), AllowedIPs: []string{"100.64.0.2/32"}, PersistentKeepalive: 25 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // the initiation reaches b, which has no such peer
+	if at, _ := a.mgr.LastHandshake(b.kp.PublicKey); !at.IsZero() {
+		t.Fatal("no handshake can exist yet")
+	}
+
+	if err := b.mgr.ApplyPeer(PeerConfig{PublicKey: a.kp.PublicKey, Endpoint: aAddr.String(), AllowedIPs: []string{"100.64.0.1/32"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.mgr.Nudge(b.kp.PublicKey); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second) // well under WireGuard's 5s retry
+	for time.Now().Before(deadline) {
+		if at, _ := a.mgr.LastHandshake(b.kp.PublicKey); !at.IsZero() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("nudge did not start a handshake")
+}

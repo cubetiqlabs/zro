@@ -16,10 +16,11 @@ import (
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
 )
 
-const (
-	nodeKeepalive = 25 * time.Second
-	popKeepalive  = 20 * time.Second
-)
+// popKeepalive keeps a PoP-to-PoP backbone link up. Only one end may start with
+// a keepalive: if both did they would initiate handshakes at the same instant
+// and keep colliding. Nodes initiate toward the PoP themselves (their keepalive
+// also holds their NAT mapping open), so the PoP sets none toward nodes.
+const popKeepalive = 20 * time.Second
 
 // meshState is the plane's view of the mesh as synchronized to this edge.
 type meshState struct {
@@ -41,11 +42,11 @@ func planPeers(self string, st *meshState) []wireguard.PeerConfig {
 	pops := make(map[string]*wireguard.PeerConfig)
 	for _, p := range st.PoPs {
 		if p.PoPCode != self && p.PublicKey != "" {
-			pops[p.PoPCode] = &wireguard.PeerConfig{
-				PublicKey:           p.PublicKey,
-				Endpoint:            p.PublicEndpoint,
-				PersistentKeepalive: popKeepalive,
+			cfg := &wireguard.PeerConfig{PublicKey: p.PublicKey, Endpoint: p.PublicEndpoint}
+			if self < p.PoPCode { // the lower code initiates
+				cfg.PersistentKeepalive = popKeepalive
 			}
+			pops[p.PoPCode] = cfg
 		}
 	}
 
@@ -68,10 +69,9 @@ func planPeers(self string, st *meshState) []wireguard.PeerConfig {
 			endpoint = n.Endpoints[0]
 		}
 		peers = append(peers, wireguard.PeerConfig{
-			PublicKey:           n.PublicKey,
-			Endpoint:            endpoint,
-			AllowedIPs:          ips,
-			PersistentKeepalive: nodeKeepalive,
+			PublicKey:  n.PublicKey,
+			Endpoint:   endpoint,
+			AllowedIPs: ips,
 		})
 	}
 

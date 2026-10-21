@@ -64,6 +64,21 @@ func TestPlanPeersRoutesRemoteNodesViaTheirHomePoP(t *testing.T) {
 		t.Fatalf("DE should carry both of its nodes (v4+v6), got %v", got)
 	}
 
+	// Handshake initiation: the PoP never initiates toward nodes, and on the
+	// backbone only the lower PoP code does (DE < KH < SG).
+	if peers["n-local"].PersistentKeepalive != 0 {
+		t.Fatal("a PoP must not start handshakes toward nodes")
+	}
+	if peers["pop-sg"].PersistentKeepalive == 0 {
+		t.Fatal("KH < SG, so KH must initiate toward SG")
+	}
+	if peers["pop-de"].PersistentKeepalive != 0 {
+		t.Fatal("DE < KH, so DE initiates and KH must not")
+	}
+	if got := byKey(planPeers("SG", st))["pop-kh"].PersistentKeepalive; got != 0 {
+		t.Fatalf("SG must not initiate toward KH (both ends would collide), got %v", got)
+	}
+
 	// No AllowedIP may belong to two peers, or WireGuard would silently move it.
 	seen := map[string]string{}
 	for _, p := range peers {

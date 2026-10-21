@@ -667,6 +667,7 @@ func (d *Daemon) DiscoverAndConnectPeer(ctx context.Context, targetOverlayIP str
 			AllowedIPs:          []string{discResp.TargetOverlayIPv4 + "/32"},
 			PersistentKeepalive: 20 * time.Second,
 		})
+		agent.NudgeUntilHandshake(d.wgManager, discResp.TargetPublicKey, func() bool { return true })
 
 		routeTarget = router.RouteTarget{
 			PublicKey:   discResp.TargetPublicKey,

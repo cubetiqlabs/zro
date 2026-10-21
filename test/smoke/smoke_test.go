@@ -713,8 +713,14 @@ func TestFullMeshSmoke(t *testing.T) {
 	_ = node1.AssignOverlay("100.64.0.2", "")
 	_ = node2.AssignOverlay("100.64.0.3", "")
 	// A real WireGuard session between the two userspace stacks over loopback UDP.
-	_ = node1.AddDirectPeer(core.Node{PublicKey: node2.PublicKey(), OverlayIPv4: "100.64.0.3"}, fmt.Sprintf("127.0.0.1:%d", node2.UDPPort()), true)
 	_ = node2.AddDirectPeer(core.Node{PublicKey: node1.PublicKey(), OverlayIPv4: "100.64.0.2"}, fmt.Sprintf("127.0.0.1:%d", node1.UDPPort()), false)
+	_ = node1.AddDirectPeer(core.Node{PublicKey: node2.PublicKey(), OverlayIPv4: "100.64.0.3"}, fmt.Sprintf("127.0.0.1:%d", node2.UDPPort()), true)
+	for i := 0; !node1.PeerHandshaken(node2.PublicKey()); i++ {
+		if i > 300 {
+			t.Fatalf("smoke: WireGuard handshake between userspace nodes never completed")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	// Node 1 (100.64.0.2) hosting PostgreSQL server on port 5432, default deny all
 	// Node 2 (100.64.0.3) connecting over the mesh

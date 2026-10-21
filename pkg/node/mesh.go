@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cubis/zro/pkg/agent"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
 )
@@ -159,10 +160,20 @@ func (d *Daemon) AddDirectPeer(peer core.Node, endpoint string, initiate bool) e
 	d.peersMu.Lock()
 	d.peers[peer.PublicKey] = peer
 	d.peersMu.Unlock()
-	return d.wgManager.ApplyPeer(wireguard.PeerConfig{
+	err := d.wgManager.ApplyPeer(wireguard.PeerConfig{
 		PublicKey:           peer.PublicKey,
 		Endpoint:            endpoint,
 		AllowedIPs:          []string{peer.OverlayIPv4 + "/32"},
 		PersistentKeepalive: keepalive,
 	})
+	if err == nil && initiate {
+		agent.NudgeUntilHandshake(d.wgManager, peer.PublicKey, func() bool { return true })
+	}
+	return err
+}
+
+// PeerHandshaken reports whether a WireGuard session with the peer is up.
+func (d *Daemon) PeerHandshaken(publicKey string) bool {
+	at, err := d.wgManager.LastHandshake(publicKey)
+	return err == nil && !at.IsZero()
 }

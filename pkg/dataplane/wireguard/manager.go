@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -194,17 +195,21 @@ func (m *Manager) ApplyPeer(cfg PeerConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	pubKeyBytes, err := base64.StdEncoding.DecodeString(cfg.PublicKey)
-	if err != nil || len(pubKeyBytes) != 32 {
-		return fmt.Errorf("invalid base64 public key: %w", err)
-	}
-	pubHex := hex.EncodeToString(pubKeyBytes)
-
 	// Re-applying an unchanged peer would reset the endpoint WireGuard learned
 	// from the peer's authenticated packets back to a possibly stale one.
 	if prev, ok := m.mockPeers[cfg.PublicKey]; ok && samePeer(prev, cfg) {
 		return nil
 	}
+	return m.applyLocked(cfg)
+}
+
+// applyLocked programs a peer unconditionally. m.mu must be held.
+func (m *Manager) applyLocked(cfg PeerConfig) error {
+	pubKeyBytes, err := base64.StdEncoding.DecodeString(cfg.PublicKey)
+	if err != nil || len(pubKeyBytes) != 32 {
+		return fmt.Errorf("invalid base64 public key: %w", err)
+	}
+	pubHex := hex.EncodeToString(pubKeyBytes)
 	var applyErr error
 
 	// 1. Configure userspace wireguard-go device via WireGuard UAPI protocol
@@ -216,9 +221,10 @@ func (m *Manager) ApplyPeer(cfg PeerConfig) error {
 		if cfg.Endpoint != "" {
 			sb.WriteString(fmt.Sprintf("endpoint=%s\n", cfg.Endpoint))
 		}
-		if cfg.PersistentKeepalive > 0 {
-			sb.WriteString(fmt.Sprintf("persistent_keepalive_interval=%d\n", int(cfg.PersistentKeepalive.Seconds())))
-		}
+		// Always written: 0 turns a previously enabled keepalive off, and the
+		// 0 -> n transition is what makes WireGuard send a keepalive (and so
+		// start a handshake) right away.
+		sb.WriteString(fmt.Sprintf("persistent_keepalive_interval=%d\n", int(cfg.PersistentKeepalive.Seconds())))
 		if cfg.PresharedKey != "" {
 			if pskBytes, err := base64.StdEncoding.DecodeString(cfg.PresharedKey); err == nil && len(pskBytes) == 32 {
 				sb.WriteString(fmt.Sprintf("preshared_key=%s\n", hex.EncodeToString(pskBytes)))
@@ -274,6 +280,72 @@ func (m *Manager) ApplyPeer(cfg PeerConfig) error {
 	}
 	m.mockPeers[cfg.PublicKey] = cfg // only remember what was actually applied
 	return nil
+}
+
+// LastHandshake returns when the userspace device last completed a handshake
+// with the peer; the zero time means never.
+func (m *Manager) LastHandshake(publicKeyBase64 string) (time.Time, error) {
+	raw, err := base64.StdEncoding.DecodeString(publicKeyBase64)
+	if err != nil || len(raw) != 32 {
+		return time.Time{}, fmt.Errorf("invalid base64 public key: %w", err)
+	}
+	m.mu.Lock()
+	dev := m.userDevice
+	m.mu.Unlock()
+	if dev == nil {
+		return time.Time{}, errors.New("handshake state needs a userspace device")
+	}
+	dump, err := dev.IpcGet()
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	want := hex.EncodeToString(raw)
+	var inPeer bool
+	var sec, nsec int64
+	for _, line := range strings.Split(dump, "\n") {
+		key, val, _ := strings.Cut(line, "=")
+		switch key {
+		case "public_key":
+			inPeer = val == want
+		case "last_handshake_time_sec":
+			if inPeer {
+				sec, _ = strconv.ParseInt(val, 10, 64)
+			}
+		case "last_handshake_time_nsec":
+			if inPeer {
+				nsec, _ = strconv.ParseInt(val, 10, 64)
+			}
+		}
+	}
+	if sec == 0 && nsec == 0 {
+		return time.Time{}, nil
+	}
+	return time.Unix(sec, nsec), nil
+}
+
+// Nudge makes WireGuard start a handshake with the peer now instead of waiting
+// for its retry timer. WireGuard refuses to start a new (non-retry) handshake
+// within 5s of the last attempt, and that timer lives in the peer object, so the
+// peer is removed and re-added. Only call it for a peer with no session yet,
+// when the remote side is known to be ready (for example it just learned about
+// this node). A peer without a keepalive is left alone: it initiates only when
+// it has traffic.
+func (m *Manager) Nudge(publicKeyBase64 string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, ok := m.mockPeers[publicKeyBase64]
+	if !ok || cfg.PersistentKeepalive == 0 || m.userDevice == nil {
+		return nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(publicKeyBase64)
+	if err != nil || len(raw) != 32 {
+		return fmt.Errorf("invalid base64 public key: %w", err)
+	}
+	if err := m.userDevice.IpcSet(fmt.Sprintf("public_key=%s\nremove=true\n", hex.EncodeToString(raw))); err != nil {
+		return err
+	}
+	return m.applyLocked(cfg)
 }
 
 // samePeer reports whether two peer configs would program the device identically.

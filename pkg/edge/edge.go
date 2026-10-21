@@ -38,6 +38,8 @@ type PoPDaemon struct {
 	derpServer   *derp.Server
 	derpListener net.Listener
 	httpClient   *http.Client
+	registered   chan struct{} // closed after the first successful registration
+	regOnce      sync.Once
 	popKey       controlauth.TokenHolder // per-PoP credential issued at first registration
 	grpcClient   *controlgrpc.Client
 	peerCount    int
@@ -103,6 +105,7 @@ func NewPoPDaemon(cfg *config.EdgeConfig) (*PoPDaemon, error) {
 		tunDev:      tunDev,
 		udpListener: udpConn,
 		routed:      make(map[string]bool),
+		registered:  make(chan struct{}),
 	}
 	if cfg.StateDir != "" {
 		if key, err := identity.ReadSecret(cfg.StateDir, popKeyFile); err == nil {
@@ -112,6 +115,13 @@ func NewPoPDaemon(cfg *config.EdgeConfig) (*PoPDaemon, error) {
 	e.httpClient = &http.Client{
 		Timeout:   10 * time.Second,
 		Transport: controlauth.NewBearerTransport(nil, cfg.PlaneEndpoint, e.credential),
+	}
+
+	// Without a kernel TUN (no privileges) nothing would route between peers, so
+	// forward in userspace instead of silently dropping relayed traffic.
+	if md, ok := tunDev.(*tun.MemoryDevice); ok {
+		slog.Warn("No kernel TUN available: forwarding between peers in userspace (lower throughput)", "interface", iface)
+		go md.Hairpin()
 	}
 
 	wgMgr, err := wireguard.NewManager(iface,
@@ -293,6 +303,7 @@ func (e *PoPDaemon) registerWithControlPlane(ctx context.Context) bool {
 		}
 	}
 	slog.Info("Registered Edge PoP with Control Plane", "pop_code", e.cfg.PoPCode, "plane", e.cfg.PlaneEndpoint)
+	e.regOnce.Do(func() { close(e.registered) })
 	return true
 }
 
@@ -387,6 +398,12 @@ func (e *PoPDaemon) PublicKey() string {
 
 func (e *PoPDaemon) realtimeListener(ctx context.Context) {
 	defer e.wg.Done()
+	// The event stream needs the PoP's own credential, which registration issues.
+	select {
+	case <-e.registered:
+	case <-ctx.Done():
+		return
+	}
 	realtime.Run(ctx, realtime.Config{
 		Endpoint:   e.cfg.PlaneEndpoint,
 		GRPC:       e.grpcClient,
@@ -394,6 +411,7 @@ func (e *PoPDaemon) realtimeListener(ctx context.Context) {
 		ID:         e.cfg.PoPCode,
 		Credential: e.credential,
 		Events:     []string{"node_joined", "node_left", "mesh_graph_updated", "pop_status_changed", "edge_registered"},
+		Debounce:   30 * time.Millisecond,
 	}, func(ctx context.Context, evs []string) {
 		slog.Debug("Mesh change received", "pop_code", e.cfg.PoPCode, "events", evs)
 		e.syncMeshTopology(ctx)
