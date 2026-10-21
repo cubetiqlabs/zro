@@ -38,6 +38,7 @@ type Manager struct {
 	disableKernel bool
 	isSimulated   bool
 	isUserspace   bool
+	sharedBind    *sharedBind
 	mockPeers     map[string]PeerConfig
 }
 
@@ -72,6 +73,16 @@ func WithKernel(useKernel bool) Option {
 	}
 }
 
+// WithSharedSocket makes the userspace WireGuard device use an existing UDP
+// socket. Non-WireGuard datagrams are handed to handler. Sharing the socket is
+// required for STUN-discovered endpoints and hole punching to match the NAT
+// mapping WireGuard actually receives on.
+func WithSharedSocket(udpConn *net.UDPConn, handler ControlPacketHandler) Option {
+	return func(m *Manager) {
+		m.sharedBind = newSharedBind(udpConn, handler)
+	}
+}
+
 // NewManager creates a WireGuard device manager.
 // By default, if a tunDevice is provided (or when running userspace WireGuard),
 // it initializes a wireguard-go userspace Device with real Noise protocol encryption.
@@ -88,7 +99,10 @@ func NewManager(interfaceName string, opts ...Option) (*Manager, error) {
 
 	// 1. If TUN device is provided, initialize userspace wireguard-go engine
 	if m.tunDevice != nil {
-		bind := conn.NewDefaultBind()
+		var bind conn.Bind = conn.NewDefaultBind()
+		if m.sharedBind != nil {
+			bind = m.sharedBind
+		}
 		logger := device.NewLogger(device.LogLevelSilent, fmt.Sprintf("[%s] ", interfaceName))
 		userDev := device.NewDevice(m.tunDevice, bind, logger)
 		m.userDevice = userDev
@@ -98,6 +112,13 @@ func NewManager(interfaceName string, opts ...Option) (*Manager, error) {
 			if err := m.applyLocalKeyAndPort(); err != nil {
 				slog.Warn("Failed to configure initial WireGuard key/port on userspace device", "error", err)
 			}
+		}
+
+		// Bring the device up explicitly. Without this the bind is only opened
+		// by a TUN EventUp, which never arrives if the interface is not
+		// configured by the host (our default in containers).
+		if err := userDev.Up(); err != nil {
+			return nil, fmt.Errorf("failed to bring up userspace WireGuard device: %w", err)
 		}
 
 		slog.Debug("Initialized userspace WireGuard engine", "interface", interfaceName, "port", m.listenPort)

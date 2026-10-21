@@ -69,6 +69,19 @@ sudo modprobe tun wireguard 2>/dev/null || true
 sudo chmod 0666 /dev/net/tun
 ```
 
+### TUN and route programming
+
+ZRO configures the overlay interface itself at startup: it brings the link up,
+assigns the enrolled overlay addresses, and installs host/subnet routes pointing
+at the TUN device (via `ip`). The container image includes `iproute2`. On hosts
+without `NET_ADMIN` or `/dev/net/tun`, the node/gateway falls back to an
+in-memory TUN, which keeps control-plane and tests working but does not forward
+host traffic.
+
+Edge PoPs additionally enable IPv4/IPv6 forwarding and route the overlay CIDRs
+into their TUN so they can relay traffic between peers. If the container runtime
+blocks `/proc/sys` writes, set forwarding on the host and pass the sysctls in.
+
 ---
 
 ## 3. Production Deployment Topologies
@@ -116,12 +129,16 @@ docker run -d \
   --restart always \
   --network host \
   --cap-add NET_ADMIN --cap-add SYS_MODULE \
+  --sysctl net.ipv4.ip_forward=1 \
+  --sysctl net.ipv6.conf.all.forwarding=1 \
   --device /dev/net/tun:/dev/net/tun \
   -e ZRO_MODE=edge \
   -e ZRO_EDGE_POP_CODE="KH" \
   -e ZRO_EDGE_REGION="Asia/Phnom_Penh" \
   -e ZRO_EDGE_PUBLIC_ENDPOINT="auto" \
   -e ZRO_EDGE_LISTEN_PORT=51820 \
+  -e ZRO_EDGE_INTERFACE_NAME="zro-edge" \
+  -e ZRO_EDGE_EDGE_API_KEY="$EDGE_API_KEY" \
   -e ZRO_EDGE_PLANE_ENDPOINT="https://zro-plane.cubis.tech:443" \
   cubis/zro:latest edge
 ```
@@ -200,6 +217,7 @@ node:
   enrollment_token: "zro_tok_eyJhbGciOi..."
   plane_endpoint: "https://zro-plane.cubis.tech:443"
   interface_name: "zro0"
+  listen_port: 0 # Shared WireGuard/STUN UDP port; 0 = ephemeral
   enable_p2p: true
   default_deny: true # Drops all incoming connections by default
   allowed_inbound_ports:

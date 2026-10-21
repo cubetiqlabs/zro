@@ -1,6 +1,8 @@
 package stun
 
 import (
+	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -9,9 +11,9 @@ import (
 )
 
 const (
-	MagicCookie = 0x2112A442
-	BindingRequest = 0x0001
-	BindingResponse = 0x0101
+	MagicCookie          = 0x2112A442
+	BindingRequest       = 0x0001
+	BindingResponse      = 0x0101
 	AttrXORMappedAddress = 0x0020
 )
 
@@ -25,22 +27,57 @@ func (r ReflexiveAddress) String() string {
 	return net.JoinHostPort(r.IP.String(), fmt.Sprintf("%d", r.Port))
 }
 
+// NewBindingRequest builds an RFC 5389 STUN Binding Request and returns the
+// transaction ID used to correlate the response.
+func NewBindingRequest() ([]byte, [12]byte, error) {
+	var txID [12]byte
+	if _, err := rand.Read(txID[:]); err != nil {
+		return nil, txID, fmt.Errorf("failed to generate STUN transaction ID: %w", err)
+	}
+
+	// 20-byte header: 2B type, 2B length, 4B magic cookie, 12B transaction ID.
+	req := make([]byte, 20)
+	binary.BigEndian.PutUint16(req[0:2], BindingRequest)
+	binary.BigEndian.PutUint16(req[2:4], 0) // zero attributes
+	binary.BigEndian.PutUint32(req[4:8], MagicCookie)
+	copy(req[8:20], txID[:])
+	return req, txID, nil
+}
+
+// IsBindingResponse reports whether packet is a STUN Binding Response.
+func IsBindingResponse(packet []byte) bool {
+	if len(packet) < 20 {
+		return false
+	}
+	return binary.BigEndian.Uint16(packet[0:2]) == BindingResponse &&
+		binary.BigEndian.Uint32(packet[4:8]) == MagicCookie
+}
+
+// IsBindingRequest reports whether packet is a STUN Binding Request.
+func IsBindingRequest(packet []byte) bool {
+	if len(packet) < 20 {
+		return false
+	}
+	return binary.BigEndian.Uint16(packet[0:2]) == BindingRequest &&
+		binary.BigEndian.Uint32(packet[4:8]) == MagicCookie
+}
+
+// ParseResponse decodes a STUN Binding Response and verifies its transaction ID.
+func ParseResponse(packet []byte, txID []byte) (*ReflexiveAddress, error) {
+	return parseSTUNResponse(packet, txID)
+}
+
 // DiscoverPublicEndpoint contacts a STUN server (such as an Edge PoP) to discover the client's public reflexive address.
+// It performs a synchronous read on localConn and must not be called on a socket owned by the WireGuard bind.
 func DiscoverPublicEndpoint(localConn *net.UDPConn, serverAddr string, timeout time.Duration) (*ReflexiveAddress, error) {
 	srv, err := net.ResolveUDPAddr("udp", serverAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve STUN server: %w", err)
 	}
 
-	// Construct RFC 5389 STUN Binding Request
-	// 20 bytes header: 2 bytes type, 2 bytes length, 4 bytes magic cookie, 12 bytes transaction ID
-	req := make([]byte, 20)
-	binary.BigEndian.PutUint16(req[0:2], BindingRequest)
-	binary.BigEndian.PutUint16(req[2:4], 0) // zero attributes
-	binary.BigEndian.PutUint32(req[4:8], MagicCookie)
-	// Random transaction ID
-	for i := 8; i < 20; i++ {
-		req[i] = byte(i * 17)
+	req, txID, err := NewBindingRequest()
+	if err != nil {
+		return nil, err
 	}
 
 	_ = localConn.SetDeadline(time.Now().Add(timeout))
@@ -56,7 +93,7 @@ func DiscoverPublicEndpoint(localConn *net.UDPConn, serverAddr string, timeout t
 		return nil, fmt.Errorf("failed to read STUN response: %w", err)
 	}
 
-	return parseSTUNResponse(buf[:n], req[8:20])
+	return parseSTUNResponse(buf[:n], txID[:])
 }
 
 // ProbeEndpoint contacts a STUN server (such as an Edge PoP) to measure round-trip latency (RTT)
@@ -131,6 +168,13 @@ func parseSTUNResponse(buf []byte, originalTxID []byte) (*ReflexiveAddress, erro
 	cookie := binary.BigEndian.Uint32(buf[4:8])
 	if cookie != MagicCookie {
 		return nil, errors.New("invalid STUN magic cookie")
+	}
+
+	if len(originalTxID) != 12 {
+		return nil, errors.New("invalid STUN transaction ID length")
+	}
+	if !bytes.Equal(buf[8:20], originalTxID) {
+		return nil, errors.New("STUN transaction ID mismatch")
 	}
 
 	attrs := buf[20:]

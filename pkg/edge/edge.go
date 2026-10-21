@@ -18,7 +18,9 @@ import (
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/dataplane/derp"
+	"github.com/cubis/zro/pkg/dataplane/netcfg"
 	"github.com/cubis/zro/pkg/dataplane/router"
+	"github.com/cubis/zro/pkg/dataplane/tun"
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
 	"github.com/cubis/zro/pkg/netutil"
 	"github.com/cubis/zro/pkg/p2p/stun"
@@ -30,6 +32,7 @@ type PoPDaemon struct {
 	cfg          *config.EdgeConfig
 	keyPair      *crypto.KeyPair
 	wgManager    *wireguard.Manager
+	tunDev       tun.Device
 	routingTable *router.Table
 	udpListener  *net.UDPConn
 	derpServer   *derp.Server
@@ -64,12 +67,63 @@ func NewPoPDaemon(cfg *config.EdgeConfig) (*PoPDaemon, error) {
 		}
 	}
 
-	wgMgr, err := wireguard.NewManager("zro-edge",
+	iface := cfg.InterfaceName
+	if iface == "" {
+		iface = "zro-edge"
+	}
+	if cfg.MTU <= 0 {
+		cfg.MTU = 1420
+	}
+	cfg.InterfaceName = iface
+
+	tunDev, err := tun.CreateTUN(iface, cfg.MTU)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize edge TUN device: %w", err)
+	}
+	if err := netcfg.EnsureLinkUp(iface, cfg.MTU); err != nil {
+		slog.Warn("Could not bring edge TUN up (relay may be limited)", "interface", iface, "error", err)
+	}
+
+	// The shared socket is owned by the WireGuard bind, which also answers STUN
+	// requests. This keeps the advertised PoP endpoint on the same NAT mapping.
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: cfg.ListenPort})
+	if err != nil {
+		_ = tunDev.Close()
+		return nil, fmt.Errorf("failed to bind edge UDP socket: %w", err)
+	}
+
+	e := &PoPDaemon{
+		cfg:          cfg,
+		keyPair:      kp,
+		tunDev:       tunDev,
+		udpListener:  udpConn,
+		routingTable: router.NewTable(),
+		httpClient:   &http.Client{Timeout: 10 * time.Second},
+	}
+
+	wgMgr, err := wireguard.NewManager(iface,
+		wireguard.WithTunDevice(tunDev),
 		wireguard.WithPrivateKey(kp.PrivateKey),
 		wireguard.WithListenPort(cfg.ListenPort),
+		wireguard.WithSharedSocket(udpConn, e.handleControlPacket),
 	)
 	if err != nil {
+		_ = udpConn.Close()
+		_ = tunDev.Close()
 		return nil, fmt.Errorf("failed to init wireguard manager: %w", err)
+	}
+	e.wgManager = wgMgr
+
+	// Edge PoPs forward overlay traffic between peers. The routes send overlay
+	// destinations into the TUN; WireGuard's per-peer AllowedIPs select the
+	// outbound tunnel.
+	if err := netcfg.EnableForwarding(); err != nil {
+		slog.Warn("Could not enable IP forwarding on edge (relay may fail)", "error", err)
+	}
+	for _, cidr := range []string{"100.64.0.0/10", "fd00:cafe::/64"} {
+		if err := netcfg.AddSubnetRoute(iface, cidr); err != nil {
+			slog.Warn("Could not add edge overlay route", "cidr", cidr, "error", err)
+		}
 	}
 
 	// Resolve public or private endpoint dynamically (auto discovery, env override, or internal mode)
@@ -80,13 +134,14 @@ func NewPoPDaemon(cfg *config.EdgeConfig) (*PoPDaemon, error) {
 		"use_private_ip", cfg.UsePrivateIP)
 	cfg.PublicEndpoint = resolvedEndpoint
 
-	return &PoPDaemon{
-		cfg:          cfg,
-		keyPair:      kp,
-		wgManager:    wgMgr,
-		routingTable: router.NewTable(),
-		httpClient:   &http.Client{Timeout: 10 * time.Second},
-	}, nil
+	return e, nil
+}
+
+// handleControlPacket answers STUN on the shared WireGuard socket.
+func (e *PoPDaemon) handleControlPacket(packet []byte, remoteAddr *net.UDPAddr) {
+	if stun.IsBindingRequest(packet) {
+		_ = stun.ServeSTUN(e.udpListener, packet, remoteAddr)
+	}
 }
 
 // Start launches the Edge PoP listener, STUN responder, and config sync worker.
@@ -95,16 +150,6 @@ func (e *PoPDaemon) Start(ctx context.Context) error {
 	e.cancel = cancel
 
 	listenAddr := fmt.Sprintf("0.0.0.0:%d", e.cfg.ListenPort)
-	udpAddr, err := net.ResolveUDPAddr("udp", listenAddr)
-	if err != nil {
-		return fmt.Errorf("failed to resolve UDP address: %w", err)
-	}
-
-	conn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on UDP %s: %w", listenAddr, err)
-	}
-	e.udpListener = conn
 
 	slog.Info("ZRO Edge Data Plane PoP started",
 		"pop_code", e.cfg.PoPCode,
@@ -113,9 +158,8 @@ func (e *PoPDaemon) Start(ctx context.Context) error {
 		"pubkey", e.keyPair.PublicKey,
 		"listen_port", e.cfg.ListenPort)
 
-	// Launch STUN packet responder loop
-	e.wg.Add(1)
-	go e.stunServerLoop(ctx)
+	// STUN is answered from the shared WireGuard socket by handleControlPacket;
+	// no separate listener is needed.
 
 	// Launch DERP Encrypted Packet Relay server over TCP
 	derpSrv, err := derp.NewServer(e.keyPair)
@@ -163,8 +207,14 @@ func (e *PoPDaemon) Stop() error {
 	if e.cancel != nil {
 		e.cancel()
 	}
+	if e.wgManager != nil {
+		_ = e.wgManager.Close()
+	}
 	if e.udpListener != nil {
 		_ = e.udpListener.Close()
+	}
+	if e.tunDev != nil {
+		_ = e.tunDev.Close()
 	}
 	if e.derpListener != nil {
 		_ = e.derpListener.Close()
@@ -172,35 +222,11 @@ func (e *PoPDaemon) Stop() error {
 	if e.derpServer != nil {
 		_ = e.derpServer.Close()
 	}
-	if e.wgManager != nil {
-		_ = e.wgManager.Close()
-	}
 	if e.grpcClient != nil {
 		_ = e.grpcClient.Close()
 	}
 	e.wg.Wait()
 	return nil
-}
-
-func (e *PoPDaemon) stunServerLoop(ctx context.Context) {
-	defer e.wg.Done()
-	buf := make([]byte, 2048)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			_ = e.udpListener.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-			n, clientAddr, err := e.udpListener.ReadFromUDP(buf)
-			if err != nil {
-				continue
-			}
-
-			// Respond to STUN queries from clients behind NAT
-			_ = stun.ServeSTUN(e.udpListener, buf[:n], clientAddr)
-		}
-	}
 }
 
 func (e *PoPDaemon) registerWithControlPlane(ctx context.Context) bool {
@@ -337,6 +363,9 @@ func (e *PoPDaemon) syncMeshTopology(ctx context.Context) {
 						PublicKey: n.PublicKey,
 						Endpoint:  ep,
 					})
+					if err := netcfg.AddHostRoute(e.cfg.InterfaceName, n.OverlayIpv4); err != nil {
+						slog.Debug("Could not add edge route for node", "node", n.OverlayIpv4, "error", err)
+					}
 				}
 			}
 			return
@@ -400,6 +429,9 @@ func (e *PoPDaemon) syncMeshTopology(ctx context.Context) {
 				PublicKey: n.PublicKey,
 				Endpoint:  ep,
 			})
+			if err := netcfg.AddHostRoute(e.cfg.InterfaceName, n.OverlayIPv4); err != nil {
+				slog.Debug("Could not add edge route for node", "node", n.OverlayIPv4, "error", err)
+			}
 		}
 	}
 }

@@ -13,6 +13,9 @@ control_plane:
   default_cidr_v4: "100.64.0.0/10"
   default_cidr_v6: "fd00:cafe::/64"
   sync_interval_ms: 1000
+  # Set true to require an API key / edge key on control-plane endpoints.
+  require_auth: false
+  edge_api_key: ""
 
 # Edge Data Plane PoP Configuration (Public IP Mesh)
 edge:
@@ -20,8 +23,12 @@ edge:
   region: "Asia/Phnom_Penh"
   public_endpoint: "auto" # "auto" detects public IP, or specify "173.1.1.1:51820"
   listen_port: 51820
+  interface_name: "zro-edge" # Linux TUN used for overlay relay
+  mtu: 1420
   wireguard_private_key: "" # Leave empty for auto-generation or specify base64 key
   plane_endpoint: "https://zro-plane.cubis.tech:443"
+  plane_transport: "rest" # rest or grpc
+  edge_api_key: "" # Required when control_plane.require_auth is true
   is_anycast: false
 
 # Client / Peer Node Configuration (IPless, P2P Mesh & Ingress Tunnels)
@@ -30,8 +37,10 @@ node:
   network_id: "8056c2e21c000001" # ZeroTier-style 16-hex Network ID
   enrollment_token: "zro_tok_..."
   plane_endpoint: "https://zro-plane.cubis.tech:443"
+  plane_transport: "rest" # rest or grpc
   interface_mode: "tun" # Options: tun, netstack
   interface_name: "zro0"
+  listen_port: 0 # Shared WireGuard/STUN UDP port; 0 = ephemeral
   mtu: 1420
   enable_p2p: true
   default_deny: true # Zero-Trust default deny all inbound traffic
@@ -51,8 +60,12 @@ node:
 gateway:
   hostname: "gw1"
   plane_endpoint: "https://zro-plane.cubis.tech:443"
+  plane_transport: "rest" # rest or grpc
   enrollment_token: "zro_tok_..."
   network_id: "8056c2e21c000001"
+  interface_name: "zro-gw"
+  listen_port: 0 # Shared WireGuard/STUN UDP port; 0 = ephemeral
+  mtu: 1420
   listen_http: ":80"
   listen_https: ":443"
   auto_tls: true

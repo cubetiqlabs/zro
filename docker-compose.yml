@@ -68,12 +68,17 @@ services:
       - SYS_MODULE
     devices:
       - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
     environment:
       ZRO_MODE: edge
       ZRO_EDGE_POP_CODE: "KH"
       ZRO_EDGE_REGION: "Asia/Phnom_Penh"
       ZRO_EDGE_PUBLIC_ENDPOINT: "${ZRO_EDGE_KH_ENDPOINT:-auto}"
       ZRO_EDGE_LISTEN_PORT: 51820
+      ZRO_EDGE_INTERFACE_NAME: "zro-edge"
+      ZRO_EDGE_MTU: 1420
       ZRO_EDGE_PLANE_ENDPOINT: "http://zro-plane:8443"
     ports:
       - "51820:51820/udp"
@@ -96,12 +101,17 @@ services:
       - SYS_MODULE
     devices:
       - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
     environment:
       ZRO_MODE: edge
       ZRO_EDGE_POP_CODE: "SG"
       ZRO_EDGE_REGION: "Asia/Singapore"
       ZRO_EDGE_PUBLIC_ENDPOINT: "${ZRO_EDGE_SG_ENDPOINT:-auto}"
       ZRO_EDGE_LISTEN_PORT: 51821
+      ZRO_EDGE_INTERFACE_NAME: "zro-edge"
+      ZRO_EDGE_MTU: 1420
       ZRO_EDGE_PLANE_ENDPOINT: "http://zro-plane:8443"
     ports:
       - "51821:51821/udp"
@@ -124,10 +134,15 @@ services:
       - SYS_MODULE
     devices:
       - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
     environment:
       ZRO_MODE: gw
       ZRO_GATEWAY_HOSTNAME: "gw1"
       ZRO_GATEWAY_PLANE_ENDPOINT: "http://zro-plane:8443"
+      ZRO_GATEWAY_INTERFACE_NAME: "zro-gw"
+      ZRO_GATEWAY_LISTEN_PORT: 0
       ZRO_GATEWAY_LISTEN_HTTP: ":80"
       ZRO_GATEWAY_DOMAIN: "app.cubis.internal"
     ports:
@@ -151,10 +166,15 @@ services:
       - SYS_MODULE
     devices:
       - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
     environment:
       ZRO_MODE: gw
       ZRO_GATEWAY_HOSTNAME: "gw2"
       ZRO_GATEWAY_PLANE_ENDPOINT: "http://zro-plane:8443"
+      ZRO_GATEWAY_INTERFACE_NAME: "zro-gw"
+      ZRO_GATEWAY_LISTEN_PORT: 0
       ZRO_GATEWAY_LISTEN_HTTP: ":80"
       ZRO_GATEWAY_DOMAIN: "app.cubis.internal"
     ports:

@@ -38,6 +38,9 @@ services:
     network_mode: host
     cap_add:
       - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
     command: ["edge"]
     environment:
       ZRO_MODE: edge
@@ -45,8 +48,12 @@ services:
       ZRO_EDGE_REGION: "${REGION}"
       ZRO_EDGE_PUBLIC_ENDPOINT: "${PUBLIC_ENDPOINT}" # e.g. 173.1.1.1:51820
       ZRO_EDGE_LISTEN_PORT: ${LISTEN_PORT:-51820}
+      ZRO_EDGE_INTERFACE_NAME: "${INTERFACE_NAME:-zro-edge}"
+      ZRO_EDGE_MTU: ${EDGE_MTU:-1420}
       ZRO_EDGE_WIREGUARD_PRIVATE_KEY: "${WIREGUARD_PRIVATE_KEY:-}"
       ZRO_EDGE_PLANE_ENDPOINT: "${PLANE_ENDPOINT:-https://zro-plane.cubis.tech:443}"
+      ZRO_EDGE_PLANE_TRANSPORT: "${PLANE_TRANSPORT:-rest}"
+      ZRO_EDGE_EDGE_API_KEY: "${EDGE_API_KEY:-}"
       ZRO_EDGE_IS_ANYCAST: "${IS_ANYCAST:-false}"
 
   # Standalone Ingress Gateway (L4/L7 Reverse Proxy & Load Balancer)
@@ -55,9 +62,20 @@ services:
     image: ${ZRO_IMAGE:-cubis/zro:latest}
     restart: always
     network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
     command: ["gw"]
     environment:
       ZRO_MODE: gw
+      ZRO_GATEWAY_PLANE_ENDPOINT: "${PLANE_ENDPOINT:-https://zro-plane.cubis.tech:443}"
+      ZRO_GATEWAY_PLANE_TRANSPORT: "${PLANE_TRANSPORT:-rest}"
+      ZRO_GATEWAY_ENROLLMENT_TOKEN: "${ENROLLMENT_TOKEN}"
+      ZRO_GATEWAY_NETWORK_ID: "${NETWORK_ID}"
+      ZRO_GATEWAY_INTERFACE_NAME: "${GATEWAY_INTERFACE_NAME:-zro-gw}"
+      ZRO_GATEWAY_LISTEN_PORT: ${GATEWAY_LISTEN_PORT:-0}
       ZRO_GATEWAY_LISTEN_HTTP: ":80"
       ZRO_GATEWAY_LISTEN_HTTPS: ":443"
       ZRO_GATEWAY_AUTO_TLS: "${AUTO_TLS:-true}"
