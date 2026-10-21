@@ -15,6 +15,7 @@ import (
 	"time"
 
 	v1 "github.com/cubis/zro/api/proto/v1"
+	"github.com/cubis/zro/pkg/agent"
 	"github.com/cubis/zro/pkg/config"
 	controlauth "github.com/cubis/zro/pkg/control/auth"
 	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
@@ -48,16 +49,18 @@ type Daemon struct {
 	peers        map[string]core.Node // pubKey -> node
 	peersMu      sync.RWMutex
 
-	tunDev       tun.Device
-	wgManager    *wireguard.Manager
-	routingTable *router.Table
-	udpConn      *net.UDPConn
-	discoEngine  *disco.Engine
-	derpClient   *derp.Client
-	tunnelClient *tunnel.Client
-	httpClient   *http.Client
-	token        controlauth.TokenHolder // bearer token issued at enrollment
-	grpcClient   *controlgrpc.Client
+	tunDev          tun.Device
+	wgManager       *wireguard.Manager
+	routingTable    *router.Table
+	udpConn         *net.UDPConn
+	discoEngine     *disco.Engine
+	derpClient      *derp.Client
+	tunnelClient    *tunnel.Client
+	httpClient      *http.Client
+	token           controlauth.TokenHolder // bearer token issued at enrollment
+	popLink         *agent.PoPLink
+	overlayPrefixes []string // routed into the interface; reported by the plane at enrollment
+	grpcClient      *controlgrpc.Client
 
 	// Zero-Trust Inbound Firewall & Mesh Listeners
 	policyMu      sync.RWMutex
@@ -139,6 +142,8 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 	}
 
 	d.wgManager = wgMgr
+	d.overlayPrefixes = core.OverlayPrefixes("", "") // refined from the enrollment response
+	d.popLink = &agent.PoPLink{WG: wgMgr, Interface: cfg.InterfaceName, OSRoutes: cfg.InterfaceMode != "netstack"}
 	d.discoEngine = disco.NewEngine(kp, udpConn)
 	return d, nil
 }
@@ -217,6 +222,8 @@ func (d *Daemon) Start(ctx context.Context) error {
 			NodeID:      nodeUUID,
 			NetworkID:   gResp.NetworkId,
 			NodeToken:   gResp.NodeToken,
+			IPv4CIDR:    gResp.Ipv4Cidr,
+			IPv6CIDR:    gResp.Ipv6Cidr,
 			OverlayIPv4: gResp.OverlayIpv4,
 			OverlayIPv6: gResp.OverlayIpv6,
 		}
@@ -289,6 +296,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		return fmt.Errorf("enrolled into network %s but network_id is configured as %s; check the enrollment token", enrollResp.NetworkID, d.cfg.NetworkID)
 	}
 	d.token.Set(enrollResp.NodeToken)
+	d.overlayPrefixes = core.OverlayPrefixes(enrollResp.IPv4CIDR, enrollResp.IPv6CIDR)
 	d.nodeID = enrollResp.NodeID
 	d.networkID = enrollResp.NetworkID
 	d.overlayIPv4 = enrollResp.OverlayIPv4
@@ -327,9 +335,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}
 
 	// 6. Launch background workers (latency probes & local tunnels)
-	d.wg.Add(2)
+	d.wg.Add(3)
 	go d.probeWorker(ctx)
 	go d.tunnelWorker(ctx)
+	go d.realtimeListener(ctx)
 
 	return nil
 }
@@ -633,13 +642,9 @@ func (d *Daemon) connectToEdgePoP(pop core.EdgePoP) error {
 		}()
 	}
 
-	// Route all private overlay traffic through primary PoP as default relay
-	return d.wgManager.ApplyPeer(wireguard.PeerConfig{
-		PublicKey:           pop.PublicKey,
-		Endpoint:            pop.PublicEndpoint,
-		AllowedIPs:          []string{"100.64.0.0/10", "fd00:cafe::/64"},
-		PersistentKeepalive: 25 * time.Second,
-	})
+	// Route overlay traffic through the PoP by default; direct peers override
+	// it with their longer prefixes.
+	return d.popLink.Connect(pop, d.overlayPrefixes)
 }
 
 // DiscoverAndConnectPeer implements Section 5 Packet Flow & Smart Routing:
@@ -711,12 +716,10 @@ func (d *Daemon) DiscoverAndConnectPeer(ctx context.Context, targetOverlayIP str
 			"target", discResp.TargetHostname,
 			"primary_pop", primaryPoP.PoPCode)
 
-		_ = d.wgManager.ApplyPeer(wireguard.PeerConfig{
-			PublicKey:           discResp.TargetPublicKey,
-			Endpoint:            relayEndpoint,
-			AllowedIPs:          []string{discResp.TargetOverlayIPv4 + "/32"},
-			PersistentKeepalive: 25 * time.Second,
-		})
+		// The PoP peer already carries the overlay prefix, so traffic to the target
+		// relays through it. A direct peer with the PoP as endpoint would only
+		// attempt a handshake the PoP cannot complete on the target's behalf.
+		_ = d.wgManager.RemovePeer(discResp.TargetPublicKey)
 
 		routeTarget = router.RouteTarget{
 			PublicKey:   discResp.TargetPublicKey,
@@ -735,19 +738,6 @@ func (d *Daemon) connectPeer(ctx context.Context, peer core.Node) {
 	d.peersMu.Lock()
 	d.peers[peer.PublicKey] = peer
 	d.peersMu.Unlock()
-
-	if d.cfg.InterfaceMode != "netstack" {
-		if peer.OverlayIPv4 != "" {
-			if err := netcfg.AddHostRoute(d.cfg.InterfaceName, peer.OverlayIPv4); err != nil {
-				slog.Debug("Failed to add overlay route", "peer", peer.OverlayIPv4, "error", err)
-			}
-		}
-		if peer.OverlayIPv6 != "" {
-			if err := netcfg.AddHostRoute(d.cfg.InterfaceName, peer.OverlayIPv6); err != nil {
-				slog.Debug("Failed to add overlay route", "peer", peer.OverlayIPv6, "error", err)
-			}
-		}
-	}
 
 	_, _ = d.DiscoverAndConnectPeer(ctx, peer.OverlayIPv4)
 }

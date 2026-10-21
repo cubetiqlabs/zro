@@ -21,6 +21,9 @@ service ControlPlaneService {
   // Dynamic route discovery for Ingress Gateways
   rpc GetGatewayRoutes(GatewayRoutesRequest) returns (GatewayRoutesResponse);
 
+  // Current members of the caller's network
+  rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
+
   // Leave the mesh: removes the calling node, its tunnels and its overlay address
   rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
 
@@ -71,6 +74,7 @@ message Node {
   repeated string tags = 7;
   repeated string allowed_ips = 8;
   repeated string endpoints = 9;
+  string assigned_pop_code = 10; // the PoP that homes this node
 }
 
 message EnrollResponse {
@@ -87,6 +91,8 @@ message EnrollResponse {
   repeated string allowed_ips = 11;
   repeated string allowed_ports = 12;
   bool default_deny = 13;
+  string ipv4_cidr = 14; // overlay prefixes of the network, used for routes/AllowedIPs
+  string ipv6_cidr = 15;
 }
 
 message ProbeReportRequest {
@@ -125,6 +131,7 @@ message EdgeSyncRequest {
 message EdgeSyncResponse {
   repeated EdgePoP pops = 1;
   repeated Node nodes = 2;
+  repeated string prefixes = 3; // overlay CIDRs in use across all networks
 }
 
 message GatewayRoutesRequest {
@@ -190,3 +197,9 @@ message DeleteTunnelResponse {}
 message DeregisterRequest {}
 
 message DeregisterResponse {}
+
+message ListPeersRequest {}
+
+message ListPeersResponse {
+  repeated Node peers = 1;
+}

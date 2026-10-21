@@ -81,6 +81,8 @@ type EnrollResponse struct {
 	OverlayIPv6  string          `json:"overlay_ipv6"`
 	DNSDomain    string          `json:"dns_domain"`
 	MTU          int             `json:"mtu"`
+	IPv4CIDR     string          `json:"ipv4_cidr"` // overlay prefixes of the network
+	IPv6CIDR     string          `json:"ipv6_cidr"`
 	AllowedIPs   core.StringList `json:"allowed_ips"`
 	AllowedPorts core.StringList `json:"allowed_ports"`
 	DefaultDeny  bool            `json:"default_deny"`
@@ -153,6 +155,8 @@ func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollRespons
 		OverlayIPv6:  node.OverlayIPv6,
 		DNSDomain:    network.DNSDomain,
 		MTU:          network.MTU,
+		IPv4CIDR:     network.IPv4CIDR,
+		IPv6CIDR:     network.IPv6CIDR,
 		AllowedIPs:   node.AllowedIPs,
 		AllowedPorts: node.AllowedPorts,
 		DefaultDeny:  node.DefaultDeny,
@@ -303,6 +307,17 @@ func (s *Service) allocator(ctx context.Context, n *core.Network) (*ipam.IPAM, e
 	}
 	s.ipamCache[n.ID] = a
 	return a, nil
+}
+
+// --- Peers --------------------------------------------------------------
+
+// Peers lists the members of node's own network.
+func (s *Service) Peers(ctx context.Context, node *core.Node) ([]core.Node, error) {
+	peers, err := s.db.Nodes.ListByNetworkID(ctx, node.NetworkID)
+	if err != nil {
+		return nil, internal("failed to list peers", err)
+	}
+	return peers, nil
 }
 
 // --- Probes -------------------------------------------------------------
@@ -590,27 +605,41 @@ func portOf(addr string) string {
 
 // --- Edge sync ----------------------------------------------------------
 
-// EdgeSync returns healthy PoPs and every node in the mesh. Edge PoPs are
-// global infrastructure, so this spans all tenants and must only be offered to
-// an edge principal.
-func (s *Service) EdgeSync(ctx context.Context) ([]core.EdgePoP, []core.Node, error) {
+// EdgeSnapshot is the mesh state synchronized to an edge PoP.
+type EdgeSnapshot struct {
+	PoPs     []core.EdgePoP `json:"pops"`
+	Nodes    []core.Node    `json:"nodes"`
+	Prefixes []string       `json:"prefixes"` // distinct overlay CIDRs across all networks
+}
+
+// EdgeSync returns healthy PoPs, every node in the mesh and the overlay
+// prefixes in use. Edge PoPs are global infrastructure, so this spans all
+// tenants and must only be offered to an edge principal.
+func (s *Service) EdgeSync(ctx context.Context) (*EdgeSnapshot, error) {
 	pops, err := s.db.EdgePoPs.ListHealthy(ctx)
 	if err != nil {
-		return nil, nil, internal("failed to list pops", err)
+		return nil, internal("failed to list pops", err)
 	}
 	tenants, err := s.db.Tenants.List(ctx)
 	if err != nil {
-		return nil, nil, internal("failed to list tenants", err)
+		return nil, internal("failed to list tenants", err)
 	}
-	var nodes []core.Node
+	snap := &EdgeSnapshot{PoPs: pops}
+	seen := map[string]bool{}
 	for _, t := range tenants {
 		nets, _ := s.db.Networks.ListByTenantID(ctx, t.ID)
 		for _, n := range nets {
 			ns, _ := s.db.Nodes.ListByNetworkID(ctx, n.ID)
-			nodes = append(nodes, ns...)
+			snap.Nodes = append(snap.Nodes, ns...)
+			for _, cidr := range []string{n.IPv4CIDR, n.IPv6CIDR} {
+				if cidr != "" && !seen[cidr] {
+					seen[cidr] = true
+					snap.Prefixes = append(snap.Prefixes, cidr)
+				}
+			}
 		}
 	}
-	return pops, nodes, nil
+	return snap, nil
 }
 
 // --- Liveness and cleanup ------------------------------------------------

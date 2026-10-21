@@ -14,6 +14,7 @@ import (
 	"time"
 
 	v1 "github.com/cubis/zro/api/proto/v1"
+	"github.com/cubis/zro/pkg/agent"
 	"github.com/cubis/zro/pkg/config"
 	controlauth "github.com/cubis/zro/pkg/control/auth"
 	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
@@ -28,8 +29,8 @@ import (
 	"github.com/cubis/zro/pkg/gateway/proxy"
 	"github.com/cubis/zro/pkg/identity"
 	"github.com/cubis/zro/pkg/p2p/stun"
+	"github.com/cubis/zro/pkg/realtime"
 	"github.com/google/uuid"
-	"golang.org/x/net/websocket"
 )
 
 // Daemon represents the running ingress gateway and cloud-native load balancer.
@@ -44,16 +45,18 @@ type Daemon struct {
 	secondaryPoP *core.EdgePoP
 	popMu        sync.RWMutex
 
-	tunDev        tun.Device
-	wgManager     *wireguard.Manager
-	udpConn       *net.UDPConn
-	proxyEngine   *proxy.Engine
-	healthChecker *proxy.HealthChecker
-	httpClient    *http.Client
-	token         controlauth.TokenHolder // bearer token issued at enrollment
-	grpcClient    *controlgrpc.Client
-	httpServer    *http.Server
-	httpsServer   *http.Server
+	tunDev          tun.Device
+	wgManager       *wireguard.Manager
+	udpConn         *net.UDPConn
+	proxyEngine     *proxy.Engine
+	healthChecker   *proxy.HealthChecker
+	httpClient      *http.Client
+	token           controlauth.TokenHolder // bearer token issued at enrollment
+	popLink         *agent.PoPLink
+	overlayPrefixes []string // routed into the interface; reported by the plane at enrollment
+	grpcClient      *controlgrpc.Client
+	httpServer      *http.Server
+	httpsServer     *http.Server
 
 	stunMu      sync.Mutex
 	stunWaiters map[[12]byte]chan *stun.ReflexiveAddress
@@ -129,6 +132,8 @@ func NewDaemon(cfg *config.GatewayConfig) (*Daemon, error) {
 	}
 
 	d.wgManager = wgMgr
+	d.overlayPrefixes = core.OverlayPrefixes("", "") // refined from the enrollment response
+	d.popLink = &agent.PoPLink{WG: wgMgr, Interface: cfg.InterfaceName, OSRoutes: true}
 	d.loadStaticRoutes()
 	return d, nil
 }
@@ -418,6 +423,7 @@ func (d *Daemon) enrollAndConnect(ctx context.Context) error {
 		return fmt.Errorf("enrolled into network %s but network_id is configured as %s; check the enrollment token", enrollResp.NetworkID, d.cfg.NetworkID)
 	}
 	d.token.Set(enrollResp.NodeToken)
+	d.overlayPrefixes = core.OverlayPrefixes(enrollResp.IPv4CIDR, enrollResp.IPv6CIDR)
 	d.nodeID = enrollResp.NodeID
 	d.networkID = enrollResp.NetworkID
 	d.overlayIPv4 = enrollResp.OverlayIPv4
@@ -448,40 +454,7 @@ func (d *Daemon) enrollAndConnect(ctx context.Context) error {
 }
 
 func (d *Daemon) connectToEdgePoP(pop core.EdgePoP) error {
-	if pop.PublicKey == "" {
-		return errors.New("empty edge pop public key")
-	}
-
-	peerCfg := wireguard.PeerConfig{
-		PublicKey:           pop.PublicKey,
-		Endpoint:            pop.PublicEndpoint,
-		AllowedIPs:          []string{"100.64.0.0/10", "fd00:cafe::/64"},
-		PersistentKeepalive: 20 * time.Second,
-	}
-
-	// Send overlay traffic into the gateway's WireGuard interface.
-	for _, cidr := range []string{"100.64.0.0/10", "fd00:cafe::/64"} {
-		if err := netcfg.AddSubnetRoute(d.cfg.InterfaceName, cidr); err != nil {
-			slog.Debug("Failed to add overlay subnet route", "cidr", cidr, "error", err)
-		}
-	}
-
-	return d.wgManager.ApplyPeer(peerCfg)
-}
-
-// addBackendRoute ensures the host routes a backend's overlay address into the
-// WireGuard interface. Backend addresses are "host:port".
-func (d *Daemon) addBackendRoute(address string) {
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		host = address
-	}
-	if net.ParseIP(host) == nil {
-		return
-	}
-	if err := netcfg.AddHostRoute(d.cfg.InterfaceName, host); err != nil {
-		slog.Debug("Failed to add backend overlay route", "backend", address, "error", err)
-	}
+	return d.popLink.Connect(pop, d.overlayPrefixes)
 }
 
 func (d *Daemon) fetchPoPs(ctx context.Context) ([]core.EdgePoP, error) {
@@ -570,7 +543,6 @@ func (d *Daemon) SyncRoutesOnce(ctx context.Context) error {
 						Weight:  int(b.Weight),
 						Healthy: b.Healthy,
 					})
-					d.addBackendRoute(b.Address)
 				}
 				if bal, exists := d.proxyEngine.GetRoute(r.Hostname); exists {
 					bal.UpdateBackends(backends)
@@ -613,7 +585,6 @@ func (d *Daemon) SyncRoutesOnce(ctx context.Context) error {
 				Weight:  b.Weight,
 				Healthy: b.Healthy,
 			})
-			d.addBackendRoute(b.Address)
 		}
 
 		if bal, exists := d.proxyEngine.GetRoute(r.Hostname); exists {
@@ -680,62 +651,17 @@ func (d *Daemon) PublicKey() string {
 
 func (d *Daemon) realtimeListener(ctx context.Context) {
 	defer d.wg.Done()
-
-	if d.grpcClient != nil {
-		_ = d.grpcClient.StreamEvents(ctx, "gateway", d.cfg.Hostname, func(evt *v1.MeshEvent) {
-			if evt != nil {
-				_ = d.SyncRoutesOnce(ctx)
-			}
-		})
-		return
-	}
-
-	wsURL := d.cfg.PlaneEndpoint + "/api/v1/ws"
-	if strings.HasPrefix(wsURL, "https://") {
-		wsURL = "wss://" + strings.TrimPrefix(wsURL, "https://")
-	} else if strings.HasPrefix(wsURL, "http://") {
-		wsURL = "ws://" + strings.TrimPrefix(wsURL, "http://")
-	}
-
-	origin := d.cfg.PlaneEndpoint
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			conn, err := websocket.Dial(wsURL, "", origin)
-			if err != nil {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(2 * time.Second):
-					continue
-				}
-			}
-
-			slog.Info("Gateway connected to Control Plane real-time WebSocket stream", "url", wsURL)
-
-			for {
-				var raw string
-				err := websocket.Message.Receive(conn, &raw)
-				if err != nil {
-					_ = conn.Close()
-					break
-				}
-
-				var evt struct {
-					Event string `json:"event"`
-				}
-				if err := json.Unmarshal([]byte(raw), &evt); err == nil {
-					if evt.Event == "gateway_routes_updated" || evt.Event == "tunnel_registered" || evt.Event == "node_enrolled" {
-						slog.Info("Instant real-time route update event received", "event", evt.Event)
-						_ = d.SyncRoutesOnce(ctx)
-					}
-				}
-			}
-		}
-	}
+	realtime.Run(ctx, realtime.Config{
+		Endpoint:   d.cfg.PlaneEndpoint,
+		GRPC:       d.grpcClient,
+		Role:       "gateway",
+		ID:         d.cfg.Hostname,
+		Credential: d.token.Get,
+		Events:     []string{"gateway_routes_updated", "node_left"},
+	}, func(ctx context.Context, evs []string) {
+		slog.Info("Route change received", "events", evs)
+		_ = d.SyncRoutesOnce(ctx)
+	})
 }
 
 // ProxyEngine returns the internal reverse proxy engine.

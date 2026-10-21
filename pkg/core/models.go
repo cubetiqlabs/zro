@@ -12,6 +12,25 @@ import (
 	"github.com/google/uuid"
 )
 
+// Default overlay prefixes, used when a network does not specify its own.
+const (
+	DefaultOverlayIPv4CIDR = "100.64.0.0/10"
+	DefaultOverlayIPv6CIDR = "fd00:cafe::/64"
+)
+
+// OverlayPrefixes returns the overlay CIDRs an agent should route into its
+// WireGuard interface, falling back to the defaults for older planes that do
+// not report them.
+func OverlayPrefixes(v4, v6 string) []string {
+	if v4 == "" {
+		v4 = DefaultOverlayIPv4CIDR
+	}
+	if v6 == "" {
+		v6 = DefaultOverlayIPv6CIDR
+	}
+	return []string{v4, v6}
+}
+
 // GenerateNetworkID generates a 16-hex character ZeroTier-styled network ID (e.g. "8056c2e21c000001").
 func GenerateNetworkID() string {
 	b := make([]byte, 8)

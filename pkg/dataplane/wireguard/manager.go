@@ -198,8 +198,12 @@ func (m *Manager) ApplyPeer(cfg PeerConfig) error {
 	}
 	pubHex := hex.EncodeToString(pubKeyBytes)
 
-	// Maintain state map
-	m.mockPeers[cfg.PublicKey] = cfg
+	// Re-applying an unchanged peer would reset the endpoint WireGuard learned
+	// from the peer's authenticated packets back to a possibly stale one.
+	if prev, ok := m.mockPeers[cfg.PublicKey]; ok && samePeer(prev, cfg) {
+		return nil
+	}
+	var applyErr error
 
 	// 1. Configure userspace wireguard-go device via WireGuard UAPI protocol
 	if m.userDevice != nil {
@@ -223,7 +227,7 @@ func (m *Manager) ApplyPeer(cfg PeerConfig) error {
 		}
 
 		if err := m.userDevice.IpcSet(sb.String()); err != nil {
-			slog.Debug("Userspace WireGuard IpcSet peer configure failed", "error", err)
+			applyErr = fmt.Errorf("configuring peer: %w", err)
 		}
 	}
 
@@ -263,7 +267,59 @@ func (m *Manager) ApplyPeer(cfg PeerConfig) error {
 		}
 	}
 
+	if applyErr != nil {
+		return applyErr
+	}
+	m.mockPeers[cfg.PublicKey] = cfg // only remember what was actually applied
 	return nil
+}
+
+// samePeer reports whether two peer configs would program the device identically.
+func samePeer(a, b PeerConfig) bool {
+	if a.PublicKey != b.PublicKey || a.PresharedKey != b.PresharedKey || a.Endpoint != b.Endpoint ||
+		a.PersistentKeepalive != b.PersistentKeepalive || len(a.AllowedIPs) != len(b.AllowedIPs) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(a.AllowedIPs))
+	for _, ip := range a.AllowedIPs {
+		seen[ip] = struct{}{}
+	}
+	for _, ip := range b.AllowedIPs {
+		if _, ok := seen[ip]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// Reconcile makes the device's peers exactly desired: changed peers are
+// re-applied, unchanged ones are left alone, and peers not listed are removed.
+// It keeps going after a failure and returns the first error.
+func (m *Manager) Reconcile(desired []PeerConfig) error {
+	want := make(map[string]struct{}, len(desired))
+	var firstErr error
+	for _, p := range desired {
+		want[p.PublicKey] = struct{}{}
+		if err := m.ApplyPeer(p); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	m.mu.Lock()
+	var stale []string
+	for key := range m.mockPeers {
+		if _, ok := want[key]; !ok {
+			stale = append(stale, key)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, key := range stale {
+		if err := m.RemovePeer(key); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // RemovePeer removes a peer from the WireGuard interface.

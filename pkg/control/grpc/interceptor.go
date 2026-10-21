@@ -30,6 +30,7 @@ var policy = map[string]access{
 	"/zro.control.v1.ControlPlaneService/ReportProbes":     accessNode,
 	"/zro.control.v1.ControlPlaneService/DiscoverP2P":      accessNode,
 	"/zro.control.v1.ControlPlaneService/GetGatewayRoutes": accessNode,
+	"/zro.control.v1.ControlPlaneService/ListPeers":        accessNode,
 	"/zro.control.v1.ControlPlaneService/Deregister":       accessNode,
 	"/zro.control.v1.ControlPlaneService/RegisterTunnel":   accessNode,
 	"/zro.control.v1.ControlPlaneService/ListTunnels":      accessNode,

@@ -12,21 +12,18 @@ import (
 	"sync"
 	"time"
 
-	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
 	controlauth "github.com/cubis/zro/pkg/control/auth"
 	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
-	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/dataplane/derp"
 	"github.com/cubis/zro/pkg/dataplane/netcfg"
-	"github.com/cubis/zro/pkg/dataplane/router"
 	"github.com/cubis/zro/pkg/dataplane/tun"
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
 	"github.com/cubis/zro/pkg/identity"
 	"github.com/cubis/zro/pkg/netutil"
 	"github.com/cubis/zro/pkg/p2p/stun"
-	"golang.org/x/net/websocket"
+	"github.com/cubis/zro/pkg/realtime"
 )
 
 // PoPDaemon is the edge data plane daemon running at public PoPs.
@@ -35,7 +32,7 @@ type PoPDaemon struct {
 	keyPair      *crypto.KeyPair
 	wgManager    *wireguard.Manager
 	tunDev       tun.Device
-	routingTable *router.Table
+	routed       map[string]bool // overlay prefixes already routed into the TUN (sync goroutine only)
 	udpListener  *net.UDPConn
 	derpServer   *derp.Server
 	derpListener net.Listener
@@ -99,11 +96,11 @@ func NewPoPDaemon(cfg *config.EdgeConfig) (*PoPDaemon, error) {
 	}
 
 	e := &PoPDaemon{
-		cfg:          cfg,
-		keyPair:      kp,
-		tunDev:       tunDev,
-		udpListener:  udpConn,
-		routingTable: router.NewTable(),
+		cfg:         cfg,
+		keyPair:     kp,
+		tunDev:      tunDev,
+		udpListener: udpConn,
+		routed:      make(map[string]bool),
 	}
 	if cfg.StateDir != "" {
 		if key, err := identity.ReadSecret(cfg.StateDir, popKeyFile); err == nil {
@@ -134,12 +131,6 @@ func NewPoPDaemon(cfg *config.EdgeConfig) (*PoPDaemon, error) {
 	if err := netcfg.EnableForwarding(); err != nil {
 		slog.Warn("Could not enable IP forwarding on edge (relay may fail)", "error", err)
 	}
-	for _, cidr := range []string{"100.64.0.0/10", "fd00:cafe::/64"} {
-		if err := netcfg.AddSubnetRoute(iface, cidr); err != nil {
-			slog.Warn("Could not add edge overlay route", "cidr", cidr, "error", err)
-		}
-	}
-
 	// Resolve public or private endpoint dynamically (auto discovery, env override, or internal mode)
 	resolvedEndpoint := netutil.ResolveEndpoint(cfg.PublicEndpoint, cfg.ListenPort, cfg.UsePrivateIP)
 	slog.Info("Edge endpoint configuration resolved",
@@ -380,112 +371,6 @@ func (e *PoPDaemon) syncWorker(ctx context.Context) {
 	}
 }
 
-func (e *PoPDaemon) syncMeshTopology(ctx context.Context) {
-	if e.grpcClient != nil {
-		gResp, err := e.grpcClient.SyncEdgeMesh(ctx, &v1.EdgeSyncRequest{
-			PopCode: e.cfg.PoPCode,
-		})
-		if err == nil && gResp != nil {
-			e.peersMu.Lock()
-			e.peerCount = len(gResp.Nodes)
-			e.peersMu.Unlock()
-
-			for _, p := range gResp.Pops {
-				if p.PopCode != e.cfg.PoPCode && p.PublicKey != "" {
-					_ = e.wgManager.ApplyPeer(wireguard.PeerConfig{
-						PublicKey:           p.PublicKey,
-						Endpoint:            p.PublicEndpoint,
-						AllowedIPs:          []string{"100.64.0.0/10", "fd00:cafe::/64"},
-						PersistentKeepalive: 20 * time.Second,
-					})
-				}
-			}
-
-			for _, n := range gResp.Nodes {
-				if n.PublicKey != "" && n.OverlayIpv4 != "" {
-					var ep string
-					if len(n.Endpoints) > 0 {
-						ep = n.Endpoints[0]
-					}
-					_ = e.wgManager.ApplyPeer(wireguard.PeerConfig{
-						PublicKey:           n.PublicKey,
-						Endpoint:            ep,
-						AllowedIPs:          []string{n.OverlayIpv4 + "/32"},
-						PersistentKeepalive: 25 * time.Second,
-					})
-					e.routingTable.SetRoute(n.OverlayIpv4, router.RouteTarget{
-						PublicKey: n.PublicKey,
-						Endpoint:  ep,
-					})
-					if err := netcfg.AddHostRoute(e.cfg.InterfaceName, n.OverlayIpv4); err != nil {
-						slog.Debug("Could not add edge route for node", "node", n.OverlayIpv4, "error", err)
-					}
-				}
-			}
-			return
-		}
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", e.cfg.PlaneEndpoint+"/api/v1/edge/sync", nil)
-	if err != nil {
-		return
-	}
-
-	resp, err := e.httpClient.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
-	var syncData struct {
-		PoPs  []core.EdgePoP `json:"pops"`
-		Nodes []core.Node    `json:"nodes"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&syncData); err != nil {
-		return
-	}
-
-	e.peersMu.Lock()
-	e.peerCount = len(syncData.Nodes)
-	e.peersMu.Unlock()
-
-	// 1. Establish backbone mesh with other PoPs
-	for _, p := range syncData.PoPs {
-		if p.PoPCode != e.cfg.PoPCode && p.PublicKey != "" {
-			_ = e.wgManager.ApplyPeer(wireguard.PeerConfig{
-				PublicKey:           p.PublicKey,
-				Endpoint:            p.PublicEndpoint,
-				AllowedIPs:          []string{"100.64.0.0/10", "fd00:cafe::/64"},
-				PersistentKeepalive: 20 * time.Second,
-			})
-		}
-	}
-
-	// 2. Configure routing for active nodes
-	for _, n := range syncData.Nodes {
-		if n.PublicKey != "" && n.OverlayIPv4 != "" {
-			var ep string
-			if len(n.Endpoints) > 0 {
-				ep = n.Endpoints[0]
-			}
-			_ = e.wgManager.ApplyPeer(wireguard.PeerConfig{
-				PublicKey:           n.PublicKey,
-				Endpoint:            ep,
-				AllowedIPs:          []string{n.OverlayIPv4 + "/32"},
-				PersistentKeepalive: 25 * time.Second,
-			})
-			e.routingTable.SetRoute(n.OverlayIPv4, router.RouteTarget{
-				PublicKey: n.PublicKey,
-				Endpoint:  ep,
-			})
-			if err := netcfg.AddHostRoute(e.cfg.InterfaceName, n.OverlayIPv4); err != nil {
-				slog.Debug("Could not add edge route for node", "node", n.OverlayIPv4, "error", err)
-			}
-		}
-	}
-}
-
 // PublicKey returns the Edge PoP WireGuard public key.
 func (e *PoPDaemon) PublicKey() string {
 	return e.keyPair.PublicKey
@@ -493,68 +378,15 @@ func (e *PoPDaemon) PublicKey() string {
 
 func (e *PoPDaemon) realtimeListener(ctx context.Context) {
 	defer e.wg.Done()
-
-	if e.grpcClient != nil {
-		_ = e.grpcClient.StreamEvents(ctx, "edge", e.cfg.PoPCode, func(evt *v1.MeshEvent) {
-			if evt != nil {
-				slog.Info("Real-time topology update event received at Edge PoP via gRPC", "pop_code", e.cfg.PoPCode, "event", evt.EventType)
-				e.syncMeshTopology(ctx)
-			}
-		})
-		return
-	}
-
-	wsURL := e.cfg.PlaneEndpoint + "/api/v1/ws"
-	if strings.HasPrefix(wsURL, "https://") {
-		wsURL = "wss://" + strings.TrimPrefix(wsURL, "https://")
-	} else if strings.HasPrefix(wsURL, "http://") {
-		wsURL = "ws://" + strings.TrimPrefix(wsURL, "http://")
-	}
-
-	origin := e.cfg.PlaneEndpoint
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			wsCfg, err := websocket.NewConfig(wsURL, origin)
-			if err != nil {
-				return
-			}
-			if cred := e.credential(); cred != "" {
-				wsCfg.Header.Set("X-Edge-Key", cred)
-			}
-			conn, err := websocket.DialConfig(wsCfg)
-			if err != nil {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(2 * time.Second):
-					continue
-				}
-			}
-
-			slog.Info("Edge PoP connected to Control Plane real-time WebSocket stream", "pop_code", e.cfg.PoPCode, "url", wsURL)
-
-			for {
-				var raw string
-				err := websocket.Message.Receive(conn, &raw)
-				if err != nil {
-					_ = conn.Close()
-					break
-				}
-
-				var evt struct {
-					Event string `json:"event"`
-				}
-				if err := json.Unmarshal([]byte(raw), &evt); err == nil {
-					if evt.Event == "node_enrolled" || evt.Event == "pop_registered" || evt.Event == "edge_sync" || evt.Event == "delta" {
-						slog.Info("Real-time topology update event received at Edge PoP", "pop_code", e.cfg.PoPCode, "event", evt.Event)
-						e.syncMeshTopology(ctx)
-					}
-				}
-			}
-		}
-	}
+	realtime.Run(ctx, realtime.Config{
+		Endpoint:   e.cfg.PlaneEndpoint,
+		GRPC:       e.grpcClient,
+		Role:       "edge",
+		ID:         e.cfg.PoPCode,
+		Credential: e.credential,
+		Events:     []string{"node_joined", "node_left", "mesh_graph_updated", "pop_status_changed", "edge_registered"},
+	}, func(ctx context.Context, evs []string) {
+		slog.Debug("Mesh change received", "pop_code", e.cfg.PoPCode, "events", evs)
+		e.syncMeshTopology(ctx)
+	})
 }

@@ -202,3 +202,8 @@ func (c *Client) Deregister(ctx context.Context) error {
 	_, err := c.client.Deregister(ctx, &v1.DeregisterRequest{})
 	return err
 }
+
+// ListPeers lists the members of the caller's network.
+func (c *Client) ListPeers(ctx context.Context) (*v1.ListPeersResponse, error) {
+	return c.client.ListPeers(ctx, &v1.ListPeersRequest{})
+}

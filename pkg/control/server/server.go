@@ -937,11 +937,8 @@ func (s *Server) popWatchWorker(ctx context.Context) {
 	}
 }
 
-// EdgeSyncResponse returns data plane synchronization state.
-type EdgeSyncResponse struct {
-	PoPs  []core.EdgePoP `json:"pops"`
-	Nodes []core.Node    `json:"nodes"`
-}
+// EdgeSyncResponse is the mesh state returned to edge PoPs.
+type EdgeSyncResponse = service.EdgeSnapshot
 
 func (s *Server) handleEdgeSync(w http.ResponseWriter, r *http.Request) {
 	pops, _ := s.db.EdgePoPs.ListHealthy(r.Context())
@@ -1042,25 +1039,17 @@ func (s *Server) handleReportProbes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetPeers(w http.ResponseWriter, r *http.Request) {
-	netIDStr := r.PathValue("id")
-	if netIDStr == "" {
-		http.Error(w, "network ID required", http.StatusBadRequest)
-		return
-	}
-
-	if _, ok := s.authorizeNetwork(r.Context(), netIDStr); !ok {
+	node := NodeFromContext(r.Context())
+	if r.PathValue("id") != node.NetworkID {
 		http.Error(w, "forbidden: network access denied", http.StatusForbidden)
 		return
 	}
-
-	peers, err := s.db.Nodes.ListByNetworkID(r.Context(), netIDStr)
+	peers, err := s.svc.Peers(r.Context(), node)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(peers)
+	writeJSON(w, http.StatusOK, peers)
 }
 
 func (s *Server) handleRegisterTunnel(w http.ResponseWriter, r *http.Request) {

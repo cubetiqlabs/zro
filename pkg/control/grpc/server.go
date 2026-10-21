@@ -102,16 +102,21 @@ func toProtoPoP(p *core.EdgePoP) *v1.EdgePoP {
 }
 
 func toProtoNode(n *core.Node) *v1.Node {
+	popCode := ""
+	if n.AssignedPoP != nil {
+		popCode = n.AssignedPoP.PoPCode
+	}
 	return &v1.Node{
-		Id:          n.ID.String(),
-		Hostname:    n.Hostname,
-		PublicKey:   n.PublicKey,
-		OverlayIpv4: n.OverlayIPv4,
-		OverlayIpv6: n.OverlayIPv6,
-		NodeType:    string(n.NodeType),
-		Tags:        []string(n.Tags),
-		AllowedIps:  []string(n.AllowedIPs),
-		Endpoints:   []string(n.Endpoints),
+		AssignedPopCode: popCode,
+		Id:              n.ID.String(),
+		Hostname:        n.Hostname,
+		PublicKey:       n.PublicKey,
+		OverlayIpv4:     n.OverlayIPv4,
+		OverlayIpv6:     n.OverlayIPv6,
+		NodeType:        string(n.NodeType),
+		Tags:            []string(n.Tags),
+		AllowedIps:      []string(n.AllowedIPs),
+		Endpoints:       []string(n.Endpoints),
 	}
 }
 
@@ -154,6 +159,8 @@ func (s *Server) Enroll(ctx context.Context, req *v1.EnrollRequest) (*v1.EnrollR
 		OverlayIpv6:  resp.OverlayIPv6,
 		DnsDomain:    resp.DNSDomain,
 		Mtu:          int32(resp.MTU),
+		Ipv4Cidr:     resp.IPv4CIDR,
+		Ipv6Cidr:     resp.IPv6CIDR,
 		AllowedIps:   resp.AllowedIPs,
 		AllowedPorts: resp.AllowedPorts,
 		DefaultDeny:  resp.DefaultDeny,
@@ -209,16 +216,16 @@ func (s *Server) DiscoverP2P(ctx context.Context, req *v1.P2PDiscoverRequest) (*
 
 // SyncEdgeMesh synchronizes global PoPs and Nodes with Edge Data Plane PoPs.
 func (s *Server) SyncEdgeMesh(ctx context.Context, _ *v1.EdgeSyncRequest) (*v1.EdgeSyncResponse, error) {
-	pops, nodes, err := s.svc.EdgeSync(ctx)
+	snap, err := s.svc.EdgeSync(ctx)
 	if err != nil {
 		return nil, toStatus(err)
 	}
-	out := &v1.EdgeSyncResponse{}
-	for i := range pops {
-		out.Pops = append(out.Pops, toProtoPoP(&pops[i]))
+	out := &v1.EdgeSyncResponse{Prefixes: snap.Prefixes}
+	for i := range snap.PoPs {
+		out.Pops = append(out.Pops, toProtoPoP(&snap.PoPs[i]))
 	}
-	for i := range nodes {
-		out.Nodes = append(out.Nodes, toProtoNode(&nodes[i]))
+	for i := range snap.Nodes {
+		out.Nodes = append(out.Nodes, toProtoNode(&snap.Nodes[i]))
 	}
 	return out, nil
 }
@@ -242,6 +249,19 @@ func (s *Server) GetGatewayRoutes(ctx context.Context, _ *v1.GatewayRoutesReques
 			})
 		}
 		out.Routes = append(out.Routes, route)
+	}
+	return out, nil
+}
+
+// ListPeers returns the members of the caller's network.
+func (s *Server) ListPeers(ctx context.Context, _ *v1.ListPeersRequest) (*v1.ListPeersResponse, error) {
+	peers, err := s.svc.Peers(ctx, node(ctx))
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	out := &v1.ListPeersResponse{}
+	for i := range peers {
+		out.Peers = append(out.Peers, toProtoNode(&peers[i]))
 	}
 	return out, nil
 }
