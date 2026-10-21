@@ -100,3 +100,30 @@ control_plane:
 		t.Fatalf("expected error for non-existent config file")
 	}
 }
+
+// Keys without a default used to ignore their environment variable when no
+// config file existed (viper only maps env for known keys).
+func TestEnvOverridesKeysWithoutDefaults(t *testing.T) {
+	t.Chdir(t.TempDir()) // no zro.yaml here
+	t.Setenv("ZRO_CONTROL_PLANE_REQUIRE_AUTH", "true")
+	t.Setenv("ZRO_CONTROL_PLANE_ADMIN_API_KEY", "admin-from-env")
+	t.Setenv("ZRO_CONTROL_PLANE_GRPC_TLS_CERT", "/certs/c.pem")
+	t.Setenv("ZRO_EDGE_EDGE_API_KEY", "edge-from-env")
+	t.Setenv("ZRO_EDGE_PLANE_GRPC_ENDPOINT", "plane:9443") // lives in the embedded PlaneGRPC struct
+	t.Setenv("ZRO_NODE_ENROLLMENT_TOKEN", "zro_tok_x")
+	t.Setenv("ZRO_GATEWAY_ENROLLMENT_TOKEN", "zro_tok_gw")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ControlPlane.RequireAuth || cfg.ControlPlane.AdminAPIKey != "admin-from-env" || cfg.ControlPlane.GRPCTLSCert != "/certs/c.pem" {
+		t.Fatalf("control plane env not applied: %+v", cfg.ControlPlane)
+	}
+	if cfg.Edge.EdgeAPIKey != "edge-from-env" || cfg.Edge.GRPCEndpoint != "plane:9443" {
+		t.Fatalf("edge env not applied: %+v", cfg.Edge)
+	}
+	if cfg.Node.EnrollmentToken != "zro_tok_x" || cfg.Gateway.EnrollmentToken != "zro_tok_gw" {
+		t.Fatal("node/gateway enrollment tokens from env not applied")
+	}
+}

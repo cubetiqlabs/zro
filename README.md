@@ -62,13 +62,14 @@ go build -o bin/zro ./cmd/zro
 ### 1. Local / Standalone Mesh Simulation (Docker Compose)
 Starts PostgreSQL, Control Plane (`:8443`), Edge PoPs in Cambodia (`:51820/udp`) and Singapore (`:51821/udp`), and Ingress Gateway (`:8080`):
 ```bash
+cp .env.example .env        # set CLUSTER_SECRET, EDGE_API_KEY (and ADMIN_API_KEY) - compose refuses to start without the first two
 docker compose up -d
 ```
 
 ### 2. Run Production Smoke Tests
-Automated validation of all components running in Docker:
+Drives the running stack through its authenticated API (needs `jq`):
 ```bash
-./scripts/smoke_test.sh
+CLUSTER_SECRET=... ADMIN_API_KEY=... ./scripts/smoke_test.sh
 ```
 
 ### 3. Production Cloud Cluster Deployment
@@ -79,7 +80,7 @@ For multi-server topologies (AWS, DigitalOcean, GCP, Bare-Metal):
   ```
 - **Deploy Standalone Edge PoP** on a VPS with a public IP (uses host networking for line-rate WireGuard performance):
   ```bash
-  POP_CODE=KH REGION=Asia/Phnom_Penh PUBLIC_ENDPOINT=173.1.1.1:51820 \
+  POP_CODE=KH REGION=Asia/Phnom_Penh PUBLIC_ENDPOINT=173.1.1.1:51820 EDGE_API_KEY=... \
   docker compose -f docker-compose.cluster.yml --profile edge up -d
   ```
 - **Deploy Ingress Gateway** with automatic TLS termination:
@@ -95,6 +96,9 @@ For multi-server topologies (AWS, DigitalOcean, GCP, Bare-Metal):
 # Unit & integration tests
 go test -v -race ./...
 
-# End-to-end full mesh smoke test
-go test -v ./test/smoke/...
+# Control plane + real edge + two nodes in one process (WireGuard, netstack, ACLs)
+go test -v -race ./test/e2e/... ./test/smoke/...
 ```
+
+`make help` lists the build, lint, vulnerability-scan and image targets. See
+[`docs/deployment.md`](docs/deployment.md) for the security model and a full production guide.

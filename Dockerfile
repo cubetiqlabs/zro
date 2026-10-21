@@ -14,9 +14,12 @@ RUN go mod download
 # Copy source tree
 COPY . .
 
-# Build statically linked binary without CGO
+# Build statically linked binary without CGO, stamped with the build version
+ARG VERSION=dev
+ARG COMMIT=
+ARG DATE=
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w -extldflags '-static'" \
+    -ldflags="-s -w -extldflags '-static' -X github.com/cubis/zro/pkg/version.Version=${VERSION} -X github.com/cubis/zro/pkg/version.Commit=${COMMIT} -X github.com/cubis/zro/pkg/version.Date=${DATE}" \
     -trimpath \
     -o /bin/zro \
     ./cmd/zro
@@ -24,11 +27,11 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # Stage 2: Production minimal runtime
 FROM alpine:3.23
 
-# Install runtime utilities for network interfaces & SSL
+# Runtime utilities: `ip` programs overlay addresses/routes, curl serves health checks.
+# (No iptables: ZRO relies on WireGuard AllowedIPs and kernel routing, not NAT rules.)
 RUN apk add --no-cache \
     ca-certificates \
     tzdata \
-    iptables \
     iproute2 \
     curl
 

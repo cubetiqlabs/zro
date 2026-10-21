@@ -543,6 +543,9 @@ func (s *Server) authorizeNetwork(ctx context.Context, networkID string) (*core.
 
 func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /health", s.handleHealth)
+	s.mux.HandleFunc("GET /healthz", s.handleLive)
+	s.mux.HandleFunc("GET /readyz", s.handleReady)
+	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 
 	// Network Management (ZeroTier-styled 16-hex Network ID)
 	s.mux.HandleFunc("POST /api/v1/networks", s.tenantAuthMiddleware(s.handleCreateNetwork))

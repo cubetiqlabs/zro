@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"github.com/cubis/zro/pkg/identity"
+	"reflect"
 	"strings"
 	"time"
 
@@ -193,6 +194,12 @@ func Load(cfgFile string) (*AppConfig, error) {
 	v.SetEnvPrefix("ZRO")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
+	// AutomaticEnv alone only reaches keys that already have a default or a file
+	// entry, so bind every key explicitly or ZRO_EDGE_EDGE_API_KEY and friends
+	// would be silently ignored when no config file is present.
+	if err := bindEnv(v, reflect.TypeOf(AppConfig{}), ""); err != nil {
+		return nil, err
+	}
 
 	if cfgFile != "" {
 		v.SetConfigFile(cfgFile)
@@ -214,4 +221,37 @@ func Load(cfgFile string) (*AppConfig, error) {
 	}
 
 	return &cfg, nil
+}
+
+// bindEnv binds every leaf field of t to its environment variable, following
+// the mapstructure tags (nested structs become dotted keys; ",squash" embeds).
+func bindEnv(v *viper.Viper, t reflect.Type, prefix string) error {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		name, opts, _ := strings.Cut(f.Tag.Get("mapstructure"), ",")
+		if name == "-" || !f.IsExported() {
+			continue
+		}
+		key := name
+		if prefix != "" && name != "" {
+			key = prefix + "." + name
+		}
+		if opts == "squash" {
+			key = prefix
+		}
+		if key == "" && opts != "squash" {
+			continue
+		}
+
+		if f.Type.Kind() == reflect.Struct && f.Type != reflect.TypeOf(time.Duration(0)) {
+			if err := bindEnv(v, f.Type, key); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := v.BindEnv(key); err != nil {
+			return fmt.Errorf("binding %s: %w", key, err)
+		}
+	}
+	return nil
 }

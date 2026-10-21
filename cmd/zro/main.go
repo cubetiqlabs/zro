@@ -22,6 +22,7 @@ import (
 	"github.com/cubis/zro/pkg/node"
 	"github.com/cubis/zro/pkg/store"
 	"github.com/cubis/zro/pkg/tunnel"
+	"github.com/cubis/zro/pkg/version"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 )
@@ -62,6 +63,7 @@ smart routing, IPless nodes, zero-trust ACLs, and cloud-native load balancing.`,
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "Path to configuration file (default: ./zro.yaml)")
 
+	rootCmd.AddCommand(newVersionCmd())
 	rootCmd.AddCommand(newPlaneCmd())
 	rootCmd.AddCommand(newEdgeCmd())
 	rootCmd.AddCommand(newNodeCmd())
@@ -81,6 +83,7 @@ func main() {
 }
 
 func runPlane(cfg *config.AppConfig) error {
+	slog.Info("ZRO control plane", "build", version.Get())
 	slog.Info("Initializing Control Plane database", "driver", cfg.ControlPlane.DatabaseDriver)
 	db, err := store.NewDB(cfg.ControlPlane.DatabaseDriver, cfg.ControlPlane.DatabaseDSN)
 	if err != nil {
@@ -157,6 +160,14 @@ func runGateway(cfg *config.AppConfig) error {
 	<-ctx.Done()
 	slog.Info("Stopping Ingress Gateway...")
 	return gwDaemon.Stop()
+}
+
+func newVersionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print the build version",
+		Run:   func(cmd *cobra.Command, args []string) { fmt.Println(version.Get()) },
+	}
 }
 
 func newPlaneCmd() *cobra.Command {
