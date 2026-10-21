@@ -169,6 +169,17 @@ func (r *nodeRepo) GetByPublicKey(ctx context.Context, pubKey string) (*core.Nod
 	return &node, nil
 }
 
+func (r *nodeRepo) GetByTokenHash(ctx context.Context, tokenHash string) (*core.Node, error) {
+	if tokenHash == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var node core.Node
+	if err := r.db.WithContext(ctx).Preload("AssignedPoP").First(&node, "token_hash = ?", tokenHash).Error; err != nil {
+		return nil, err
+	}
+	return &node, nil
+}
+
 func (r *nodeRepo) GetByOverlayIP(ctx context.Context, networkID string, overlayIP string) (*core.Node, error) {
 	var node core.Node
 	if err := r.db.WithContext(ctx).Preload("AssignedPoP").First(&node, "network_id = ? AND (overlay_ipv4 = ? OR overlay_ipv6 = ?)", networkID, overlayIP, overlayIP).Error; err != nil {

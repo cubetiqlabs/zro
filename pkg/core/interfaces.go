@@ -41,6 +41,7 @@ type NodeRepository interface {
 	Create(ctx context.Context, node *Node) error
 	GetByID(ctx context.Context, id uuid.UUID) (*Node, error)
 	GetByPublicKey(ctx context.Context, pubKey string) (*Node, error)
+	GetByTokenHash(ctx context.Context, tokenHash string) (*Node, error)
 	GetByOverlayIP(ctx context.Context, networkID string, overlayIP string) (*Node, error)
 	ListByNetworkID(ctx context.Context, networkID string) ([]Node, error)
 	ListActiveByPoPID(ctx context.Context, popID uuid.UUID) ([]Node, error)

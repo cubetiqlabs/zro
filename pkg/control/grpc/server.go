@@ -2,7 +2,6 @@ package grpc
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -13,6 +12,7 @@ import (
 	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
 	"github.com/cubis/zro/pkg/control/delegation"
+	"github.com/cubis/zro/pkg/control/events"
 	"github.com/cubis/zro/pkg/control/ipam"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
@@ -31,19 +31,28 @@ type Server struct {
 	ipamCache map[string]*ipam.IPAM
 	ipamMu    sync.RWMutex
 
-	streamMu    sync.RWMutex
-	streamChans map[chan *v1.MeshEvent]bool
+	bus         *events.Bus
+	streamScope func(context.Context) (events.Scope, error)
 }
 
 // NewServer creates a new gRPC Control Plane Server.
 func NewServer(cfg *config.ControlPlaneConfig, db *store.DB) *Server {
 	return &Server{
-		cfg:         cfg,
-		db:          db,
-		delegator:   delegation.NewEngine(db.EdgePoPs),
-		ipamCache:   make(map[string]*ipam.IPAM),
-		streamChans: make(map[chan *v1.MeshEvent]bool),
+		cfg:       cfg,
+		db:        db,
+		delegator: delegation.NewEngine(db.EdgePoPs),
+		ipamCache: make(map[string]*ipam.IPAM),
+		bus:       events.NewBus(),
+		streamScope: func(context.Context) (events.Scope, error) {
+			return events.Scope{}, status.Error(codes.Unauthenticated, "event streams are not configured")
+		},
 	}
+}
+
+// SetEventSource wires the shared event bus and the function that decides
+// which events an incoming stream may see. Streams fail closed until set.
+func (s *Server) SetEventSource(bus *events.Bus, scope func(context.Context) (events.Scope, error)) {
+	s.bus, s.streamScope = bus, scope
 }
 
 // Enroll handles cryptographic node and gateway enrollment over gRPC.
@@ -157,7 +166,7 @@ func (s *Server) Enroll(ctx context.Context, req *v1.EnrollRequest) (*v1.EnrollR
 		}
 	}
 
-	s.BroadcastEvent("node_enrolled", map[string]any{
+	s.bus.Publish(events.Scope{TenantID: network.TenantID, NetworkID: network.ID}, "node_enrolled", map[string]any{
 		"node_id":      node.ID.String(),
 		"hostname":     node.Hostname,
 		"overlay_ipv4": node.OverlayIPv4,
@@ -348,61 +357,45 @@ func (s *Server) GetGatewayRoutes(ctx context.Context, req *v1.GatewayRoutesRequ
 
 // StreamMeshEvents provides a persistent real-time event bus over gRPC streaming.
 func (s *Server) StreamMeshEvents(req *v1.StreamEventsRequest, stream v1.ControlPlaneService_StreamMeshEventsServer) error {
-	ch := make(chan *v1.MeshEvent, 32)
-
-	s.streamMu.Lock()
-	s.streamChans[ch] = true
-	s.streamMu.Unlock()
-
-	defer func() {
-		s.streamMu.Lock()
-		delete(s.streamChans, ch)
-		close(ch)
-		s.streamMu.Unlock()
-	}()
+	scope, err := s.streamScope(stream.Context())
+	if err != nil {
+		return err
+	}
+	sub := s.bus.Subscribe(scope)
+	defer sub.Close()
 
 	slog.Info("gRPC client connected to real-time event stream", "subscriber", req.SubscriberId, "role", req.Role)
 
-	// Send initial connected event
-	_ = stream.Send(&v1.MeshEvent{
+	if err := stream.Send(&v1.MeshEvent{
 		EventType:   "connected",
 		Timestamp:   time.Now().UnixNano(),
 		PayloadJson: fmt.Sprintf(`{"status":"connected","role":%q}`, req.Role),
-	})
+	}); err != nil {
+		return err
+	}
 
 	for {
 		select {
 		case <-stream.Context().Done():
 			return stream.Context().Err()
-		case evt, ok := <-ch:
+		case msg, ok := <-sub.C:
 			if !ok {
-				return nil
+				return status.Error(codes.ResourceExhausted, "event stream too slow; reconnect and resync")
 			}
-			if err := stream.Send(evt); err != nil {
+			if err := stream.Send(&v1.MeshEvent{
+				EventType:   msg.Event,
+				Timestamp:   msg.Timestamp.UnixNano(),
+				PayloadJson: string(msg.Data),
+			}); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-// BroadcastEvent dispatches an event to all connected gRPC event streams.
+// BroadcastEvent publishes an unscoped (control-plane wide) event.
 func (s *Server) BroadcastEvent(eventType string, payload any) {
-	dataBytes, _ := json.Marshal(payload)
-	evt := &v1.MeshEvent{
-		EventType:   eventType,
-		Timestamp:   time.Now().UnixNano(),
-		PayloadJson: string(dataBytes),
-	}
-
-	s.streamMu.RLock()
-	defer s.streamMu.RUnlock()
-
-	for ch := range s.streamChans {
-		select {
-		case ch <- evt:
-		default:
-		}
-	}
+	s.bus.Publish(events.Scope{}, eventType, payload)
 }
 
 func (s *Server) getOrCreateIPAM(ctx context.Context, net *core.Network) (*ipam.IPAM, error) {

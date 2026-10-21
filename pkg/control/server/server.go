@@ -2,11 +2,13 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,7 +16,9 @@ import (
 
 	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
+	controlauth "github.com/cubis/zro/pkg/control/auth"
 	"github.com/cubis/zro/pkg/control/delegation"
+	controlevents "github.com/cubis/zro/pkg/control/events"
 	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
 	"github.com/cubis/zro/pkg/control/ipam"
 	"github.com/cubis/zro/pkg/control/ws"
@@ -25,6 +29,9 @@ import (
 	"github.com/cubis/zro/pkg/store"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // Server is the HTTP/REST Control Plane API server for ZRO.
@@ -39,15 +46,13 @@ type Server struct {
 	gatewayProxy *proxy.Engine
 
 	// High-performance Realtime Communication
-	wsHub      *ws.Hub
 	grpcServer *grpc.Server
 	grpcCtrl   *controlgrpc.Server
 	grpcLis    net.Listener
 
-	// Notification subscribers for delta updates
-	subscribersMu sync.RWMutex
-	subscribers   map[chan []byte]bool
-	cancel        context.CancelFunc
+	// Tenant-scoped fan-out shared by SSE, WebSocket and gRPC streams
+	bus    *controlevents.Bus
+	cancel context.CancelFunc
 }
 
 // NewServer creates a new instance of the Control Plane API Server.
@@ -56,15 +61,15 @@ func NewServer(cfg *config.ControlPlaneConfig, db *store.DB) *Server {
 	mux := http.NewServeMux()
 
 	s := &Server{
-		cfg:         cfg,
-		db:          db,
-		delegator:   delegator,
-		ipamCache:   make(map[string]*ipam.IPAM),
-		mux:         mux,
-		subscribers: make(map[chan []byte]bool),
-		wsHub:       ws.NewHub(),
-		grpcCtrl:    controlgrpc.NewServer(cfg, db),
+		cfg:       cfg,
+		db:        db,
+		delegator: delegator,
+		ipamCache: make(map[string]*ipam.IPAM),
+		mux:       mux,
+		bus:       controlevents.NewBus(),
+		grpcCtrl:  controlgrpc.NewServer(cfg, db),
 	}
+	s.grpcCtrl.SetEventSource(s.bus, s.grpcStreamScope)
 
 	if cfg.EnableGateway {
 		s.gatewayProxy = proxy.NewEngine()
@@ -133,10 +138,17 @@ func (s *Server) Handler() http.Handler {
 
 type contextKey string
 
-const tenantContextKey contextKey = "zro_tenant"
+const (
+	tenantContextKey contextKey = "zro_tenant"
+	nodeContextKey   contextKey = "zro_node"
+	edgeContextKey   contextKey = "zro_edge"
+)
 
 // TenantFromContext returns the authenticated Tenant from the request context.
 func TenantFromContext(ctx context.Context) *core.Tenant {
+	if t := controlauth.TenantFromContext(ctx); t != nil {
+		return t
+	}
 	if val := ctx.Value(tenantContextKey); val != nil {
 		if t, ok := val.(*core.Tenant); ok {
 			return t
@@ -145,27 +157,81 @@ func TenantFromContext(ctx context.Context) *core.Tenant {
 	return nil
 }
 
+// NodeFromContext returns the authenticated node from the request context.
+func NodeFromContext(ctx context.Context) *core.Node {
+	if node := controlauth.NodeFromContext(ctx); node != nil {
+		return node
+	}
+	if val := ctx.Value(nodeContextKey); val != nil {
+		if node, ok := val.(*core.Node); ok {
+			return node
+		}
+	}
+	return nil
+}
+
+// IsEdgeFromContext reports whether the request was authenticated as edge
+// infrastructure (which is allowed to observe cross-tenant mesh state).
+func IsEdgeFromContext(ctx context.Context) bool {
+	if val, ok := ctx.Value(edgeContextKey).(bool); ok && val {
+		return true
+	}
+	if subject := controlauth.FromContext(ctx); subject != nil {
+		return subject.Kind == controlauth.KindEdge
+	}
+	return false
+}
+
+func withTenant(ctx context.Context, tenant *core.Tenant) context.Context {
+	ctx = controlauth.WithSubject(ctx, &controlauth.Subject{Kind: controlauth.KindTenant, Tenant: tenant})
+	return context.WithValue(ctx, tenantContextKey, tenant)
+}
+
+func withNode(ctx context.Context, node *core.Node) context.Context {
+	ctx = controlauth.WithSubject(ctx, &controlauth.Subject{Kind: controlauth.KindNode, Node: node})
+	return context.WithValue(ctx, nodeContextKey, node)
+}
+
+func withEdge(ctx context.Context) context.Context {
+	ctx = controlauth.WithSubject(ctx, &controlauth.Subject{Kind: controlauth.KindEdge})
+	return context.WithValue(ctx, edgeContextKey, true)
+}
+
+func (s *Server) defaultTenant(ctx context.Context) *core.Tenant {
+	tenants, _ := s.db.Tenants.List(ctx)
+	if len(tenants) > 0 {
+		return &tenants[0]
+	}
+
+	key, _, err := controlauth.GenerateToken("zro_key_")
+	if err != nil {
+		key = uuid.NewString()
+	}
+	defaultTenant := &core.Tenant{
+		ID:        uuid.New(),
+		Name:      "Default Organization",
+		Slug:      "default-org",
+		APIKey:    key,
+		IsActive:  true,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	_ = s.db.Tenants.Create(ctx, defaultTenant)
+	slog.Warn("Created permissive-mode default tenant; enable control_plane.require_auth for production",
+		"tenant_id", defaultTenant.ID, "api_key", defaultTenant.APIKey)
+	return defaultTenant
+}
+
 func (s *Server) tenantAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var apiKey string
-		authHeader := r.Header.Get("Authorization")
-		if strings.HasPrefix(authHeader, "Bearer ") {
-			apiKey = strings.TrimPrefix(authHeader, "Bearer ")
-		} else if strings.HasPrefix(authHeader, "ApiKey ") {
-			apiKey = strings.TrimPrefix(authHeader, "ApiKey ")
-		}
-		if apiKey == "" {
-			apiKey = r.Header.Get("X-API-Key")
-		}
-
+		apiKey := controlauth.TenantKey(r)
 		if apiKey != "" {
 			tenant, err := s.db.Tenants.GetByAPIKey(r.Context(), apiKey)
 			if err != nil || tenant == nil || !tenant.IsActive {
 				http.Error(w, `{"error":"unauthorized: invalid or inactive API key"}`, http.StatusUnauthorized)
 				return
 			}
-			ctx := context.WithValue(r.Context(), tenantContextKey, tenant)
-			next(w, r.WithContext(ctx))
+			next(w, r.WithContext(withTenant(r.Context(), tenant)))
 			return
 		}
 
@@ -175,63 +241,198 @@ func (s *Server) tenantAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// Permissive / dev mode: bind to default tenant
-		tenants, _ := s.db.Tenants.List(r.Context())
-		if len(tenants) > 0 {
-			ctx := context.WithValue(r.Context(), tenantContextKey, &tenants[0])
-			next(w, r.WithContext(ctx))
+		// Permissive / dev mode: bind to default tenant.
+		tenant := s.defaultTenant(r.Context())
+		next(w, r.WithContext(withTenant(r.Context(), tenant)))
+	}
+}
+
+// nodeAuthMiddleware authenticates node-facing endpoints. In permissive mode a
+// missing token is allowed for backwards compatibility, but a supplied token is
+// always validated. Production deployments must set RequireAuth=true.
+func (s *Server) nodeAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := controlauth.NodeToken(r)
+		if token == "" {
+			if s.cfg.RequireAuth {
+				http.Error(w, `{"error":"unauthorized: node token required"}`, http.StatusUnauthorized)
+				return
+			}
+			next(w, r)
 			return
 		}
 
-		defaultTenant := &core.Tenant{
-			ID:        uuid.New(),
-			Name:      "Default Organization",
-			Slug:      "default-org",
-			APIKey:    "zro_key_default",
-			IsActive:  true,
-			CreatedAt: time.Now(),
-			UpdatedAt: time.Now(),
+		node, err := s.db.Nodes.GetByTokenHash(r.Context(), controlauth.HashToken(token))
+		if err != nil || node == nil || !node.IsActive {
+			http.Error(w, `{"error":"unauthorized: invalid or inactive node token"}`, http.StatusUnauthorized)
+			return
 		}
-		_ = s.db.Tenants.Create(r.Context(), defaultTenant)
-		ctx := context.WithValue(r.Context(), tenantContextKey, defaultTenant)
+		next(w, r.WithContext(withNode(r.Context(), node)))
+	}
+}
+
+// authenticateStream resolves the principal of a streaming request (node
+// token, tenant API key, or edge API key). On failure it returns the error
+// message to send to the client.
+func (s *Server) authenticateStream(r *http.Request) (context.Context, string) {
+	ctx := r.Context()
+	rawToken := controlauth.NodeToken(r)
+
+	// Node tokens are deliberately prefixed so we do not hash tenant/edge
+	// keys against the node table.
+	if strings.HasPrefix(rawToken, "zro_node_") {
+		node, err := s.db.Nodes.GetByTokenHash(ctx, controlauth.HashToken(rawToken))
+		if err != nil || node == nil || !node.IsActive {
+			return nil, "unauthorized: invalid or inactive node token"
+		}
+		return withNode(ctx, node), ""
+	}
+
+	tenantKey := controlauth.TenantKey(r)
+	if tenantKey != "" {
+		tenant, err := s.db.Tenants.GetByAPIKey(ctx, tenantKey)
+		if err == nil && tenant != nil && tenant.IsActive {
+			return withTenant(ctx, tenant), ""
+		}
+		// The same header may carry an edge key; fall through to edge
+		// authentication before rejecting it.
+	}
+
+	if s.isValidEdgeKey(r) {
+		return withEdge(ctx), ""
+	}
+
+	if tenantKey != "" || rawToken != "" || controlauth.EdgeKey(r) != "" {
+		return nil, "unauthorized: invalid stream credentials"
+	}
+	if s.cfg.RequireAuth {
+		return nil, "unauthorized: stream credentials required"
+	}
+	return withTenant(ctx, s.defaultTenant(ctx)), ""
+}
+
+// streamAuthMiddleware authenticates streaming endpoints; handlers then apply
+// the principal's event scope.
+func (s *Server) streamAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, msg := s.authenticateStream(r)
+		if msg != "" {
+			http.Error(w, `{"error":"`+msg+`"}`, http.StatusUnauthorized)
+			return
+		}
 		next(w, r.WithContext(ctx))
 	}
 }
 
+// eventScope maps the authenticated principal to the events it may observe.
+func (s *Server) eventScope(ctx context.Context) (controlevents.Scope, bool) {
+	subject := controlauth.FromContext(ctx)
+	if subject == nil {
+		return controlevents.Scope{}, false
+	}
+	switch subject.Kind {
+	case controlauth.KindEdge:
+		return controlevents.Global(), true
+	case controlauth.KindTenant:
+		return controlevents.ForTenant(subject.Tenant.ID), true
+	case controlauth.KindNode:
+		network, err := s.db.Networks.GetByID(ctx, subject.Node.NetworkID)
+		if err != nil || network == nil {
+			return controlevents.Scope{}, false
+		}
+		return controlevents.ForNode(network.TenantID, network.ID), true
+	}
+	return controlevents.Scope{}, false
+}
+
+// grpcStreamScope authenticates a gRPC event stream from its metadata using
+// the same credential rules as the REST stream endpoints.
+func (s *Server) grpcStreamScope(ctx context.Context) (controlevents.Scope, error) {
+	header := http.Header{}
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		for k, vals := range md {
+			for _, v := range vals {
+				header.Add(k, v)
+			}
+		}
+	}
+	authCtx, msg := s.authenticateStream((&http.Request{Header: header, URL: &url.URL{}}).WithContext(ctx))
+	if msg != "" {
+		return controlevents.Scope{}, status.Error(codes.Unauthenticated, msg)
+	}
+	scope, ok := s.eventScope(authCtx)
+	if !ok {
+		return controlevents.Scope{}, status.Error(codes.PermissionDenied, "no event scope for principal")
+	}
+	return scope, nil
+}
+
+func (s *Server) expectedEdgeKey() string {
+	expectedKey := s.cfg.EdgeAPIKey
+	if expectedKey == "" {
+		expectedKey = s.cfg.SecretKey
+	}
+	return expectedKey
+}
+
+func (s *Server) isValidEdgeKey(r *http.Request) bool {
+	key := controlauth.EdgeKey(r)
+	if key == "" {
+		// WebSocket clients that only have an edge key commonly send it in the
+		// generic token query parameter.
+		key = strings.TrimSpace(r.URL.Query().Get("token"))
+	}
+	expected := s.expectedEdgeKey()
+	if key == "" || expected == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(key), []byte(expected)) == 1
+}
+
 func (s *Server) edgeAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var edgeKey string
-		authHeader := r.Header.Get("Authorization")
-		if strings.HasPrefix(authHeader, "Bearer ") {
-			edgeKey = strings.TrimPrefix(authHeader, "Bearer ")
-		}
-		if edgeKey == "" {
-			edgeKey = r.Header.Get("X-Edge-Key")
-		}
-		if edgeKey == "" {
-			edgeKey = r.Header.Get("X-API-Key")
-		}
-
-		expectedKey := s.cfg.EdgeAPIKey
-		if expectedKey == "" {
-			expectedKey = s.cfg.SecretKey
-		}
-
-		if edgeKey != "" {
-			if expectedKey != "" && edgeKey == expectedKey {
-				next(w, r)
+		key := controlauth.EdgeKey(r)
+		if key != "" {
+			if s.isValidEdgeKey(r) {
+				next(w, r.WithContext(withEdge(r.Context())))
 				return
 			}
 			http.Error(w, `{"error":"unauthorized: invalid edge API key"}`, http.StatusUnauthorized)
 			return
 		}
 
-		if s.cfg.RequireAuth || (expectedKey != "" && s.cfg.EdgeAPIKey != "") {
+		if s.cfg.RequireAuth || s.cfg.EdgeAPIKey != "" {
 			http.Error(w, `{"error":"unauthorized: edge API key required"}`, http.StatusUnauthorized)
 			return
 		}
 
-		next(w, r)
+		next(w, r.WithContext(withEdge(r.Context())))
+	}
+}
+
+// authorizeNetwork resolves a network and verifies that the current principal
+// may observe or mutate it. In permissive mode with no principal attached it
+// preserves the legacy open behavior.
+func (s *Server) authorizeNetwork(ctx context.Context, networkID string) (*core.Network, bool) {
+	network, err := s.db.Networks.GetByID(ctx, networkID)
+	if err != nil || network == nil {
+		return nil, false
+	}
+
+	subject := controlauth.FromContext(ctx)
+	if subject == nil {
+		return network, !s.cfg.RequireAuth
+	}
+
+	switch subject.Kind {
+	case controlauth.KindNode:
+		return network, subject.Node != nil && subject.Node.IsActive && subject.Node.NetworkID == network.ID
+	case controlauth.KindTenant:
+		return network, subject.Tenant != nil && subject.Tenant.IsActive && network.TenantID == subject.Tenant.ID
+	case controlauth.KindEdge:
+		return network, true
+	default:
+		return network, false
 	}
 }
 
@@ -259,18 +460,18 @@ func (s *Server) registerRoutes() {
 
 	// Node Enrollment & Mesh Coordination
 	s.mux.HandleFunc("POST /api/v1/enroll", s.handleEnrollNode)
-	s.mux.HandleFunc("POST /api/v1/probes", s.handleReportProbes)
-	s.mux.HandleFunc("GET /api/v1/network/{id}/peers", s.handleGetPeers)
-	s.mux.HandleFunc("POST /api/v1/p2p/discover", s.handleP2PDiscover)
+	s.mux.HandleFunc("POST /api/v1/probes", s.nodeAuthMiddleware(s.handleReportProbes))
+	s.mux.HandleFunc("GET /api/v1/network/{id}/peers", s.nodeAuthMiddleware(s.handleGetPeers))
+	s.mux.HandleFunc("POST /api/v1/p2p/discover", s.nodeAuthMiddleware(s.handleP2PDiscover))
 
 	// Ingress & Tunneling
-	s.mux.HandleFunc("POST /api/v1/tunnels", s.handleRegisterTunnel)
-	s.mux.HandleFunc("GET /api/v1/gateway/routes", s.handleGetGatewayRoutes)
-	s.mux.HandleFunc("GET /api/v1/events", s.handleEventStream)
+	s.mux.HandleFunc("POST /api/v1/tunnels", s.nodeAuthMiddleware(s.handleRegisterTunnel))
+	s.mux.HandleFunc("GET /api/v1/gateway/routes", s.nodeAuthMiddleware(s.handleGetGatewayRoutes))
+	s.mux.HandleFunc("GET /api/v1/events", s.streamAuthMiddleware(s.handleEventStream))
 
 	// Real-Time WebSockets Event Hub (RFC 6455)
-	s.mux.Handle("/api/v1/ws", s.wsHub.Handler())
-	s.mux.Handle("/ws/v1/events", s.wsHub.Handler())
+	s.mux.HandleFunc("/api/v1/ws", s.streamAuthMiddleware(s.handleWebSocket))
+	s.mux.HandleFunc("/ws/v1/events", s.streamAuthMiddleware(s.handleWebSocket))
 
 	if s.cfg.EnableGateway {
 		s.mux.HandleFunc("/", s.handleGatewayFallback)
@@ -321,22 +522,7 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 	if tenant != nil {
 		tenantID = tenant.ID
 	} else {
-		tenants, _ := s.db.Tenants.List(r.Context())
-		if len(tenants) > 0 {
-			tenantID = tenants[0].ID
-		} else {
-			defaultTenant := &core.Tenant{
-				ID:        uuid.New(),
-				Name:      "Default Organization",
-				Slug:      "default-org",
-				APIKey:    "zro_key_" + netID,
-				IsActive:  true,
-				CreatedAt: time.Now(),
-				UpdatedAt: time.Now(),
-			}
-			_ = s.db.Tenants.Create(r.Context(), defaultTenant)
-			tenantID = defaultTenant.ID
-		}
+		tenantID = s.defaultTenant(r.Context()).ID
 	}
 
 	network := &core.Network{
@@ -367,18 +553,10 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListNetworks(w http.ResponseWriter, r *http.Request) {
 	tenant := TenantFromContext(r.Context())
-	var tenantID uuid.UUID
-	if tenant != nil {
-		tenantID = tenant.ID
-	} else {
-		tenants, err := s.db.Tenants.List(r.Context())
-		if err != nil || len(tenants) == 0 {
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode([]core.Network{})
-			return
-		}
-		tenantID = tenants[0].ID
+	if tenant == nil {
+		tenant = s.defaultTenant(r.Context())
 	}
+	tenantID := tenant.ID
 
 	networks, err := s.db.Networks.ListByTenantID(r.Context(), tenantID)
 	if err != nil {
@@ -408,7 +586,7 @@ func (s *Server) handleListPoPs(w http.ResponseWriter, r *http.Request) {
 
 // RegisterEdgePoPRequest defines dynamic registration payload from an Edge Data Plane node.
 type RegisterEdgePoPRequest struct {
-	PoPCode        string `json:"pop_code"`        // e.g. "KH", "SG", "US", "HK", "DE"
+	PoPCode        string `json:"pop_code"` // e.g. "KH", "SG", "US", "HK", "DE"
 	Region         string `json:"region"`
 	PublicEndpoint string `json:"public_endpoint"` // e.g. "173.1.1.1:51820"
 	PublicKey      string `json:"public_key"`      // Curve25519 public key
@@ -464,12 +642,12 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Edge Data Plane PoP registered dynamically", "pop_code", pop.PoPCode, "endpoint", pop.PublicEndpoint, "pubkey", pop.PublicKey)
 
 	// Broadcast edge update
-	s.broadcastDelta(map[string]any{
+	s.broadcastDelta(controlevents.Scope{}, map[string]any{
 		"event":    "edge_registered",
 		"pop_code": pop.PoPCode,
 		"endpoint": pop.PublicEndpoint,
 	})
-	s.broadcastDelta(map[string]any{
+	s.broadcastDelta(controlevents.Scope{}, map[string]any{
 		"event": "mesh_graph_updated",
 	})
 
@@ -512,13 +690,13 @@ func (s *Server) handleEdgeHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 	if !wasHealthy {
 		slog.Info("Edge PoP recovered to healthy state via heartbeat", "pop_code", pop.PoPCode)
-		s.broadcastDelta(map[string]any{
+		s.broadcastDelta(controlevents.Scope{}, map[string]any{
 			"event":      "pop_status_changed",
 			"pop_code":   pop.PoPCode,
 			"is_healthy": true,
 			"status":     "online",
 		})
-		s.broadcastDelta(map[string]any{
+		s.broadcastDelta(controlevents.Scope{}, map[string]any{
 			"event": "mesh_graph_updated",
 		})
 	}
@@ -551,13 +729,13 @@ func (s *Server) popWatchWorker(ctx context.Context) {
 					p.UpdatedAt = time.Now()
 					_ = s.db.EdgePoPs.Update(ctx, &p)
 					slog.Warn("Edge PoP heartbeat timeout - marked degraded/offline", "pop_code", p.PoPCode, "last_seen", p.LastSeenAt)
-					s.broadcastDelta(map[string]any{
+					s.broadcastDelta(controlevents.Scope{}, map[string]any{
 						"event":      "pop_status_changed",
 						"pop_code":   p.PoPCode,
 						"is_healthy": false,
 						"status":     "offline",
 					})
-					s.broadcastDelta(map[string]any{
+					s.broadcastDelta(controlevents.Scope{}, map[string]any{
 						"event": "mesh_graph_updated",
 					})
 				}
@@ -576,10 +754,11 @@ func (s *Server) handleEdgeSync(w http.ResponseWriter, r *http.Request) {
 	pops, _ := s.db.EdgePoPs.ListHealthy(r.Context())
 	var allNodes []core.Node
 
-	// List nodes across networks
+	// Edge PoPs are global infrastructure: synchronize nodes from every tenant
+	// and network, not just the first tenant returned by the database.
 	tenants, _ := s.db.Tenants.List(r.Context())
-	if len(tenants) > 0 {
-		nets, _ := s.db.Networks.ListByTenantID(r.Context(), tenants[0].ID)
+	for _, t := range tenants {
+		nets, _ := s.db.Networks.ListByTenantID(r.Context(), t.ID)
 		for _, n := range nets {
 			nodes, _ := s.db.Nodes.ListByNetworkID(r.Context(), n.ID)
 			allNodes = append(allNodes, nodes...)
@@ -608,15 +787,16 @@ type EnrollRequest struct {
 
 // EnrollResponse payload returned to the newly enrolled node.
 type EnrollResponse struct {
-	NodeID       uuid.UUID    `json:"node_id"`
-	NetworkID    string       `json:"network_id"` // ZeroTier-style 16-hex ID
-	OverlayIPv4  string       `json:"overlay_ipv4"`
-	OverlayIPv6  string       `json:"overlay_ipv6"`
-	DNSDomain    string       `json:"dns_domain"`
-	MTU          int          `json:"mtu"`
-	PrimaryPoP   core.EdgePoP `json:"primary_pop"`
+	NodeID       uuid.UUID     `json:"node_id"`
+	NetworkID    string        `json:"network_id"` // ZeroTier-style 16-hex ID
+	NodeToken    string        `json:"node_token"` // bearer token for node-facing APIs
+	OverlayIPv4  string        `json:"overlay_ipv4"`
+	OverlayIPv6  string        `json:"overlay_ipv6"`
+	DNSDomain    string        `json:"dns_domain"`
+	MTU          int           `json:"mtu"`
+	PrimaryPoP   core.EdgePoP  `json:"primary_pop"`
 	SecondaryPoP *core.EdgePoP `json:"secondary_pop,omitempty"`
-	Peers        []core.Node  `json:"peers"`
+	Peers        []core.Node   `json:"peers"`
 }
 
 func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
@@ -636,6 +816,10 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 	network, err := s.db.Networks.GetByID(r.Context(), payload.NetworkID)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("network %s not found", payload.NetworkID), http.StatusNotFound)
+		return
+	}
+	if !network.IsActive {
+		http.Error(w, "network is inactive", http.StatusForbidden)
 		return
 	}
 
@@ -675,11 +859,18 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 		defaultDeny = *req.DefaultDeny
 	}
 
+	nodeToken, tokenHash, err := controlauth.GenerateToken("zro_node_")
+	if err != nil {
+		http.Error(w, "failed to generate node credentials", http.StatusInternalServerError)
+		return
+	}
+
 	node := &core.Node{
 		ID:           nodeID,
 		NetworkID:    network.ID,
 		Hostname:     req.Hostname,
 		PublicKey:    req.PublicKey,
+		TokenHash:    tokenHash,
 		OverlayIPv4:  v4,
 		OverlayIPv6:  v6,
 		NodeType:     req.NodeType,
@@ -716,6 +907,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 	resp := EnrollResponse{
 		NodeID:      node.ID,
 		NetworkID:   network.ID,
+		NodeToken:   nodeToken,
 		OverlayIPv4: v4,
 		OverlayIPv6: v6,
 		DNSDomain:   network.DNSDomain,
@@ -729,7 +921,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Notify all connected edge nodes and peers of new member
-	s.broadcastDelta(map[string]any{
+	s.broadcastDelta(networkScope(network), map[string]any{
 		"event":         "node_joined",
 		"network_id":    network.ID,
 		"node_id":       node.ID,
@@ -737,7 +929,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 		"pubkey":        node.PublicKey,
 		"allowed_ports": node.AllowedPorts,
 	})
-	s.broadcastDelta(map[string]any{
+	s.broadcastDelta(networkScope(network), map[string]any{
 		"event":      "mesh_graph_updated",
 		"network_id": network.ID,
 	})
@@ -774,11 +966,24 @@ func (s *Server) handleP2PDiscover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Fetch Initiator Node
-	initiator, err := s.db.Nodes.GetByID(r.Context(), req.InitiatorNodeID)
-	if err != nil {
-		http.Error(w, "initiator node not found", http.StatusNotFound)
-		return
+	// 1. Fetch Initiator Node. An authenticated node may only act as itself.
+	initiator := NodeFromContext(r.Context())
+	if initiator != nil {
+		if req.InitiatorNodeID != uuid.Nil && req.InitiatorNodeID != initiator.ID {
+			http.Error(w, "forbidden: initiator node does not match authenticated node", http.StatusForbidden)
+			return
+		}
+	} else {
+		if req.InitiatorNodeID == uuid.Nil {
+			http.Error(w, "initiator_node_id is required", http.StatusBadRequest)
+			return
+		}
+		var err error
+		initiator, err = s.db.Nodes.GetByID(r.Context(), req.InitiatorNodeID)
+		if err != nil {
+			http.Error(w, "initiator node not found", http.StatusNotFound)
+			return
+		}
 	}
 
 	// Update initiator's endpoints if newer endpoints were provided
@@ -790,6 +995,7 @@ func (s *Server) handleP2PDiscover(w http.ResponseWriter, r *http.Request) {
 
 	// 2. Resolve Target Node in the same network (by Overlay IP or NodeID)
 	var target *core.Node
+	var err error
 	if req.TargetOverlayIP != "" {
 		target, err = s.db.Nodes.GetByOverlayIP(r.Context(), initiator.NetworkID, req.TargetOverlayIP)
 	} else if req.TargetNodeID != nil {
@@ -808,7 +1014,7 @@ func (s *Server) handleP2PDiscover(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 4. Signal target node via delta broadcast of P2P hole punch request
-	s.broadcastDelta(map[string]any{
+	s.broadcastDelta(s.scopeForNetwork(r.Context(), target.NetworkID), map[string]any{
 		"event":               "p2p_punch_requested",
 		"network_id":          target.NetworkID,
 		"target_node_id":      target.ID,
@@ -840,6 +1046,15 @@ func (s *Server) handleReportProbes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if node := NodeFromContext(r.Context()); node != nil {
+		// Never trust a body-supplied node ID when the request is authenticated.
+		sample.NodeID = node.ID
+	}
+	if sample.NodeID == uuid.Nil {
+		http.Error(w, "node_id is required", http.StatusBadRequest)
+		return
+	}
+
 	sample.Timestamp = time.Now()
 	s.delegator.RecordProbe(sample)
 
@@ -850,6 +1065,11 @@ func (s *Server) handleGetPeers(w http.ResponseWriter, r *http.Request) {
 	netIDStr := r.PathValue("id")
 	if netIDStr == "" {
 		http.Error(w, "network ID required", http.StatusBadRequest)
+		return
+	}
+
+	if _, ok := s.authorizeNetwork(r.Context(), netIDStr); !ok {
+		http.Error(w, "forbidden: network access denied", http.StatusForbidden)
 		return
 	}
 
@@ -870,6 +1090,30 @@ func (s *Server) handleRegisterTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if tunnel.PublicHostname == "" || tunnel.LocalAddress == "" {
+		http.Error(w, "public_hostname and local_address are required", http.StatusBadRequest)
+		return
+	}
+
+	node := NodeFromContext(r.Context())
+	if node != nil {
+		tunnel.NodeID = node.ID
+	} else if tunnel.NodeID == uuid.Nil {
+		http.Error(w, "node_id is required", http.StatusBadRequest)
+		return
+	}
+
+	// Resolve the owning node so the event can be scoped to its network.
+	ownerNode := node
+	if ownerNode == nil {
+		var err error
+		ownerNode, err = s.db.Nodes.GetByID(r.Context(), tunnel.NodeID)
+		if err != nil || ownerNode == nil {
+			http.Error(w, "node not found", http.StatusNotFound)
+			return
+		}
+	}
+
 	tunnel.ID = uuid.New()
 	tunnel.CreatedAt = time.Now()
 	tunnel.UpdatedAt = time.Now()
@@ -883,11 +1127,12 @@ func (s *Server) handleRegisterTunnel(w http.ResponseWriter, r *http.Request) {
 		_ = s.syncInternalGateway(r.Context())
 	}
 
-	s.broadcastDelta(map[string]any{
-		"event":          "gateway_routes_updated",
-		"hostname":       tunnel.PublicHostname,
-		"local_address":  tunnel.LocalAddress,
-		"node_id":        tunnel.NodeID,
+	s.broadcastDelta(s.scopeForNetwork(r.Context(), ownerNode.NetworkID), map[string]any{
+		"event":         "gateway_routes_updated",
+		"network_id":    ownerNode.NetworkID,
+		"hostname":      tunnel.PublicHostname,
+		"local_address": tunnel.LocalAddress,
+		"node_id":       tunnel.NodeID,
 	})
 
 	w.Header().Set("Content-Type", "application/json")
@@ -897,28 +1142,22 @@ func (s *Server) handleRegisterTunnel(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+	scope, scoped := s.eventScope(r.Context())
+	if !ok || !scoped {
+		http.Error(w, "streaming unavailable", http.StatusForbidden)
 		return
 	}
+
+	// Long-lived stream: lift the server-wide write deadline.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	ch := make(chan []byte, 16)
-	s.subscribersMu.Lock()
-	s.subscribers[ch] = true
-	s.subscribersMu.Unlock()
+	sub := s.bus.Subscribe(scope)
+	defer sub.Close()
 
-	defer func() {
-		s.subscribersMu.Lock()
-		delete(s.subscribers, ch)
-		close(ch)
-		s.subscribersMu.Unlock()
-	}()
-
-	// Send initial heartbeat
 	_, _ = fmt.Fprintf(w, "event: connected\ndata: {}\n\n")
 	flusher.Flush()
 
@@ -926,50 +1165,48 @@ func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
-		case msg, ok := <-ch:
+		case msg, ok := <-sub.C:
 			if !ok {
 				return
 			}
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", msg)
+			_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", msg.Event, msg.Data)
 			flusher.Flush()
 		}
 	}
 }
 
-func (s *Server) broadcastDelta(data any) {
-	bytes, err := json.Marshal(data)
-	if err != nil {
+func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	scope, ok := s.eventScope(r.Context())
+	if !ok {
+		http.Error(w, "streaming unavailable", http.StatusForbidden)
 		return
 	}
+	ws.Serve(w, r, s.bus.Subscribe(scope), s.cfg.AllowedOrigins)
+}
 
-	// 1. Broadcast to SSE subscribers
-	s.subscribersMu.RLock()
-	for ch := range s.subscribers {
-		select {
-		case ch <- bytes:
-		default:
-		}
+// broadcastDelta publishes a change event to the subscribers allowed to see
+// scope. data["event"] names the event.
+func (s *Server) broadcastDelta(scope controlevents.Scope, data map[string]any) {
+	name, _ := data["event"].(string)
+	if name == "" {
+		name = "delta"
 	}
-	s.subscribersMu.RUnlock()
+	s.bus.Publish(scope, name, data)
+}
 
-	// 2. Broadcast to real-time WebSockets hub
-	var evtName string
-	if m, ok := data.(map[string]any); ok {
-		if ev, exists := m["event"].(string); exists {
-			evtName = ev
-		}
-	}
-	if evtName == "" {
-		evtName = "delta"
-	}
-	if s.wsHub != nil {
-		s.wsHub.Broadcast(evtName, data)
-	}
+// networkScope is the event scope of a known network.
+func networkScope(n *core.Network) controlevents.Scope {
+	return controlevents.Scope{TenantID: n.TenantID, NetworkID: n.ID}
+}
 
-	// 3. Broadcast to real-time gRPC event streams
-	if s.grpcCtrl != nil {
-		s.grpcCtrl.BroadcastEvent(evtName, data)
+// scopeForNetwork resolves the event scope of a network by ID. If the network
+// cannot be loaded the event is scoped to the network ID only, so tenant
+// subscribers never see it (fail closed).
+func (s *Server) scopeForNetwork(ctx context.Context, networkID string) controlevents.Scope {
+	if n, err := s.db.Networks.GetByID(ctx, networkID); err == nil && n != nil {
+		return networkScope(n)
 	}
+	return controlevents.Scope{NetworkID: networkID}
 }
 
 func (s *Server) getOrCreateIPAM(ctx context.Context, net *core.Network) (*ipam.IPAM, error) {
@@ -1016,7 +1253,11 @@ type GatewayRoutesResponse struct {
 }
 
 func (s *Server) handleGetGatewayRoutes(w http.ResponseWriter, r *http.Request) {
-	routes, err := s.buildGatewayRoutes(r.Context())
+	networkID := ""
+	if node := NodeFromContext(r.Context()); node != nil {
+		networkID = node.NetworkID
+	}
+	routes, err := s.buildGatewayRoutes(r.Context(), networkID)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to build gateway routes: %v", err), http.StatusInternalServerError)
 		return
@@ -1026,7 +1267,7 @@ func (s *Server) handleGetGatewayRoutes(w http.ResponseWriter, r *http.Request) 
 	_ = json.NewEncoder(w).Encode(GatewayRoutesResponse{Routes: routes})
 }
 
-func (s *Server) buildGatewayRoutes(ctx context.Context) ([]GatewayRouteItem, error) {
+func (s *Server) buildGatewayRoutes(ctx context.Context, networkID string) ([]GatewayRouteItem, error) {
 	tunnels, err := s.db.Tunnels.ListAll(ctx)
 	if err != nil {
 		return nil, err
@@ -1037,6 +1278,9 @@ func (s *Server) buildGatewayRoutes(ctx context.Context) ([]GatewayRouteItem, er
 	for _, t := range tunnels {
 		node, err := s.db.Nodes.GetByID(ctx, t.NodeID)
 		if err != nil || node == nil || !node.IsActive || node.OverlayIPv4 == "" {
+			continue
+		}
+		if networkID != "" && node.NetworkID != networkID {
 			continue
 		}
 
@@ -1077,7 +1321,7 @@ func (s *Server) syncInternalGateway(ctx context.Context) error {
 	if s.gatewayProxy == nil {
 		return nil
 	}
-	routes, err := s.buildGatewayRoutes(ctx)
+	routes, err := s.buildGatewayRoutes(ctx, "")
 	if err != nil {
 		return err
 	}
@@ -1141,7 +1385,7 @@ type MeshGraphEdge struct {
 	ID      string  `json:"id"`
 	Source  string  `json:"source"`
 	Target  string  `json:"target"`
-	Type    string  `json:"type"` // "backbone_link", "edge_mesh", "p2p_direct", "gateway_proxy"
+	Type    string  `json:"type"`   // "backbone_link", "edge_mesh", "p2p_direct", "gateway_proxy"
 	Status  string  `json:"status"` // "active", "degraded", "idle"
 	RTTMs   float64 `json:"rtt_ms,omitempty"`
 	Details string  `json:"details,omitempty"`
@@ -1409,12 +1653,12 @@ func (s *Server) handleCreateACLRule(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Created new ACL rule", "id", rule.ID, "network_id", rule.NetworkID, "action", rule.Action, "ports", rule.Ports)
 
 	// Broadcast ACL and graph update
-	s.broadcastDelta(map[string]any{
+	s.broadcastDelta(s.scopeForNetwork(r.Context(), rule.NetworkID), map[string]any{
 		"event":      "acl_rules_updated",
 		"network_id": rule.NetworkID,
 		"rule_id":    rule.ID,
 	})
-	s.broadcastDelta(map[string]any{
+	s.broadcastDelta(s.scopeForNetwork(r.Context(), rule.NetworkID), map[string]any{
 		"event": "mesh_graph_updated",
 	})
 
@@ -1461,17 +1705,32 @@ func (s *Server) handleDeleteACLRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	rule, err := s.db.ACLs.GetByID(r.Context(), id)
+	if err != nil || rule == nil {
+		http.Error(w, "rule not found", http.StatusNotFound)
+		return
+	}
+	network, ok := s.authorizeNetwork(r.Context(), rule.NetworkID)
+	if !ok {
+		// Same response as a missing rule so rule IDs cannot be probed across tenants.
+		http.Error(w, "rule not found", http.StatusNotFound)
+		return
+	}
+
 	if err := s.db.ACLs.Delete(r.Context(), id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	s.broadcastDelta(map[string]any{
-		"event":   "acl_rules_updated",
-		"rule_id": idStr,
+	scope := networkScope(network)
+	s.broadcastDelta(scope, map[string]any{
+		"event":      "acl_rules_updated",
+		"network_id": rule.NetworkID,
+		"rule_id":    idStr,
 	})
-	s.broadcastDelta(map[string]any{
-		"event": "mesh_graph_updated",
+	s.broadcastDelta(scope, map[string]any{
+		"event":      "mesh_graph_updated",
+		"network_id": rule.NetworkID,
 	})
 
 	w.Header().Set("Content-Type", "application/json")

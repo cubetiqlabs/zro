@@ -468,7 +468,14 @@ func (e *PoPDaemon) realtimeListener(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
-			conn, err := websocket.Dial(wsURL, "", origin)
+			wsCfg, err := websocket.NewConfig(wsURL, origin)
+			if err != nil {
+				return
+			}
+			if e.cfg.EdgeAPIKey != "" {
+				wsCfg.Header.Set("X-Edge-Key", e.cfg.EdgeAPIKey)
+			}
+			conn, err := websocket.DialConfig(wsCfg)
 			if err != nil {
 				select {
 				case <-ctx.Done():

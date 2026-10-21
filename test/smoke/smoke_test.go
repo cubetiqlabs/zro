@@ -17,6 +17,7 @@ import (
 
 	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
+	controlevents "github.com/cubis/zro/pkg/control/events"
 	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/core"
@@ -587,6 +588,7 @@ func TestFullMeshSmoke(t *testing.T) {
 
 	grpcSrv := grpc.NewServer()
 	ctrlGRPC := controlgrpc.NewServer(cfg, db)
+	ctrlGRPC.SetEventSource(controlevents.NewBus(), func(context.Context) (controlevents.Scope, error) { return controlevents.Global(), nil })
 	v1.RegisterControlPlaneServiceServer(grpcSrv, ctrlGRPC)
 	go func() {
 		_ = grpcSrv.Serve(grpcLis)

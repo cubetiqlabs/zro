@@ -6,14 +6,17 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cubis/zro/pkg/config"
+	"github.com/cubis/zro/pkg/control/events"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/store"
 	"github.com/google/uuid"
+	"golang.org/x/net/websocket"
 )
 
 func TestServerEnrollmentFlow(t *testing.T) {
@@ -543,6 +546,63 @@ func TestServerAuthAndTenantIsolation(t *testing.T) {
 		t.Fatalf("expected 403 Forbidden when Tenant Beta creates ACL on Tenant Alpha network, got %d", rAclB.StatusCode)
 	}
 	_ = rAclB.Body.Close()
+
+	// Case 5b: event streams are tenant-scoped and cross-tenant ACL deletes are hidden
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/v1/ws"
+	dialWS := func(key string) *websocket.Conn {
+		wsCfg, _ := websocket.NewConfig(wsURL, ts.URL)
+		wsCfg.Header.Set("Authorization", "Bearer "+key)
+		conn, err := websocket.DialConfig(wsCfg)
+		if err != nil {
+			t.Fatalf("websocket dial for %s failed: %v", key, err)
+		}
+		var hello events.Message
+		_ = websocket.JSON.Receive(conn, &hello)
+		return conn
+	}
+	connA, connB := dialWS("key_alpha_12345"), dialWS("key_beta_67890")
+	defer connA.Close()
+	defer connB.Close()
+
+	aclOwn, _ := json.Marshal(CreateACLRuleRequest{NetworkID: netA.ID, SourceIP: "*", DestIP: "*", Ports: "80", Action: core.ACLActionAllow})
+	reqOwn, _ := http.NewRequest("POST", ts.URL+"/api/v1/acl/rules", bytes.NewReader(aclOwn))
+	reqOwn.Header.Set("Authorization", "Bearer key_alpha_12345")
+	reqOwn.Header.Set("Content-Type", "application/json")
+	rOwn, err := http.DefaultClient.Do(reqOwn)
+	if err != nil || rOwn.StatusCode != http.StatusCreated {
+		t.Fatalf("Tenant Alpha failed to create its ACL rule: %v", err)
+	}
+	var ruleA core.ACLRule
+	_ = json.NewDecoder(rOwn.Body).Decode(&ruleA)
+	_ = rOwn.Body.Close()
+
+	_ = connA.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var evA events.Message
+	if err := websocket.JSON.Receive(connA, &evA); err != nil || evA.Event != "acl_rules_updated" {
+		t.Fatalf("Tenant Alpha should receive its own acl_rules_updated event, got %+v err=%v", evA, err)
+	}
+	_ = connB.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	var evB events.Message
+	if err := websocket.JSON.Receive(connB, &evB); err == nil {
+		t.Fatalf("Tenant Beta must not receive Tenant Alpha's events, got %+v", evB)
+	}
+
+	delRule := func(key string) int {
+		req, _ := http.NewRequest("DELETE", ts.URL+"/api/v1/acl/rules/"+ruleA.ID.String(), nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := delRule("key_beta_67890"); code != http.StatusNotFound {
+		t.Fatalf("expected 404 when Tenant Beta deletes Alpha's rule, got %d", code)
+	}
+	if code := delRule("key_alpha_12345"); code != http.StatusOK {
+		t.Fatalf("expected 200 when Tenant Alpha deletes its rule, got %d", code)
+	}
 
 	// Case 6: Edge PoP authentication
 	// 6a. Register edge without key when RequireAuth=true -> 401

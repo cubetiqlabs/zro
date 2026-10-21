@@ -31,6 +31,8 @@ type ControlPlaneConfig struct {
 	GRPCListenAddr string `mapstructure:"grpc_listen_addr"`
 	RequireAuth    bool   `mapstructure:"require_auth"`
 	EdgeAPIKey     string `mapstructure:"edge_api_key"`
+	// AllowedOrigins lists extra browser origins permitted to open event WebSockets (same-origin is always allowed).
+	AllowedOrigins []string `mapstructure:"allowed_origins"`
 }
 
 // EdgeConfig configures a global Edge Data Plane PoP.

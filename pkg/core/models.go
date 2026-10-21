@@ -110,6 +110,7 @@ type Node struct {
 	NetworkID      string     `gorm:"size:16;not null;index" json:"network_id"`
 	Hostname       string     `gorm:"size:255;not null" json:"hostname"`
 	PublicKey      string     `gorm:"size:64;not null;index" json:"public_key"`
+	TokenHash      string     `gorm:"size:64;index" json:"-"`
 	OverlayIPv4    string     `gorm:"size:50;not null;index" json:"overlay_ipv4"`
 	OverlayIPv6    string     `gorm:"size:50;not null" json:"overlay_ipv6"`
 	AssignedPoPID  *uuid.UUID `gorm:"type:uuid;index" json:"assigned_pop_id,omitempty"`

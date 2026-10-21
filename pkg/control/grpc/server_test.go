@@ -9,6 +9,7 @@ import (
 
 	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
+	"github.com/cubis/zro/pkg/control/events"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/store"
@@ -61,6 +62,7 @@ func TestGRPCControlPlaneService(t *testing.T) {
 	// 2. Start gRPC Server
 	grpcSrv := grpc.NewServer()
 	ctrlServer := NewServer(cfg, db)
+	ctrlServer.SetEventSource(events.NewBus(), func(context.Context) (events.Scope, error) { return events.Global(), nil })
 	v1.RegisterControlPlaneServiceServer(grpcSrv, ctrlServer)
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
