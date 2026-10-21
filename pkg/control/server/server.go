@@ -19,6 +19,7 @@ import (
 
 	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
+	controlacl "github.com/cubis/zro/pkg/control/acl"
 	controlauth "github.com/cubis/zro/pkg/control/auth"
 	controlevents "github.com/cubis/zro/pkg/control/events"
 	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
@@ -577,6 +578,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/p2p/discover", s.nodeAuthMiddleware(s.handleP2PDiscover))
 
 	// Ingress & Tunneling
+	s.mux.HandleFunc("GET /api/v1/acl/policy", s.nodeAuthMiddleware(s.handleACLPolicy))
 	s.mux.HandleFunc("DELETE /api/v1/node", s.nodeAuthMiddleware(s.handleDeregister))
 	s.mux.HandleFunc("POST /api/v1/tunnels", s.nodeAuthMiddleware(s.handleRegisterTunnel))
 	s.mux.HandleFunc("GET /api/v1/tunnels", s.nodeAuthMiddleware(s.handleListTunnels))
@@ -1069,6 +1071,16 @@ func (s *Server) handleRegisterTunnel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, tunnel)
 }
 
+// handleACLPolicy returns the access rules the calling node enforces.
+func (s *Server) handleACLPolicy(w http.ResponseWriter, r *http.Request) {
+	rules, err := s.svc.ACLPolicy(r.Context(), NodeFromContext(r.Context()))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rules)
+}
+
 // handleDeregister removes the calling node from the mesh.
 func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 	if err := s.svc.Deregister(r.Context(), NodeFromContext(r.Context())); err != nil {
@@ -1499,6 +1511,11 @@ func (s *Server) handleCreateACLRule(w http.ResponseWriter, r *http.Request) {
 		Action:    req.Action,
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
+	}
+
+	if err := controlacl.ValidateRule(rule); err != nil {
+		http.Error(w, "invalid ACL rule: "+err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	if err := s.db.ACLs.Create(r.Context(), rule); err != nil {

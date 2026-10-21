@@ -120,6 +120,17 @@ func toProtoNode(n *core.Node) *v1.Node {
 	}
 }
 
+func toProtoRules(rules []core.ACLRule) []*v1.ACLRule {
+	out := make([]*v1.ACLRule, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, &v1.ACLRule{
+			Id: r.ID.String(), Priority: int32(r.Priority), SourceIp: r.SourceIP, DestIp: r.DestIP,
+			SourceTag: r.SourceTag, DestTag: r.DestTag, Protocol: r.Protocol, Ports: r.Ports, Action: string(r.Action),
+		})
+	}
+	return out
+}
+
 func toProtoTunnel(t *core.Tunnel) *v1.Tunnel {
 	return &v1.Tunnel{
 		Id:             t.ID.String(),
@@ -164,6 +175,7 @@ func (s *Server) Enroll(ctx context.Context, req *v1.EnrollRequest) (*v1.EnrollR
 		AllowedIps:   resp.AllowedIPs,
 		AllowedPorts: resp.AllowedPorts,
 		DefaultDeny:  resp.DefaultDeny,
+		AclRules:     toProtoRules(resp.ACLRules),
 		PrimaryPop:   toProtoPoP(&resp.PrimaryPoP),
 		SecondaryPop: toProtoPoP(resp.SecondaryPoP),
 	}
@@ -251,6 +263,15 @@ func (s *Server) GetGatewayRoutes(ctx context.Context, _ *v1.GatewayRoutesReques
 		out.Routes = append(out.Routes, route)
 	}
 	return out, nil
+}
+
+// GetACLPolicy returns the network-wide access rules the node must enforce.
+func (s *Server) GetACLPolicy(ctx context.Context, _ *v1.GetACLPolicyRequest) (*v1.GetACLPolicyResponse, error) {
+	rules, err := s.svc.ACLPolicy(ctx, node(ctx))
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return &v1.GetACLPolicyResponse{Rules: toProtoRules(rules)}, nil
 }
 
 // ListPeers returns the members of the caller's network.

@@ -149,6 +149,40 @@ func TestNodeToNodeThroughEdge(t *testing.T) {
 	if echoed != "via-edge" {
 		t.Fatalf("unexpected echo %q", echoed)
 	}
+
+	// Network-wide policy reaches the nodes live: a DENY rule created through the
+	// API cuts the path that was just working, and deleting it restores it.
+	reaches := func() bool {
+		conn, err := a.DialMesh(ctx, "tcp", target)
+		if err != nil {
+			return false
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := conn.Write([]byte("probe!!!")); err != nil {
+			return false
+		}
+		_, err = io.ReadFull(conn, make([]byte, 8))
+		return err == nil
+	}
+	ruleBody, _ := json.Marshal(server.CreateACLRuleRequest{
+		NetworkID: network.ID, Priority: 1, Ports: "7000", Protocol: "tcp", Action: core.ACLActionDeny,
+	})
+	resp, err = http.Post(ts.URL+"/api/v1/acl/rules", "application/json", bytes.NewReader(ruleBody))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create deny rule: %v", err)
+	}
+	var rule core.ACLRule
+	_ = json.NewDecoder(resp.Body).Decode(&rule)
+	resp.Body.Close()
+	waitFor(t, 15*time.Second, "the DENY rule to reach node B", func() bool { return !reaches() })
+
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/acl/rules/"+rule.ID.String(), nil)
+	if resp, err = http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete rule: %v", err)
+	}
+	resp.Body.Close()
+	waitFor(t, 15*time.Second, "the path to reopen after the rule was deleted", reaches)
 }
 
 func waitFor(t *testing.T, d time.Duration, what string, ok func() bool) {

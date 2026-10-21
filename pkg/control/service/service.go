@@ -89,6 +89,7 @@ type EnrollResponse struct {
 	PrimaryPoP   core.EdgePoP    `json:"primary_pop"`
 	SecondaryPoP *core.EdgePoP   `json:"secondary_pop,omitempty"`
 	Peers        []core.Node     `json:"peers"`
+	ACLRules     []core.ACLRule  `json:"acl_rules"` // network-wide access policy
 }
 
 // maxAllocAttempts bounds retries when another replica claims the address we picked.
@@ -162,6 +163,7 @@ func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollRespons
 		DefaultDeny:  node.DefaultDeny,
 		Peers:        peers,
 	}
+	resp.ACLRules, _ = s.db.ACLs.ListByNetworkID(ctx, network.ID)
 	if node.AssignedPoP != nil {
 		resp.PrimaryPoP = *node.AssignedPoP
 		if res, err := s.delegator.Delegate(ctx, node.ID); err == nil && res != nil {
@@ -318,6 +320,16 @@ func (s *Service) Peers(ctx context.Context, node *core.Node) ([]core.Node, erro
 		return nil, internal("failed to list peers", err)
 	}
 	return peers, nil
+}
+
+// ACLPolicy returns the access rules of node's network, which the node enforces
+// on inbound traffic.
+func (s *Service) ACLPolicy(ctx context.Context, node *core.Node) ([]core.ACLRule, error) {
+	rules, err := s.db.ACLs.ListByNetworkID(ctx, node.NetworkID)
+	if err != nil {
+		return nil, internal("failed to list access rules", err)
+	}
+	return rules, nil
 }
 
 // --- Probes -------------------------------------------------------------

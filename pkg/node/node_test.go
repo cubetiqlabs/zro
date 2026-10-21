@@ -168,3 +168,45 @@ func TestTunnelProxiesOverlayToLocalService(t *testing.T) {
 		t.Fatalf("echo through tunnel failed: %q %v", buf[:n], err)
 	}
 }
+
+// TestNetworkPolicyOverridesLocalFirewall: central rules close ports the node
+// opens, open ports the node's default-deny closes, and fall back to the local
+// firewall when no rule matches.
+func TestNetworkPolicyOverridesLocalFirewall(t *testing.T) {
+	d := newMeshNode(t, "pol", "100.64.0.40", config.NodeConfig{
+		DefaultDeny: true, AllowedInboundPorts: []string{"5432/tcp"}, Tags: []string{"tag:db"},
+	})
+	d.peers["k-web"] = core.Node{PublicKey: "k-web", OverlayIPv4: "100.64.0.41", Tags: core.StringList{"tag:web"}}
+	d.peers["k-con"] = core.Node{PublicKey: "k-con", OverlayIPv4: "100.64.0.42", Tags: core.StringList{"tag:contractor"}}
+
+	// No central policy: the local firewall alone decides.
+	if !d.IsTrafficAllowed("100.64.0.41", "tcp", 5432) || d.IsTrafficAllowed("100.64.0.41", "tcp", 8080) {
+		t.Fatal("without a network policy the local allow-list applies")
+	}
+
+	d.policy.setRules([]core.ACLRule{
+		{Priority: 10, SourceTag: "tag:contractor", DestTag: "*", SourceIP: "*", DestIP: "*", Protocol: "*", Ports: "*", Action: core.ACLActionDeny},
+		{Priority: 20, SourceTag: "tag:web", DestTag: "tag:db", SourceIP: "*", DestIP: "*", Protocol: "tcp", Ports: "8080", Action: core.ACLActionAllow},
+	})
+
+	if d.IsTrafficAllowed("100.64.0.42", "tcp", 5432) {
+		t.Fatal("a central DENY must close a port the node opened locally")
+	}
+	if !d.IsTrafficAllowed("100.64.0.41", "tcp", 8080) {
+		t.Fatal("a central ALLOW must open a port the node's default-deny closed")
+	}
+	if !d.IsTrafficAllowed("100.64.0.41", "tcp", 5432) {
+		t.Fatal("traffic no rule matches falls back to the local allow-list")
+	}
+	if d.IsTrafficAllowed("100.64.0.41", "tcp", 9999) {
+		t.Fatal("unmatched and not locally allowed must stay denied")
+	}
+	if d.IsTrafficAllowed("100.64.0.99", "tcp", 8080) {
+		t.Fatal("an unknown source has no tags, so the web rule must not open the port")
+	}
+
+	d.policy.setRules(nil) // rules removed: back to the local firewall only
+	if d.IsTrafficAllowed("100.64.0.41", "tcp", 8080) {
+		t.Fatal("removing the policy must close what it opened")
+	}
+}

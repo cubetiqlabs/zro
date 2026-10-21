@@ -207,3 +207,8 @@ func (c *Client) Deregister(ctx context.Context) error {
 func (c *Client) ListPeers(ctx context.Context) (*v1.ListPeersResponse, error) {
 	return c.client.ListPeers(ctx, &v1.ListPeersRequest{})
 }
+
+// GetACLPolicy fetches the network-wide access rules.
+func (c *Client) GetACLPolicy(ctx context.Context) (*v1.GetACLPolicyResponse, error) {
+	return c.client.GetACLPolicy(ctx, &v1.GetACLPolicyRequest{})
+}

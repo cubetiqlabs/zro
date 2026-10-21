@@ -24,6 +24,7 @@ const (
 	ControlPlaneService_DiscoverP2P_FullMethodName      = "/zro.control.v1.ControlPlaneService/DiscoverP2P"
 	ControlPlaneService_SyncEdgeMesh_FullMethodName     = "/zro.control.v1.ControlPlaneService/SyncEdgeMesh"
 	ControlPlaneService_GetGatewayRoutes_FullMethodName = "/zro.control.v1.ControlPlaneService/GetGatewayRoutes"
+	ControlPlaneService_GetACLPolicy_FullMethodName     = "/zro.control.v1.ControlPlaneService/GetACLPolicy"
 	ControlPlaneService_ListPeers_FullMethodName        = "/zro.control.v1.ControlPlaneService/ListPeers"
 	ControlPlaneService_Deregister_FullMethodName       = "/zro.control.v1.ControlPlaneService/Deregister"
 	ControlPlaneService_RegisterTunnel_FullMethodName   = "/zro.control.v1.ControlPlaneService/RegisterTunnel"
@@ -48,6 +49,8 @@ type ControlPlaneServiceClient interface {
 	SyncEdgeMesh(ctx context.Context, in *EdgeSyncRequest, opts ...grpc.CallOption) (*EdgeSyncResponse, error)
 	// Dynamic route discovery for Ingress Gateways
 	GetGatewayRoutes(ctx context.Context, in *GatewayRoutesRequest, opts ...grpc.CallOption) (*GatewayRoutesResponse, error)
+	// Network-wide access rules the calling node enforces on inbound traffic
+	GetACLPolicy(ctx context.Context, in *GetACLPolicyRequest, opts ...grpc.CallOption) (*GetACLPolicyResponse, error)
 	// Current members of the caller's network
 	ListPeers(ctx context.Context, in *ListPeersRequest, opts ...grpc.CallOption) (*ListPeersResponse, error)
 	// Leave the mesh: removes the calling node, its tunnels and its overlay address
@@ -112,6 +115,16 @@ func (c *controlPlaneServiceClient) GetGatewayRoutes(ctx context.Context, in *Ga
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GatewayRoutesResponse)
 	err := c.cc.Invoke(ctx, ControlPlaneService_GetGatewayRoutes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) GetACLPolicy(ctx context.Context, in *GetACLPolicyRequest, opts ...grpc.CallOption) (*GetACLPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetACLPolicyResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_GetACLPolicy_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -217,6 +230,8 @@ type ControlPlaneServiceServer interface {
 	SyncEdgeMesh(context.Context, *EdgeSyncRequest) (*EdgeSyncResponse, error)
 	// Dynamic route discovery for Ingress Gateways
 	GetGatewayRoutes(context.Context, *GatewayRoutesRequest) (*GatewayRoutesResponse, error)
+	// Network-wide access rules the calling node enforces on inbound traffic
+	GetACLPolicy(context.Context, *GetACLPolicyRequest) (*GetACLPolicyResponse, error)
 	// Current members of the caller's network
 	ListPeers(context.Context, *ListPeersRequest) (*ListPeersResponse, error)
 	// Leave the mesh: removes the calling node, its tunnels and its overlay address
@@ -248,6 +263,9 @@ func (UnimplementedControlPlaneServiceServer) SyncEdgeMesh(context.Context, *Edg
 }
 func (UnimplementedControlPlaneServiceServer) GetGatewayRoutes(context.Context, *GatewayRoutesRequest) (*GatewayRoutesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetGatewayRoutes not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) GetACLPolicy(context.Context, *GetACLPolicyRequest) (*GetACLPolicyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetACLPolicy not implemented")
 }
 func (UnimplementedControlPlaneServiceServer) ListPeers(context.Context, *ListPeersRequest) (*ListPeersResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListPeers not implemented")
@@ -366,6 +384,24 @@ func _ControlPlaneService_GetGatewayRoutes_Handler(srv interface{}, ctx context.
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ControlPlaneServiceServer).GetGatewayRoutes(ctx, req.(*GatewayRoutesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_GetACLPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetACLPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).GetACLPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_GetACLPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).GetACLPolicy(ctx, req.(*GetACLPolicyRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -507,6 +543,10 @@ var ControlPlaneService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetGatewayRoutes",
 			Handler:    _ControlPlaneService_GetGatewayRoutes_Handler,
+		},
+		{
+			MethodName: "GetACLPolicy",
+			Handler:    _ControlPlaneService_GetACLPolicy_Handler,
 		},
 		{
 			MethodName: "ListPeers",

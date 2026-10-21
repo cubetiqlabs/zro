@@ -32,7 +32,7 @@ func (d *Daemon) realtimeListener(ctx context.Context) {
 		Role:       "node",
 		ID:         d.cfg.Hostname,
 		Credential: d.token.Get,
-		Events:     []string{"node_joined", "node_left", "p2p_punch_requested"},
+		Events:     []string{"node_joined", "node_left", "acl_rules_updated", "p2p_punch_requested"},
 		Raw: func(name string, data json.RawMessage) {
 			if name == "p2p_punch_requested" {
 				go d.answerPunchRequest(ctx, data)
@@ -40,9 +40,11 @@ func (d *Daemon) realtimeListener(ctx context.Context) {
 		},
 	}, func(ctx context.Context, evs []string) {
 		for _, e := range evs {
-			if e == "node_joined" || e == "node_left" {
+			switch e {
+			case "node_joined", "node_left":
 				d.syncPeers(ctx)
-				return
+			case "acl_rules_updated":
+				d.syncPolicy(ctx)
 			}
 		}
 	})
@@ -60,7 +62,7 @@ func (d *Daemon) fetchPeers(ctx context.Context) ([]core.Node, error) {
 			peers = append(peers, core.Node{
 				Hostname: p.Hostname, PublicKey: p.PublicKey,
 				OverlayIPv4: p.OverlayIpv4, OverlayIPv6: p.OverlayIpv6,
-				Endpoints: core.StringList(p.Endpoints),
+				Endpoints: core.StringList(p.Endpoints), Tags: core.StringList(p.Tags),
 			})
 		}
 		return peers, nil

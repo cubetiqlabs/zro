@@ -62,6 +62,7 @@ type Daemon struct {
 	grpcClient      *controlgrpc.Client
 
 	// Zero-Trust Inbound Firewall & Mesh Listeners
+	policy       networkPolicy // network-wide rules from the plane
 	policyMu     sync.RWMutex
 	allowedPorts []string // e.g. ["5432/tcp"]
 	defaultDeny  bool     // default true for zero-trust
@@ -211,6 +212,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			NodeID:      nodeUUID,
 			NetworkID:   gResp.NetworkId,
 			NodeToken:   gResp.NodeToken,
+			ACLRules:    rulesFromProto(gResp.AclRules),
 			IPv4CIDR:    gResp.Ipv4Cidr,
 			IPv6CIDR:    gResp.Ipv6Cidr,
 			OverlayIPv4: gResp.OverlayIpv4,
@@ -240,6 +242,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 				OverlayIPv4: p.OverlayIpv4,
 				OverlayIPv6: p.OverlayIpv6,
 				Endpoints:   core.StringList(p.Endpoints),
+				Tags:        core.StringList(p.Tags),
 			})
 		}
 	} else {
@@ -285,6 +288,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		return fmt.Errorf("enrolled into network %s but network_id is configured as %s; check the enrollment token", enrollResp.NetworkID, d.cfg.NetworkID)
 	}
 	d.token.Set(enrollResp.NodeToken)
+	d.policy.setRules(enrollResp.ACLRules)
 	d.overlayPrefixes = core.OverlayPrefixes(enrollResp.IPv4CIDR, enrollResp.IPv6CIDR)
 	d.nodeID = enrollResp.NodeID
 	d.networkID = enrollResp.NetworkID
@@ -956,6 +960,12 @@ func (d *Daemon) DenyPort(portProto string) {
 // IsTrafficAllowed evaluates if incoming traffic from srcIP to localPort on protocol is permitted.
 // If defaultDeny is enabled, all ports are denied unless explicitly allowed.
 func (d *Daemon) IsTrafficAllowed(srcIP string, protocol string, destPort int) bool {
+	// Network rules first: a matching DENY closes a port the node itself opens,
+	// and a matching ALLOW opens one the node's default-deny would close.
+	if allow, matched := d.centralDecision(srcIP, protocol, destPort); matched {
+		return allow
+	}
+
 	d.policyMu.RLock()
 	allowedPorts := d.allowedPorts
 	defaultDeny := d.defaultDeny

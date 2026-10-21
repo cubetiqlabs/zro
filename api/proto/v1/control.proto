@@ -21,6 +21,9 @@ service ControlPlaneService {
   // Dynamic route discovery for Ingress Gateways
   rpc GetGatewayRoutes(GatewayRoutesRequest) returns (GatewayRoutesResponse);
 
+  // Network-wide access rules the calling node enforces on inbound traffic
+  rpc GetACLPolicy(GetACLPolicyRequest) returns (GetACLPolicyResponse);
+
   // Current members of the caller's network
   rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
 
@@ -93,6 +96,7 @@ message EnrollResponse {
   bool default_deny = 13;
   string ipv4_cidr = 14; // overlay prefixes of the network, used for routes/AllowedIPs
   string ipv6_cidr = 15;
+  repeated ACLRule acl_rules = 16; // access policy of the network at enrollment
 }
 
 message ProbeReportRequest {
@@ -202,4 +206,22 @@ message ListPeersRequest {}
 
 message ListPeersResponse {
   repeated Node peers = 1;
+}
+
+message ACLRule {
+  string id = 1;
+  int32 priority = 2; // lower number is evaluated first
+  string source_ip = 3;
+  string dest_ip = 4;
+  string source_tag = 5;
+  string dest_tag = 6;
+  string protocol = 7;
+  string ports = 8;
+  string action = 9; // ALLOW or DENY
+}
+
+message GetACLPolicyRequest {}
+
+message GetACLPolicyResponse {
+  repeated ACLRule rules = 1;
 }

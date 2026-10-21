@@ -774,6 +774,29 @@ func TestPhase1AuthMatrix(t *testing.T) {
 		t.Fatalf("deleting own tunnel: got %d", code)
 	}
 
+	// Access policy: tenants write rules, nodes receive only their own network's,
+	// and malformed rules are refused instead of silently mis-matching.
+	if code, body := do("POST", "/api/v1/acl/rules", keyA, CreateACLRuleRequest{NetworkID: netA, SourceTag: "tag:web", DestTag: "tag:db", Ports: "5432", Action: core.ACLActionAllow}); code != http.StatusCreated {
+		t.Fatalf("create rule: %d %s", code, body)
+	}
+	if code, _ := do("POST", "/api/v1/acl/rules", keyA, CreateACLRuleRequest{NetworkID: netA, SourceIP: "10.0.0.0/99", Action: core.ACLActionAllow}); code != http.StatusBadRequest {
+		t.Fatalf("a malformed CIDR must be rejected, got %d", code)
+	}
+	if code, _ := do("POST", "/api/v1/acl/rules", keyA, CreateACLRuleRequest{NetworkID: netA, Ports: "80,x", Action: core.ACLActionAllow}); code != http.StatusBadRequest {
+		t.Fatalf("a malformed port list must be rejected, got %d", code)
+	}
+	var policyA, policyB []core.ACLRule
+	_, body = do("GET", "/api/v1/acl/policy", nodeA.NodeToken, nil)
+	_ = json.Unmarshal(body, &policyA)
+	_, body = do("GET", "/api/v1/acl/policy", nodeB.NodeToken, nil)
+	_ = json.Unmarshal(body, &policyB)
+	if len(policyA) != 1 || policyA[0].SourceTag != "tag:web" || len(policyB) != 0 {
+		t.Fatalf("each node must get exactly its own network's rules, got A=%d B=%d", len(policyA), len(policyB))
+	}
+	if code, _ := do("GET", "/api/v1/acl/policy", "", nil); code != http.StatusUnauthorized {
+		t.Fatalf("policy without a node token: got %d", code)
+	}
+
 	// Leaving the mesh invalidates the token and frees the node.
 	if code, _ := do("DELETE", "/api/v1/node", nodeB.NodeToken, nil); code != http.StatusNoContent {
 		t.Fatalf("deregister: got %d", code)
