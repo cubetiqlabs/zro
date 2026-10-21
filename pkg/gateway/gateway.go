@@ -12,7 +12,9 @@ import (
 	"sync"
 	"time"
 
+	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
+	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
@@ -43,6 +45,7 @@ type Daemon struct {
 	proxyEngine   *proxy.Engine
 	healthChecker *proxy.HealthChecker
 	httpClient    *http.Client
+	grpcClient    *controlgrpc.Client
 	httpServer    *http.Server
 	httpsServer   *http.Server
 
@@ -81,7 +84,11 @@ func NewDaemon(cfg *config.GatewayConfig) (*Daemon, error) {
 		return nil, fmt.Errorf("failed to initialize TUN device: %w", err)
 	}
 
-	wgMgr, err := wireguard.NewManager(cfg.InterfaceName)
+	wgMgr, err := wireguard.NewManager(cfg.InterfaceName,
+		wireguard.WithTunDevice(tunDev),
+		wireguard.WithPrivateKey(kp.PrivateKey),
+		wireguard.WithListenPort(0),
+	)
 	if err != nil {
 		_ = tunDev.Close()
 		return nil, fmt.Errorf("failed to initialize WireGuard manager: %w", err)
@@ -105,6 +112,20 @@ func NewDaemon(cfg *config.GatewayConfig) (*Daemon, error) {
 func (d *Daemon) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	d.cancel = cancel
+
+	// Connect gRPC client if plane transport is set to grpc
+	if strings.EqualFold(d.cfg.PlaneTransport, "grpc") {
+		grpcTarget := d.cfg.PlaneEndpoint
+		grpcTarget = strings.TrimPrefix(grpcTarget, "http://")
+		grpcTarget = strings.TrimPrefix(grpcTarget, "https://")
+		gc, err := controlgrpc.NewClient(grpcTarget)
+		if err == nil {
+			d.grpcClient = gc
+			slog.Info("ZRO Ingress Gateway connected to Control Plane via gRPC", "target", grpcTarget)
+		} else {
+			slog.Warn("Failed to initialize gRPC client for Gateway", "error", err)
+		}
+	}
 
 	// 1. Load static routes from config
 	d.loadStaticRoutes()
@@ -194,6 +215,9 @@ func (d *Daemon) Stop() error {
 	}
 	if d.tunDev != nil {
 		_ = d.tunDev.Close()
+	}
+	if d.grpcClient != nil {
+		_ = d.grpcClient.Close()
 	}
 
 	d.wg.Wait()
@@ -387,6 +411,33 @@ func (d *Daemon) SyncRoutesOnce(ctx context.Context) error {
 		return nil
 	}
 
+	if d.grpcClient != nil {
+		gResp, err := d.grpcClient.GetGatewayRoutes(ctx, &v1.GatewayRoutesRequest{
+			GatewayHostname: d.cfg.Hostname,
+		})
+		if err == nil && gResp != nil {
+			for _, r := range gResp.Routes {
+				var backends []*balancer.Backend
+				for _, b := range r.Backends {
+					backends = append(backends, &balancer.Backend{
+						Address: b.Address,
+						Weight:  int(b.Weight),
+						Healthy: b.Healthy,
+					})
+				}
+				if bal, exists := d.proxyEngine.GetRoute(r.Hostname); exists {
+					bal.UpdateBackends(backends)
+				} else {
+					strat := balancer.Strategy(d.cfg.Strategy)
+					newBal := balancer.NewBalancer(strat, backends)
+					d.proxyEngine.RegisterRoute(r.Hostname, newBal)
+					slog.Info("Discovered and registered dynamic gateway route via gRPC", "hostname", r.Hostname, "backends", len(backends))
+				}
+			}
+			return nil
+		}
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "GET", d.cfg.PlaneEndpoint+"/api/v1/gateway/routes", nil)
 	if err != nil {
 		return err
@@ -481,6 +532,15 @@ func (d *Daemon) PublicKey() string {
 
 func (d *Daemon) realtimeListener(ctx context.Context) {
 	defer d.wg.Done()
+
+	if d.grpcClient != nil {
+		_ = d.grpcClient.StreamEvents(ctx, "gateway", d.cfg.Hostname, func(evt *v1.MeshEvent) {
+			if evt != nil {
+				_ = d.SyncRoutesOnce(ctx)
+			}
+		})
+		return
+	}
 
 	wsURL := d.cfg.PlaneEndpoint + "/api/v1/ws"
 	if strings.HasPrefix(wsURL, "https://") {

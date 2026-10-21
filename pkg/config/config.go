@@ -29,6 +29,8 @@ type ControlPlaneConfig struct {
 	SyncIntervalMs int    `mapstructure:"sync_interval_ms"`
 	EnableGateway  bool   `mapstructure:"enable_gateway"`
 	GRPCListenAddr string `mapstructure:"grpc_listen_addr"`
+	RequireAuth    bool   `mapstructure:"require_auth"`
+	EdgeAPIKey     string `mapstructure:"edge_api_key"`
 }
 
 // EdgeConfig configures a global Edge Data Plane PoP.
@@ -39,6 +41,7 @@ type EdgeConfig struct {
 	ListenPort          int    `mapstructure:"listen_port"`
 	WireGuardPrivateKey string `mapstructure:"wireguard_private_key"`
 	PlaneEndpoint       string `mapstructure:"plane_endpoint"`
+	PlaneTransport      string `mapstructure:"plane_transport"` // "rest" or "grpc"
 	EdgeAPIKey          string `mapstructure:"edge_api_key"`
 	IsAnycast           bool   `mapstructure:"is_anycast"`
 	UsePrivateIP        bool   `mapstructure:"use_private_ip"`
@@ -58,8 +61,9 @@ type NodeConfig struct {
 	NetworkID           string              `mapstructure:"network_id"`
 	EnrollmentToken     string              `mapstructure:"enrollment_token"`
 	PlaneEndpoint       string              `mapstructure:"plane_endpoint"`
-	InterfaceMode       string              `mapstructure:"interface_mode"` // "tun" or "netstack"
-	InterfaceName       string              `mapstructure:"interface_name"` // "zro0"
+	PlaneTransport      string              `mapstructure:"plane_transport"` // "rest" or "grpc"
+	InterfaceMode       string              `mapstructure:"interface_mode"`  // "tun" or "netstack"
+	InterfaceName       string              `mapstructure:"interface_name"`  // "zro0"
 	MTU                 int                 `mapstructure:"mtu"`
 	EnableP2P           bool                `mapstructure:"enable_p2p"`
 	Tags                []string            `mapstructure:"tags"`
@@ -79,6 +83,7 @@ type StaticRouteConfig struct {
 type GatewayConfig struct {
 	Hostname              string              `mapstructure:"hostname"`
 	PlaneEndpoint         string              `mapstructure:"plane_endpoint"`
+	PlaneTransport        string              `mapstructure:"plane_transport"` // "rest" or "grpc"
 	EnrollmentToken       string              `mapstructure:"enrollment_token"`
 	NetworkID             string              `mapstructure:"network_id"`
 	InterfaceName         string              `mapstructure:"interface_name"`

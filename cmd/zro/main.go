@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,6 +33,29 @@ var (
 		Short: "ZRO: High-Performance Global Networking & Ether-Switch Mesh",
 		Long: `ZRO is an enterprise-grade global networking fabric with userspace WireGuard,
 smart routing, IPless nodes, zero-trust ACLs, and cloud-native load balancing.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(cfgFile)
+			if err != nil {
+				return err
+			}
+
+			mode := strings.ToLower(strings.TrimSpace(cfg.Mode))
+			switch mode {
+			case "plane", "control_plane":
+				return runPlane(cfg)
+			case "edge":
+				return runEdge(cfg)
+			case "node":
+				return runNode(cfg)
+			case "gw", "gateway":
+				return runGateway(cfg)
+			default:
+				if mode != "" {
+					return fmt.Errorf("unknown mode %q in configuration (expected: plane, edge, node, gw)", mode)
+				}
+				return cmd.Help()
+			}
+		},
 	}
 )
 
@@ -56,6 +80,85 @@ func main() {
 	}
 }
 
+func runPlane(cfg *config.AppConfig) error {
+	slog.Info("Initializing Control Plane database", "driver", cfg.ControlPlane.DatabaseDriver)
+	db, err := store.NewDB(cfg.ControlPlane.DatabaseDriver, cfg.ControlPlane.DatabaseDSN)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %w", err)
+	}
+
+	srv := server.NewServer(&cfg.ControlPlane, db)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		if err := srv.Start(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Control Plane error", "error", err)
+		}
+	}()
+
+	<-ctx.Done()
+	slog.Info("Shutting down Control Plane gracefully...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return srv.Shutdown(shutdownCtx)
+}
+
+func runEdge(cfg *config.AppConfig) error {
+	pop, err := edge.NewPoPDaemon(&cfg.Edge)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := pop.Start(ctx); err != nil {
+		return err
+	}
+
+	<-ctx.Done()
+	slog.Info("Shutting down Edge PoP...")
+	return pop.Stop()
+}
+
+func runNode(cfg *config.AppConfig) error {
+	agent, err := node.NewDaemon(&cfg.Node)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := agent.Start(ctx); err != nil {
+		return err
+	}
+
+	<-ctx.Done()
+	slog.Info("Disconnecting node from overlay mesh...")
+	return agent.Stop()
+}
+
+func runGateway(cfg *config.AppConfig) error {
+	gwDaemon, err := gateway.NewDaemon(&cfg.Gateway)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := gwDaemon.Start(ctx); err != nil {
+		return err
+	}
+
+	<-ctx.Done()
+	slog.Info("Stopping Ingress Gateway...")
+	return gwDaemon.Stop()
+}
+
 func newPlaneCmd() *cobra.Command {
 	var enableGatewayFlag bool
 
@@ -72,28 +175,7 @@ func newPlaneCmd() *cobra.Command {
 				cfg.ControlPlane.EnableGateway = true
 			}
 
-			slog.Info("Initializing Control Plane database", "driver", cfg.ControlPlane.DatabaseDriver)
-			db, err := store.NewDB(cfg.ControlPlane.DatabaseDriver, cfg.ControlPlane.DatabaseDSN)
-			if err != nil {
-				return fmt.Errorf("failed to open database: %w", err)
-			}
-
-			srv := server.NewServer(&cfg.ControlPlane, db)
-
-			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-			defer stop()
-
-			go func() {
-				if err := srv.Start(); err != nil && err != http.ErrServerClosed {
-					slog.Error("Control Plane error", "error", err)
-				}
-			}()
-
-			<-ctx.Done()
-			slog.Info("Shutting down Control Plane gracefully...")
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			return srv.Shutdown(shutdownCtx)
+			return runPlane(cfg)
 		},
 	}
 
@@ -131,21 +213,7 @@ func newEdgeCmd() *cobra.Command {
 				cfg.Edge.PlaneEndpoint = planeFlag
 			}
 
-			pop, err := edge.NewPoPDaemon(&cfg.Edge)
-			if err != nil {
-				return err
-			}
-
-			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-			defer stop()
-
-			if err := pop.Start(ctx); err != nil {
-				return err
-			}
-
-			<-ctx.Done()
-			slog.Info("Shutting down Edge PoP...")
-			return pop.Stop()
+			return runEdge(cfg)
 		},
 	}
 
@@ -167,21 +235,7 @@ func newNodeCmd() *cobra.Command {
 				return err
 			}
 
-			agent, err := node.NewDaemon(&cfg.Node)
-			if err != nil {
-				return err
-			}
-
-			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-			defer stop()
-
-			if err := agent.Start(ctx); err != nil {
-				return err
-			}
-
-			<-ctx.Done()
-			slog.Info("Disconnecting node from overlay mesh...")
-			return agent.Stop()
+			return runNode(cfg)
 		},
 	}
 }
@@ -215,21 +269,7 @@ func newGatewayCmd() *cobra.Command {
 				cfg.Gateway.ListenHTTPS = listenHTTPSFlag
 			}
 
-			gwDaemon, err := gateway.NewDaemon(&cfg.Gateway)
-			if err != nil {
-				return err
-			}
-
-			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-			defer stop()
-
-			if err := gwDaemon.Start(ctx); err != nil {
-				return err
-			}
-
-			<-ctx.Done()
-			slog.Info("Stopping Ingress Gateway...")
-			return gwDaemon.Stop()
+			return runGateway(cfg)
 		},
 	}
 

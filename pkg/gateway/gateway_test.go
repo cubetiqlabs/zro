@@ -201,6 +201,11 @@ func TestGatewayStaticAndDynamicRoutes(t *testing.T) {
 		t.Fatalf("gw2 expected to have identical clustered routes for myapp-api.example.com")
 	}
 
+	// gw2 health checker detects node1 crash
+	for _, b := range gw2Bal.GetBackends() {
+		gw2.healthChecker.Check(ctx, b, "/")
+	}
+
 	reqGW2 := httptest.NewRequest("GET", "http://myapp-api.example.com/api", nil)
 	recGW2 := httptest.NewRecorder()
 	gw2.ProxyEngine().ServeHTTP(recGW2, reqGW2)

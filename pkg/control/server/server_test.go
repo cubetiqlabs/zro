@@ -433,3 +433,140 @@ func TestMeshGraphAndEdgeHeartbeatsAndACLs(t *testing.T) {
 	}
 	t.Logf("✅ Real-Time Mesh Topology Graph verified: %d nodes, %d edges", len(graphResp.Nodes), len(graphResp.Edges))
 }
+
+func TestServerAuthAndTenantIsolation(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.NewDB("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to init db: %v", err)
+	}
+
+	secretKey := "test-auth-cluster-secret"
+	edgeKey := "edge-secret-key-123"
+	cfg := &config.ControlPlaneConfig{
+		ListenAddr:    ":8443",
+		PublicURL:     "https://zro-plane.cubis.tech:443",
+		SecretKey:     secretKey,
+		EdgeAPIKey:    edgeKey,
+		RequireAuth:   true, // Require explicit authentication
+		DefaultCIDRv4: "100.64.0.0/16",
+		DefaultCIDRv6: "fd00:cafe::/64",
+	}
+
+	// 1. Create two distinct tenants
+	tenantA := &core.Tenant{
+		ID:        uuid.New(),
+		Name:      "Tenant Alpha",
+		Slug:      "alpha",
+		APIKey:    "key_alpha_12345",
+		IsActive:  true,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	_ = db.Tenants.Create(ctx, tenantA)
+
+	tenantB := &core.Tenant{
+		ID:        uuid.New(),
+		Name:      "Tenant Beta",
+		Slug:      "beta",
+		APIKey:    "key_beta_67890",
+		IsActive:  true,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	_ = db.Tenants.Create(ctx, tenantB)
+
+	srv := NewServer(cfg, db)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// Case 1: Unauthenticated request when RequireAuth=true -> MUST RETURN 401
+	rUnauth, _ := http.Get(ts.URL + "/api/v1/networks")
+	if rUnauth.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for unauthenticated request, got %d", rUnauth.StatusCode)
+	}
+	_ = rUnauth.Body.Close()
+
+	// Case 2: Invalid API key -> MUST RETURN 401
+	reqInvalid, _ := http.NewRequest("GET", ts.URL+"/api/v1/networks", nil)
+	reqInvalid.Header.Set("Authorization", "Bearer invalid-key")
+	rInvalid, _ := http.DefaultClient.Do(reqInvalid)
+	if rInvalid.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for invalid API key, got %d", rInvalid.StatusCode)
+	}
+	_ = rInvalid.Body.Close()
+
+	// Case 3: Tenant Alpha creates a network
+	createBody, _ := json.Marshal(CreateNetworkRequest{
+		Name: "Alpha VPC",
+	})
+	reqCreateA, _ := http.NewRequest("POST", ts.URL+"/api/v1/networks", bytes.NewReader(createBody))
+	reqCreateA.Header.Set("Authorization", "Bearer key_alpha_12345")
+	reqCreateA.Header.Set("Content-Type", "application/json")
+	rCreateA, err := http.DefaultClient.Do(reqCreateA)
+	if err != nil || rCreateA.StatusCode != http.StatusCreated {
+		t.Fatalf("failed to create network for Tenant Alpha: %v", err)
+	}
+	var netA core.Network
+	_ = json.NewDecoder(rCreateA.Body).Decode(&netA)
+	_ = rCreateA.Body.Close()
+
+	if netA.TenantID != tenantA.ID {
+		t.Fatalf("expected network to be owned by Tenant Alpha (%s), got %s", tenantA.ID, netA.TenantID)
+	}
+
+	// Case 4: Tenant Beta lists networks -> MUST NOT see Tenant Alpha's network
+	reqListB, _ := http.NewRequest("GET", ts.URL+"/api/v1/networks", nil)
+	reqListB.Header.Set("X-API-Key", "key_beta_67890")
+	rListB, _ := http.DefaultClient.Do(reqListB)
+	var netsB []core.Network
+	_ = json.NewDecoder(rListB.Body).Decode(&netsB)
+	_ = rListB.Body.Close()
+
+	if len(netsB) != 0 {
+		t.Fatalf("Tenant Beta should see 0 networks, got %d", len(netsB))
+	}
+
+	// Case 5: Tenant Beta attempts to create an ACL rule on Tenant Alpha's network -> MUST RETURN 403 Forbidden
+	aclBody, _ := json.Marshal(CreateACLRuleRequest{
+		NetworkID: netA.ID,
+		SourceIP:  "*",
+		DestIP:    "*",
+		Ports:     "80",
+		Action:    core.ACLActionAllow,
+	})
+	reqAclB, _ := http.NewRequest("POST", ts.URL+"/api/v1/acl/rules", bytes.NewReader(aclBody))
+	reqAclB.Header.Set("Authorization", "Bearer key_beta_67890")
+	reqAclB.Header.Set("Content-Type", "application/json")
+	rAclB, _ := http.DefaultClient.Do(reqAclB)
+	if rAclB.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when Tenant Beta creates ACL on Tenant Alpha network, got %d", rAclB.StatusCode)
+	}
+	_ = rAclB.Body.Close()
+
+	// Case 6: Edge PoP authentication
+	// 6a. Register edge without key when RequireAuth=true -> 401
+	kpEdge, _ := crypto.GenerateKeyPair()
+	edgeRegBody, _ := json.Marshal(RegisterEdgePoPRequest{
+		PoPCode:        "SG",
+		Region:         "Singapore",
+		PublicEndpoint: "123.1.1.1:51820",
+		PublicKey:      kpEdge.PublicKey,
+	})
+	rEdgeNoKey, _ := http.Post(ts.URL+"/api/v1/edge/register", "application/json", bytes.NewReader(edgeRegBody))
+	if rEdgeNoKey.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for edge registration without key, got %d", rEdgeNoKey.StatusCode)
+	}
+	_ = rEdgeNoKey.Body.Close()
+
+	// 6b. Register edge with valid EdgeAPIKey -> 200 OK
+	reqEdgeValid, _ := http.NewRequest("POST", ts.URL+"/api/v1/edge/register", bytes.NewReader(edgeRegBody))
+	reqEdgeValid.Header.Set("Authorization", "Bearer "+edgeKey)
+	reqEdgeValid.Header.Set("Content-Type", "application/json")
+	rEdgeValid, err := http.DefaultClient.Do(reqEdgeValid)
+	if err != nil || rEdgeValid.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for valid edge registration, got %d", rEdgeValid.StatusCode)
+	}
+	_ = rEdgeValid.Body.Close()
+	t.Log("✅ TestServerAuthAndTenantIsolation passed: 401 enforcement, API key validation, multi-tenant isolation, and edge authentication verified")
+}

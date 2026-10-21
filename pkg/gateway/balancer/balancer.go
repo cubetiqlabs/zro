@@ -127,7 +127,7 @@ func (b *Balancer) Pick(r *http.Request) (*Backend, error) {
 	case StrategyRoundRobin:
 		fallthrough
 	default:
-		idx := atomic.AddUint64(&b.rrCounter, 1) % uint64(len(healthy))
+		idx := (atomic.AddUint64(&b.rrCounter, 1) - 1) % uint64(len(healthy))
 		return healthy[idx], nil
 	}
 }

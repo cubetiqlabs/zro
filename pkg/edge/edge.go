@@ -12,7 +12,9 @@ import (
 	"sync"
 	"time"
 
+	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
+	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/dataplane/derp"
@@ -33,6 +35,7 @@ type PoPDaemon struct {
 	derpServer   *derp.Server
 	derpListener net.Listener
 	httpClient   *http.Client
+	grpcClient   *controlgrpc.Client
 	peerCount    int
 	peersMu      sync.RWMutex
 
@@ -61,7 +64,10 @@ func NewPoPDaemon(cfg *config.EdgeConfig) (*PoPDaemon, error) {
 		}
 	}
 
-	wgMgr, err := wireguard.NewManager("zro-edge")
+	wgMgr, err := wireguard.NewManager("zro-edge",
+		wireguard.WithPrivateKey(kp.PrivateKey),
+		wireguard.WithListenPort(cfg.ListenPort),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init wireguard manager: %w", err)
 	}
@@ -127,6 +133,20 @@ func (e *PoPDaemon) Start(ctx context.Context) error {
 		}
 	}
 
+	// Connect gRPC client if plane transport is set to grpc
+	if strings.EqualFold(e.cfg.PlaneTransport, "grpc") {
+		grpcTarget := e.cfg.PlaneEndpoint
+		grpcTarget = strings.TrimPrefix(grpcTarget, "http://")
+		grpcTarget = strings.TrimPrefix(grpcTarget, "https://")
+		gc, err := controlgrpc.NewClient(grpcTarget)
+		if err == nil {
+			e.grpcClient = gc
+			slog.Info("Edge PoP connected to Control Plane via gRPC", "target", grpcTarget)
+		} else {
+			slog.Warn("Failed to initialize gRPC client for Edge PoP", "error", err)
+		}
+	}
+
 	// Launch Control Plane config synchronization and registration loop
 	e.wg.Add(1)
 	go e.syncWorker(ctx)
@@ -154,6 +174,9 @@ func (e *PoPDaemon) Stop() error {
 	}
 	if e.wgManager != nil {
 		_ = e.wgManager.Close()
+	}
+	if e.grpcClient != nil {
+		_ = e.grpcClient.Close()
 	}
 	e.wg.Wait()
 	return nil
@@ -200,6 +223,10 @@ func (e *PoPDaemon) registerWithControlPlane(ctx context.Context) bool {
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if e.cfg.EdgeAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+e.cfg.EdgeAPIKey)
+		req.Header.Set("X-Edge-Key", e.cfg.EdgeAPIKey)
+	}
 
 	resp, err := e.httpClient.Do(req)
 	if err == nil {
@@ -234,6 +261,10 @@ func (e *PoPDaemon) sendHeartbeat(ctx context.Context) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if e.cfg.EdgeAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+e.cfg.EdgeAPIKey)
+		req.Header.Set("X-Edge-Key", e.cfg.EdgeAPIKey)
+	}
 
 	resp, err := e.httpClient.Do(req)
 	if err == nil {
@@ -270,9 +301,55 @@ func (e *PoPDaemon) syncWorker(ctx context.Context) {
 }
 
 func (e *PoPDaemon) syncMeshTopology(ctx context.Context) {
+	if e.grpcClient != nil {
+		gResp, err := e.grpcClient.SyncEdgeMesh(ctx, &v1.EdgeSyncRequest{
+			PopCode: e.cfg.PoPCode,
+		})
+		if err == nil && gResp != nil {
+			e.peersMu.Lock()
+			e.peerCount = len(gResp.Nodes)
+			e.peersMu.Unlock()
+
+			for _, p := range gResp.Pops {
+				if p.PopCode != e.cfg.PoPCode && p.PublicKey != "" {
+					_ = e.wgManager.ApplyPeer(wireguard.PeerConfig{
+						PublicKey:           p.PublicKey,
+						Endpoint:            p.PublicEndpoint,
+						AllowedIPs:          []string{"100.64.0.0/10", "fd00:cafe::/64"},
+						PersistentKeepalive: 20 * time.Second,
+					})
+				}
+			}
+
+			for _, n := range gResp.Nodes {
+				if n.PublicKey != "" && n.OverlayIpv4 != "" {
+					var ep string
+					if len(n.Endpoints) > 0 {
+						ep = n.Endpoints[0]
+					}
+					_ = e.wgManager.ApplyPeer(wireguard.PeerConfig{
+						PublicKey:           n.PublicKey,
+						Endpoint:            ep,
+						AllowedIPs:          []string{n.OverlayIpv4 + "/32"},
+						PersistentKeepalive: 25 * time.Second,
+					})
+					e.routingTable.SetRoute(n.OverlayIpv4, router.RouteTarget{
+						PublicKey: n.PublicKey,
+						Endpoint:  ep,
+					})
+				}
+			}
+			return
+		}
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "GET", e.cfg.PlaneEndpoint+"/api/v1/edge/sync", nil)
 	if err != nil {
 		return
+	}
+	if e.cfg.EdgeAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+e.cfg.EdgeAPIKey)
+		req.Header.Set("X-Edge-Key", e.cfg.EdgeAPIKey)
 	}
 
 	resp, err := e.httpClient.Do(req)
@@ -334,6 +411,16 @@ func (e *PoPDaemon) PublicKey() string {
 
 func (e *PoPDaemon) realtimeListener(ctx context.Context) {
 	defer e.wg.Done()
+
+	if e.grpcClient != nil {
+		_ = e.grpcClient.StreamEvents(ctx, "edge", e.cfg.PoPCode, func(evt *v1.MeshEvent) {
+			if evt != nil {
+				slog.Info("Real-time topology update event received at Edge PoP via gRPC", "pop_code", e.cfg.PoPCode, "event", evt.EventType)
+				e.syncMeshTopology(ctx)
+			}
+		})
+		return
+	}
 
 	wsURL := e.cfg.PlaneEndpoint + "/api/v1/ws"
 	if strings.HasPrefix(wsURL, "https://") {
