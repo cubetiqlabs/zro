@@ -94,6 +94,9 @@ func (s *Server) Start() error {
 	// Launch background watcher for Edge PoP health / heartbeat tracking
 	go s.popWatchWorker(ctx)
 
+	// Reap stale nodes, expired enrollment redemptions and old probe history
+	go s.svc.Maintain(ctx, time.Minute, s.cfg.NodeTTL)
+
 	// Start gRPC server in background if configured
 	if s.cfg.GRPCListenAddr != "" {
 		creds, err := s.grpcTransportCredentials()
@@ -259,8 +262,10 @@ func withNode(ctx context.Context, node *core.Node) context.Context {
 	return context.WithValue(ctx, nodeContextKey, node)
 }
 
-func withEdge(ctx context.Context) context.Context {
-	ctx = controlauth.WithSubject(ctx, &controlauth.Subject{Kind: controlauth.KindEdge})
+func withEdge(ctx context.Context) context.Context { return withEdgePoP(ctx, "") }
+
+func withEdgePoP(ctx context.Context, popCode string) context.Context {
+	ctx = controlauth.WithSubject(ctx, &controlauth.Subject{Kind: controlauth.KindEdge, PoPCode: popCode})
 	return context.WithValue(ctx, edgeContextKey, true)
 }
 
@@ -328,6 +333,7 @@ func (s *Server) nodeAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, `{"error":"unauthorized: invalid or inactive node token"}`, http.StatusUnauthorized)
 			return
 		}
+		s.svc.Touch(r.Context(), node)
 		next(w, r.WithContext(withNode(r.Context(), node)))
 	}
 }
@@ -359,8 +365,8 @@ func (s *Server) authenticateStream(r *http.Request) (context.Context, string) {
 		// authentication before rejecting it.
 	}
 
-	if s.isValidEdgeKey(r) {
-		return withEdge(ctx), ""
+	if edgeCtx, ok := s.authenticateEdge(r); ok && popCodeOf(edgeCtx) != "" {
+		return edgeCtx, ""
 	}
 
 	if tenantKey != "" || rawToken != "" || controlauth.EdgeKey(r) != "" {
@@ -438,6 +444,8 @@ func (s *Server) grpcStreamScope(ctx context.Context) (controlevents.Scope, erro
 	return scope, nil
 }
 
+const popKeyPrefix = "zro_pop_"
+
 func (s *Server) isValidEdgeKey(r *http.Request) bool {
 	key := controlauth.EdgeKey(r)
 	expected := s.cfg.EdgeAPIKey
@@ -447,25 +455,64 @@ func (s *Server) isValidEdgeKey(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(key), []byte(expected)) == 1
 }
 
+// popCodeOf returns the PoP an authenticated edge principal belongs to ("" for
+// the shared registration key).
+func popCodeOf(ctx context.Context) string {
+	if sub := controlauth.FromContext(ctx); sub != nil && sub.Kind == controlauth.KindEdge {
+		return sub.PoPCode
+	}
+	return ""
+}
+
+// authenticateEdge identifies an edge principal. A per-PoP credential
+// identifies its PoP; the shared registration key identifies a registrar that
+// may only claim PoPs.
+func (s *Server) authenticateEdge(r *http.Request) (context.Context, bool) {
+	key := controlauth.EdgeKey(r)
+	if strings.HasPrefix(key, popKeyPrefix) {
+		pop, err := s.db.EdgePoPs.GetByKeyHash(r.Context(), controlauth.HashToken(key))
+		if err != nil || pop == nil {
+			return nil, false
+		}
+		return withEdgePoP(r.Context(), pop.PoPCode), true
+	}
+	if s.isValidEdgeKey(r) {
+		return withEdge(r.Context()), true
+	}
+	return nil, false
+}
+
+// edgeOpen reports the unauthenticated development mode for edge endpoints.
+func (s *Server) edgeOpen() bool { return !s.cfg.RequireAuth && s.cfg.EdgeAPIKey == "" }
+
+// edgeAuthMiddleware admits registrars (shared key) and PoPs (own credential).
 func (s *Server) edgeAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := controlauth.EdgeKey(r)
-		if key != "" {
-			if s.isValidEdgeKey(r) {
-				next(w, r.WithContext(withEdge(r.Context())))
+		if controlauth.EdgeKey(r) != "" {
+			if ctx, ok := s.authenticateEdge(r); ok {
+				next(w, r.WithContext(ctx))
 				return
 			}
-			http.Error(w, `{"error":"unauthorized: invalid edge API key"}`, http.StatusUnauthorized)
+			http.Error(w, `{"error":"unauthorized: invalid edge credential"}`, http.StatusUnauthorized)
 			return
 		}
-
-		if s.cfg.RequireAuth || s.cfg.EdgeAPIKey != "" {
-			http.Error(w, `{"error":"unauthorized: edge API key required"}`, http.StatusUnauthorized)
+		if !s.edgeOpen() {
+			http.Error(w, `{"error":"unauthorized: edge credential required"}`, http.StatusUnauthorized)
 			return
 		}
-
 		next(w, r.WithContext(withEdge(r.Context())))
 	}
+}
+
+// popAuthMiddleware admits only an edge presenting its own per-PoP credential.
+func (s *Server) popAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return s.edgeAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if popCodeOf(r.Context()) == "" && !s.edgeOpen() {
+			http.Error(w, `{"error":"forbidden: a per-PoP credential is required; re-register to obtain one"}`, http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	})
 }
 
 // authorizeNetwork resolves a network and verifies that the current principal
@@ -509,8 +556,10 @@ func (s *Server) registerRoutes() {
 	// Edge PoPs, Dynamic Registration & Real-time Heartbeats
 	s.mux.HandleFunc("GET /api/v1/pops", s.handleListPoPs)
 	s.mux.HandleFunc("POST /api/v1/edge/register", s.edgeAuthMiddleware(s.handleRegisterEdgePoP))
-	s.mux.HandleFunc("POST /api/v1/edge/heartbeat", s.edgeAuthMiddleware(s.handleEdgeHeartbeat))
-	s.mux.HandleFunc("GET /api/v1/edge/sync", s.edgeAuthMiddleware(s.handleEdgeSync))
+	s.mux.HandleFunc("POST /api/v1/edge/heartbeat", s.popAuthMiddleware(s.handleEdgeHeartbeat))
+	s.mux.HandleFunc("POST /api/v1/edge/deregister", s.popAuthMiddleware(s.handleEdgeDeregister))
+	s.mux.HandleFunc("GET /api/v1/edge/sync", s.popAuthMiddleware(s.handleEdgeSync))
+	s.mux.HandleFunc("POST /api/v1/pops/{code}/reset-key", s.adminAuthMiddleware(s.handleResetPoPKey))
 
 	// Live Mesh Topology Graph (Real-Time)
 	s.mux.HandleFunc("GET /api/v1/mesh/graph", s.tenantAuthMiddleware(s.handleGetMeshGraph))
@@ -528,6 +577,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/p2p/discover", s.nodeAuthMiddleware(s.handleP2PDiscover))
 
 	// Ingress & Tunneling
+	s.mux.HandleFunc("DELETE /api/v1/node", s.nodeAuthMiddleware(s.handleDeregister))
 	s.mux.HandleFunc("POST /api/v1/tunnels", s.nodeAuthMiddleware(s.handleRegisterTunnel))
 	s.mux.HandleFunc("GET /api/v1/tunnels", s.nodeAuthMiddleware(s.handleListTunnels))
 	s.mux.HandleFunc("DELETE /api/v1/tunnels/{id}", s.nodeAuthMiddleware(s.handleDeleteTunnel))
@@ -682,9 +732,34 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	existing, _ := s.db.EdgePoPs.GetByPoPCode(r.Context(), req.PoPCode)
+	caller := popCodeOf(r.Context())
+
+	// A claimed PoP can only be re-registered by its own credential, so a holder
+	// of the shared key cannot overwrite another PoP's key and endpoint.
+	if existing != nil && existing.KeyHash != "" && caller != existing.PoPCode {
+		http.Error(w, "pop is already claimed; present its credential or have an admin reset it", http.StatusForbidden)
+		return
+	}
+	if caller != "" && (existing == nil || caller != req.PoPCode) {
+		http.Error(w, "credential does not belong to this pop", http.StatusForbidden)
+		return
+	}
+
+	var popKey, keyHash string
+	if existing == nil || existing.KeyHash == "" {
+		var err error
+		if popKey, keyHash, err = controlauth.GenerateToken(popKeyPrefix); err != nil {
+			http.Error(w, "failed to issue pop credential", http.StatusInternalServerError)
+			return
+		}
+	}
+
 	var pop core.EdgePoP
 	if existing != nil {
 		pop = *existing
+		if keyHash != "" {
+			pop.KeyHash = keyHash
+		}
 		pop.PublicEndpoint = req.PublicEndpoint
 		pop.PublicKey = req.PublicKey
 		pop.Region = req.Region
@@ -706,6 +781,7 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 			Weight:         req.Weight,
 			IsAnycast:      req.IsAnycast,
 			IsHealthy:      true,
+			KeyHash:        keyHash,
 			LastSeenAt:     time.Now(),
 			CreatedAt:      time.Now(),
 			UpdatedAt:      time.Now(),
@@ -728,9 +804,45 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 		"event": "mesh_graph_updated",
 	})
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(pop)
+	writeJSON(w, http.StatusOK, struct {
+		core.EdgePoP
+		PopKey string `json:"pop_key,omitempty"` // issued once, when the PoP is claimed
+	}{pop, popKey})
+}
+
+// handleResetPoPKey lets an admin release a claimed PoP (for example after the
+// edge lost its state) so it can register again with the shared key.
+func (s *Server) handleResetPoPKey(w http.ResponseWriter, r *http.Request) {
+	pop, err := s.db.EdgePoPs.GetByPoPCode(r.Context(), r.PathValue("code"))
+	if err != nil || pop == nil {
+		http.Error(w, "pop not found", http.StatusNotFound)
+		return
+	}
+	pop.KeyHash = ""
+	if err := s.db.EdgePoPs.Update(r.Context(), pop); err != nil {
+		http.Error(w, "failed to reset pop credential", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleEdgeDeregister marks the calling PoP offline immediately instead of
+// waiting for the heartbeat timeout.
+func (s *Server) handleEdgeDeregister(w http.ResponseWriter, r *http.Request) {
+	pop, err := s.db.EdgePoPs.GetByPoPCode(r.Context(), popCodeOf(r.Context()))
+	if err != nil || pop == nil {
+		http.Error(w, "pop not found", http.StatusNotFound)
+		return
+	}
+	pop.IsHealthy = false
+	pop.UpdatedAt = time.Now()
+	if err := s.db.EdgePoPs.Update(r.Context(), pop); err != nil {
+		http.Error(w, "failed to update pop", http.StatusInternalServerError)
+		return
+	}
+	s.broadcastDelta(controlevents.Scope{}, map[string]any{"event": "pop_status_changed", "pop_code": pop.PoPCode, "is_healthy": false, "status": "offline"})
+	s.broadcastDelta(controlevents.Scope{}, map[string]any{"event": "mesh_graph_updated"})
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // EdgeHeartbeatRequest defines heartbeat telemetry sent by an Edge Data Plane node.
@@ -750,6 +862,10 @@ func (s *Server) handleEdgeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if caller := popCodeOf(r.Context()); caller != "" && caller != req.PoPCode {
+		http.Error(w, "credential does not belong to this pop", http.StatusForbidden)
+		return
+	}
 	pop, err := s.db.EdgePoPs.GetByPoPCode(r.Context(), req.PoPCode)
 	if err != nil || pop == nil {
 		http.Error(w, "pop not found", http.StatusNotFound)
@@ -962,6 +1078,18 @@ func (s *Server) handleRegisterTunnel(w http.ResponseWriter, r *http.Request) {
 		_ = s.syncInternalGateway(r.Context())
 	}
 	writeJSON(w, http.StatusCreated, tunnel)
+}
+
+// handleDeregister removes the calling node from the mesh.
+func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
+	if err := s.svc.Deregister(r.Context(), NodeFromContext(r.Context())); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	if s.cfg.EnableGateway {
+		_ = s.syncInternalGateway(r.Context())
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleListTunnels returns the tunnels of the caller's network.

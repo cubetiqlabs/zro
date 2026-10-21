@@ -196,3 +196,9 @@ func DialPlane(planeEndpoint string, g config.PlaneGRPC, token func() string) (*
 	}
 	return Dial(DialOptions{Endpoint: endpoint, Insecure: g.GRPCInsecure, CAFile: g.CAFile, Token: token})
 }
+
+// Deregister removes the calling node from the mesh.
+func (c *Client) Deregister(ctx context.Context) error {
+	_, err := c.client.Deregister(ctx, &v1.DeregisterRequest{})
+	return err
+}

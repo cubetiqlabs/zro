@@ -26,6 +26,7 @@ import (
 	"github.com/cubis/zro/pkg/gateway/acme"
 	"github.com/cubis/zro/pkg/gateway/balancer"
 	"github.com/cubis/zro/pkg/gateway/proxy"
+	"github.com/cubis/zro/pkg/identity"
 	"github.com/cubis/zro/pkg/p2p/stun"
 	"github.com/google/uuid"
 	"golang.org/x/net/websocket"
@@ -63,9 +64,9 @@ type Daemon struct {
 
 // NewDaemon initializes a new ingress gateway daemon.
 func NewDaemon(cfg *config.GatewayConfig) (*Daemon, error) {
-	kp, err := crypto.GenerateKeyPair()
+	kp, err := identity.LoadOrCreateKey(cfg.StateDir, "gateway.key")
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate WireGuard keypair: %w", err)
+		return nil, fmt.Errorf("failed to load WireGuard identity: %w", err)
 	}
 
 	if cfg.InterfaceName == "" {
@@ -413,6 +414,9 @@ func (d *Daemon) enrollAndConnect(ctx context.Context) error {
 		return fmt.Errorf("failed to decode gateway enrollment response: %w", err)
 	}
 
+	if d.cfg.NetworkID != "" && !strings.EqualFold(d.cfg.NetworkID, enrollResp.NetworkID) {
+		return fmt.Errorf("enrolled into network %s but network_id is configured as %s; check the enrollment token", enrollResp.NetworkID, d.cfg.NetworkID)
+	}
 	d.token.Set(enrollResp.NodeToken)
 	d.nodeID = enrollResp.NodeID
 	d.networkID = enrollResp.NetworkID

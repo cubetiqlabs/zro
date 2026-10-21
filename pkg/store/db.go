@@ -40,7 +40,8 @@ func NewDB(driverName, dsn string) (*DB, error) {
 	}
 
 	gormDB, err := gorm.Open(dialector, &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
+		Logger:         logger.Default.LogMode(logger.Silent),
+		TranslateError: true, // surface unique violations as gorm.ErrDuplicatedKey
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
@@ -51,6 +52,10 @@ func NewDB(driverName, dsn string) (*DB, error) {
 		sqlDB.SetMaxIdleConns(10)
 		sqlDB.SetMaxOpenConns(100)
 		sqlDB.SetConnMaxLifetime(time.Hour)
+	}
+
+	if err := dedupeNodes(gormDB); err != nil {
+		return nil, fmt.Errorf("failed to prepare node uniqueness: %w", err)
 	}
 
 	// Execute schema auto-migrations
@@ -102,4 +107,24 @@ func NewDB(driverName, dsn string) (*DB, error) {
 	}
 
 	return dbInstance, nil
+}
+
+// dedupeNodes removes duplicate node rows left behind by earlier versions
+// (every restart enrolled a fresh node) so the unique indexes on
+// (network_id, public_key) and (network_id, overlay_ipv4) can be created. The
+// most recently seen row of each group survives.
+func dedupeNodes(db *gorm.DB) error {
+	if !db.Migrator().HasTable(&core.Node{}) {
+		return nil
+	}
+	for _, col := range []string{"public_key", "overlay_ipv4"} {
+		err := db.Exec(`DELETE FROM nodes WHERE id IN (
+			SELECT id FROM (
+				SELECT id, ROW_NUMBER() OVER (PARTITION BY network_id, ` + col + ` ORDER BY last_seen_at DESC, created_at DESC) AS rn FROM nodes
+			) ranked WHERE rn > 1)`).Error
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

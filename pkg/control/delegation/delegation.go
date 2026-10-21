@@ -60,6 +60,32 @@ func (e *Engine) RecordProbe(sample core.LatencySample) {
 	nodeProbes[sample.PoPCode] = sample
 }
 
+// Forget drops a node's probe history (the node left or was reaped).
+func (e *Engine) Forget(nodeID uuid.UUID) {
+	e.mu.Lock()
+	delete(e.recentProbes, nodeID)
+	e.mu.Unlock()
+}
+
+// Prune drops samples older than maxAge, and nodes left without samples, so
+// probe history stays bounded. Live nodes re-report every few seconds, which is
+// why history is memory-only.
+func (e *Engine) Prune(maxAge time.Duration) {
+	cutoff := time.Now().Add(-maxAge)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for id, probes := range e.recentProbes {
+		for code, sample := range probes {
+			if sample.Timestamp.Before(cutoff) {
+				delete(probes, code)
+			}
+		}
+		if len(probes) == 0 {
+			delete(e.recentProbes, id)
+		}
+	}
+}
+
 // Delegate selects the optimal primary and secondary Edge PoPs for a node.
 func (e *Engine) Delegate(ctx context.Context, nodeID uuid.UUID) (*DelegationResult, error) {
 	healthyPoPs, err := e.popRepo.ListHealthy(ctx)

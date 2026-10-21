@@ -30,6 +30,10 @@ type Subject struct {
 	Kind   Kind
 	Node   *core.Node
 	Tenant *core.Tenant
+	// PoPCode is set for an edge authenticated with its own per-PoP credential.
+	// An edge using only the shared registration key has no PoPCode and may
+	// only claim PoPs.
+	PoPCode string
 }
 
 // NetworkID returns the network a node principal is bound to.

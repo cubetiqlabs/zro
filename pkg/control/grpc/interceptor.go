@@ -30,6 +30,7 @@ var policy = map[string]access{
 	"/zro.control.v1.ControlPlaneService/ReportProbes":     accessNode,
 	"/zro.control.v1.ControlPlaneService/DiscoverP2P":      accessNode,
 	"/zro.control.v1.ControlPlaneService/GetGatewayRoutes": accessNode,
+	"/zro.control.v1.ControlPlaneService/Deregister":       accessNode,
 	"/zro.control.v1.ControlPlaneService/RegisterTunnel":   accessNode,
 	"/zro.control.v1.ControlPlaneService/ListTunnels":      accessNode,
 	"/zro.control.v1.ControlPlaneService/DeleteTunnel":     accessNode,
@@ -56,8 +57,11 @@ func (s *Server) authorize(ctx context.Context, method string) (context.Context,
 		return ctx, status.Error(codes.Unauthenticated, "credentials required")
 	case need == accessNode && subject.Kind != controlauth.KindNode:
 		return ctx, status.Error(codes.PermissionDenied, "a node token is required")
-	case need == accessEdge && subject.Kind != controlauth.KindEdge:
-		return ctx, status.Error(codes.PermissionDenied, "an edge key is required")
+	case need == accessEdge && (subject.Kind != controlauth.KindEdge || subject.PoPCode == ""):
+		return ctx, status.Error(codes.PermissionDenied, "a per-PoP edge credential is required")
+	}
+	if n := subject.Node; n != nil {
+		s.svc.Touch(ctx, n)
 	}
 	return ctx, nil
 }

@@ -774,6 +774,14 @@ func TestPhase1AuthMatrix(t *testing.T) {
 		t.Fatalf("deleting own tunnel: got %d", code)
 	}
 
+	// Leaving the mesh invalidates the token and frees the node.
+	if code, _ := do("DELETE", "/api/v1/node", nodeB.NodeToken, nil); code != http.StatusNoContent {
+		t.Fatalf("deregister: got %d", code)
+	}
+	if code, _ := do("GET", "/api/v1/tunnels", nodeB.NodeToken, nil); code != http.StatusUnauthorized {
+		t.Fatalf("token of a deregistered node must be rejected, got %d", code)
+	}
+
 	// Mesh graph honors ownership; no cross-tenant default.
 	if code, _ := do("GET", "/api/v1/mesh/graph?network_id="+netA, keyB, nil); code != http.StatusForbidden {
 		t.Fatalf("graph of another tenant's network: got %d", code)
@@ -794,5 +802,86 @@ func TestPhase1AuthMatrix(t *testing.T) {
 	}
 	if code, _ := do("GET", "/api/v1/networks", rotated.APIKey, nil); code != http.StatusOK {
 		t.Fatalf("new key must work, got %d", code)
+	}
+}
+
+func TestEdgePoPClaimAndPerPoPCredentials(t *testing.T) {
+	db, err := store.NewDB("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(&config.ControlPlaneConfig{SecretKey: "s", EdgeAPIKey: "shared-edge-key", AdminAPIKey: "admin", RequireAuth: true}, db)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	call := func(method, path, bearer string, body any) (int, []byte) {
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest(method, ts.URL+path, bytes.NewReader(b))
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(resp.Body)
+		return resp.StatusCode, buf.Bytes()
+	}
+	kp, _ := crypto.GenerateKeyPair()
+	reg := func(code string) RegisterEdgePoPRequest {
+		return RegisterEdgePoPRequest{PoPCode: code, Region: "r", PublicEndpoint: "1.2.3.4:51820", PublicKey: kp.PublicKey}
+	}
+
+	// First registration claims the PoP and returns its own credential once.
+	code, body := call("POST", "/api/v1/edge/register", "shared-edge-key", reg("KH"))
+	var claimed struct {
+		PopKey string `json:"pop_key"`
+	}
+	_ = json.Unmarshal(body, &claimed)
+	if code != http.StatusOK || claimed.PopKey == "" {
+		t.Fatalf("claim: %d %s", code, body)
+	}
+
+	// The shared key can no longer touch a claimed PoP, nor use PoP-only endpoints.
+	if code, _ := call("POST", "/api/v1/edge/register", "shared-edge-key", reg("KH")); code != http.StatusForbidden {
+		t.Fatalf("shared key overwriting a claimed PoP: got %d", code)
+	}
+	if code, _ := call("POST", "/api/v1/edge/heartbeat", "shared-edge-key", EdgeHeartbeatRequest{PoPCode: "KH"}); code != http.StatusForbidden {
+		t.Fatalf("shared key on heartbeat: got %d", code)
+	}
+	if code, _ := call("GET", "/api/v1/edge/sync", "shared-edge-key", nil); code != http.StatusForbidden {
+		t.Fatalf("shared key on sync: got %d", code)
+	}
+
+	// The PoP's own credential works for itself and only for itself.
+	if code, _ := call("POST", "/api/v1/edge/register", claimed.PopKey, reg("KH")); code != http.StatusOK {
+		t.Fatalf("PoP refreshing its registration: got %d", code)
+	}
+	if code, _ := call("POST", "/api/v1/edge/heartbeat", claimed.PopKey, EdgeHeartbeatRequest{PoPCode: "KH"}); code != http.StatusOK {
+		t.Fatalf("PoP heartbeat: got %d", code)
+	}
+	_, _ = call("POST", "/api/v1/edge/register", "shared-edge-key", reg("SG"))
+	if code, _ := call("POST", "/api/v1/edge/heartbeat", claimed.PopKey, EdgeHeartbeatRequest{PoPCode: "SG"}); code != http.StatusForbidden {
+		t.Fatalf("KH credential used for SG: got %d", code)
+	}
+	if code, _ := call("POST", "/api/v1/edge/register", claimed.PopKey, reg("SG")); code != http.StatusForbidden {
+		t.Fatalf("KH credential registering SG: got %d", code)
+	}
+
+	// Graceful shutdown marks the PoP offline; an admin reset lets it be re-claimed.
+	if code, _ := call("POST", "/api/v1/edge/deregister", claimed.PopKey, nil); code != http.StatusNoContent {
+		t.Fatalf("deregister: got %d", code)
+	}
+	if pop, _ := db.EdgePoPs.GetByPoPCode(context.Background(), "KH"); pop.IsHealthy {
+		t.Fatal("deregistered PoP must be offline")
+	}
+	if code, _ := call("POST", "/api/v1/pops/KH/reset-key", "admin", nil); code != http.StatusNoContent {
+		t.Fatalf("reset: got %d", code)
+	}
+	if code, body := call("POST", "/api/v1/edge/register", "shared-edge-key", reg("KH")); code != http.StatusOK || !bytes.Contains(body, []byte("pop_key")) {
+		t.Fatalf("re-claim after reset: %d %s", code, body)
+	}
+	if code, _ := call("POST", "/api/v1/edge/heartbeat", claimed.PopKey, EdgeHeartbeatRequest{PoPCode: "KH"}); code != http.StatusUnauthorized {
+		t.Fatalf("the old credential must be dead after a reset, got %d", code)
 	}
 }

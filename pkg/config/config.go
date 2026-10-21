@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"github.com/cubis/zro/pkg/identity"
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 )
@@ -38,6 +40,8 @@ type ControlPlaneConfig struct {
 	EdgeAPIKey      string `mapstructure:"edge_api_key"`
 	// AdminAPIKey guards tenant administration; the tenant API is disabled when empty.
 	AdminAPIKey string `mapstructure:"admin_api_key"`
+	// NodeTTL is how long a node may stay silent before it is removed and its address freed; 0 disables reaping.
+	NodeTTL time.Duration `mapstructure:"node_ttl"`
 	// AllowedOrigins lists extra browser origins permitted to open event WebSockets (same-origin is always allowed).
 	AllowedOrigins []string `mapstructure:"allowed_origins"`
 }
@@ -58,6 +62,7 @@ type EdgeConfig struct {
 	InterfaceName       string `mapstructure:"interface_name"`
 	MTU                 int    `mapstructure:"mtu"`
 	WireGuardPrivateKey string `mapstructure:"wireguard_private_key"`
+	StateDir            string `mapstructure:"state_dir"` // persists the edge identity; empty = ephemeral
 	PlaneEndpoint       string `mapstructure:"plane_endpoint"`
 	PlaneTransport      string `mapstructure:"plane_transport"` // "rest" or "grpc"
 	PlaneGRPC           `mapstructure:",squash"`
@@ -77,6 +82,7 @@ type LocalTunnelConfig struct {
 // NodeConfig configures the zro-node client daemon.
 type NodeConfig struct {
 	Hostname            string `mapstructure:"hostname"`
+	StateDir            string `mapstructure:"state_dir"` // persists the WireGuard identity; empty = ephemeral
 	NetworkID           string `mapstructure:"network_id"`
 	EnrollmentToken     string `mapstructure:"enrollment_token"`
 	PlaneEndpoint       string `mapstructure:"plane_endpoint"`
@@ -103,6 +109,7 @@ type StaticRouteConfig struct {
 // GatewayConfig configures the reverse proxy and cloud-native load balancer.
 type GatewayConfig struct {
 	Hostname              string `mapstructure:"hostname"`
+	StateDir              string `mapstructure:"state_dir"` // persists the WireGuard identity; empty = ephemeral
 	PlaneEndpoint         string `mapstructure:"plane_endpoint"`
 	PlaneTransport        string `mapstructure:"plane_transport"` // "rest" or "grpc"
 	PlaneGRPC             `mapstructure:",squash"`
@@ -142,9 +149,13 @@ func Load(cfgFile string) (*AppConfig, error) {
 	v.SetDefault("control_plane.default_cidr_v6", "fd00:cafe::/64")
 	v.SetDefault("control_plane.sync_interval_ms", 1000)
 	v.SetDefault("control_plane.enable_gateway", false)
-	v.SetDefault("control_plane.grpc_listen_addr", ":9443")
+	v.SetDefault("control_plane.node_ttl", "168h")
+	v.SetDefault("control_plane.grpc_listen_addr", "") // opt in; requires TLS or grpc_insecure
 
 	// Edge defaults
+	v.SetDefault("edge.state_dir", identity.DefaultDir())
+	v.SetDefault("node.state_dir", identity.DefaultDir())
+	v.SetDefault("gateway.state_dir", identity.DefaultDir())
 	v.SetDefault("edge.pop_code", "KH")
 	v.SetDefault("edge.region", "Asia/Phnom_Penh")
 	v.SetDefault("edge.listen_port", 51820)

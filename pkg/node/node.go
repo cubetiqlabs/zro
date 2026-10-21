@@ -26,6 +26,7 @@ import (
 	"github.com/cubis/zro/pkg/dataplane/router"
 	"github.com/cubis/zro/pkg/dataplane/tun"
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
+	"github.com/cubis/zro/pkg/identity"
 	"github.com/cubis/zro/pkg/p2p/disco"
 	"github.com/cubis/zro/pkg/p2p/puncher"
 	"github.com/cubis/zro/pkg/p2p/stun"
@@ -78,9 +79,9 @@ type Daemon struct {
 
 // NewDaemon initializes a new node daemon.
 func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
-	kp, err := crypto.GenerateKeyPair()
+	kp, err := identity.LoadOrCreateKey(cfg.StateDir, "node.key")
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate WireGuard keypair: %w", err)
+		return nil, fmt.Errorf("failed to load WireGuard identity: %w", err)
 	}
 
 	var tunDev tun.Device
@@ -284,6 +285,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}
 
+	if d.cfg.NetworkID != "" && !strings.EqualFold(d.cfg.NetworkID, enrollResp.NetworkID) {
+		return fmt.Errorf("enrolled into network %s but network_id is configured as %s; check the enrollment token", enrollResp.NetworkID, d.cfg.NetworkID)
+	}
 	d.token.Set(enrollResp.NodeToken)
 	d.nodeID = enrollResp.NodeID
 	d.networkID = enrollResp.NetworkID
@@ -586,6 +590,28 @@ func (d *Daemon) Stop() error {
 		_ = d.grpcClient.Close()
 	}
 	d.wg.Wait()
+	return nil
+}
+
+// Leave permanently removes this node from the mesh, freeing its overlay
+// address and tunnels. It is deliberately not part of Stop: a restart must keep
+// the node's identity.
+func (d *Daemon) Leave(ctx context.Context) error {
+	if d.grpcClient != nil {
+		return d.grpcClient.Deregister(ctx)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, d.cfg.PlaneEndpoint+"/api/v1/node", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("deregister rejected: status %d", resp.StatusCode)
+	}
 	return nil
 }
 

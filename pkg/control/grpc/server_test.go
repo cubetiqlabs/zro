@@ -279,7 +279,7 @@ func testAuthenticator(db *store.DB, edgeKey string) Authenticator {
 		}
 		tok := strings.TrimPrefix(vals[0], "Bearer ")
 		if tok == edgeKey {
-			return controlauth.WithSubject(ctx, &controlauth.Subject{Kind: controlauth.KindEdge}), nil
+			return controlauth.WithSubject(ctx, &controlauth.Subject{Kind: controlauth.KindEdge, PoPCode: "KH"}), nil
 		}
 		node, err := db.Nodes.GetByTokenHash(ctx, controlauth.HashToken(tok))
 		if err != nil {

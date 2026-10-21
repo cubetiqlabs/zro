@@ -138,6 +138,17 @@ func (r *edgePoPRepo) GetByPoPCode(ctx context.Context, code string) (*core.Edge
 	return &pop, nil
 }
 
+func (r *edgePoPRepo) GetByKeyHash(ctx context.Context, keyHash string) (*core.EdgePoP, error) {
+	if keyHash == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var pop core.EdgePoP
+	if err := r.db.WithContext(ctx).First(&pop, "key_hash = ?", keyHash).Error; err != nil {
+		return nil, err
+	}
+	return &pop, nil
+}
+
 func (r *edgePoPRepo) ListHealthy(ctx context.Context) ([]core.EdgePoP, error) {
 	var pops []core.EdgePoP
 	err := r.db.WithContext(ctx).Where("is_healthy = ?", true).Order("weight desc").Find(&pops).Error
@@ -169,7 +180,11 @@ func newNodeRepo(db *gorm.DB) core.NodeRepository {
 }
 
 func (r *nodeRepo) Create(ctx context.Context, node *core.Node) error {
-	return r.db.WithContext(ctx).Create(node).Error
+	err := r.db.WithContext(ctx).Create(node).Error
+	if errors.Is(err, gorm.ErrDuplicatedKey) {
+		return core.ErrDuplicate
+	}
+	return err
 }
 
 func (r *nodeRepo) GetByID(ctx context.Context, id uuid.UUID) (*core.Node, error) {
@@ -186,6 +201,28 @@ func (r *nodeRepo) GetByPublicKey(ctx context.Context, pubKey string) (*core.Nod
 		return nil, err
 	}
 	return &node, nil
+}
+
+func (r *nodeRepo) GetByNetworkAndPublicKey(ctx context.Context, networkID, pubKey string) (*core.Node, error) {
+	var node core.Node
+	err := r.db.WithContext(ctx).Preload("AssignedPoP").First(&node, "network_id = ? AND public_key = ?", networkID, pubKey).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &node, nil
+}
+
+func (r *nodeRepo) TouchLastSeen(ctx context.Context, id uuid.UUID, at time.Time) error {
+	return r.db.WithContext(ctx).Model(&core.Node{}).Where("id = ?", id).Update("last_seen_at", at).Error
+}
+
+func (r *nodeRepo) ListStale(ctx context.Context, before time.Time, limit int) ([]core.Node, error) {
+	var nodes []core.Node
+	err := r.db.WithContext(ctx).Where("last_seen_at < ?", before).Order("last_seen_at").Limit(limit).Find(&nodes).Error
+	return nodes, err
 }
 
 func (r *nodeRepo) GetByTokenHash(ctx context.Context, tokenHash string) (*core.Node, error) {

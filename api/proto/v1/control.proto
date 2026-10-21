@@ -21,6 +21,9 @@ service ControlPlaneService {
   // Dynamic route discovery for Ingress Gateways
   rpc GetGatewayRoutes(GatewayRoutesRequest) returns (GatewayRoutesResponse);
 
+  // Leave the mesh: removes the calling node, its tunnels and its overlay address
+  rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
+
   // Ingress tunnels owned by the calling node (node token required)
   rpc RegisterTunnel(RegisterTunnelRequest) returns (Tunnel);
   rpc ListTunnels(ListTunnelsRequest) returns (ListTunnelsResponse);
@@ -183,3 +186,7 @@ message DeleteTunnelRequest {
 }
 
 message DeleteTunnelResponse {}
+
+message DeregisterRequest {}
+
+message DeregisterResponse {}

@@ -35,6 +35,7 @@ type EdgePoPRepository interface {
 	Create(ctx context.Context, pop *EdgePoP) error
 	GetByID(ctx context.Context, id uuid.UUID) (*EdgePoP, error)
 	GetByPoPCode(ctx context.Context, code string) (*EdgePoP, error)
+	GetByKeyHash(ctx context.Context, keyHash string) (*EdgePoP, error)
 	ListHealthy(ctx context.Context) ([]EdgePoP, error)
 	ListAll(ctx context.Context) ([]EdgePoP, error)
 	Update(ctx context.Context, pop *EdgePoP) error
@@ -46,6 +47,7 @@ type NodeRepository interface {
 	Create(ctx context.Context, node *Node) error
 	GetByID(ctx context.Context, id uuid.UUID) (*Node, error)
 	GetByPublicKey(ctx context.Context, pubKey string) (*Node, error)
+	GetByNetworkAndPublicKey(ctx context.Context, networkID, pubKey string) (*Node, error)
 	GetByTokenHash(ctx context.Context, tokenHash string) (*Node, error)
 	GetByOverlayIP(ctx context.Context, networkID string, overlayIP string) (*Node, error)
 	ListByNetworkID(ctx context.Context, networkID string) ([]Node, error)
@@ -53,6 +55,10 @@ type NodeRepository interface {
 	Update(ctx context.Context, node *Node) error
 	Delete(ctx context.Context, id uuid.UUID) error
 	ListAllocatedIPs(ctx context.Context, networkID string) ([]string, error)
+	// TouchLastSeen records liveness without rewriting the whole row.
+	TouchLastSeen(ctx context.Context, id uuid.UUID, at time.Time) error
+	// ListStale returns nodes not seen since before, oldest first.
+	ListStale(ctx context.Context, before time.Time, limit int) ([]Node, error)
 }
 
 // ACLRepository defines operations for Access Control Rules.
@@ -84,6 +90,9 @@ type TunnelRepository interface {
 }
 
 // ErrTokenReused is returned when an enrollment token was already redeemed by another key.
+// ErrDuplicate is returned when a create violates a unique constraint.
+var ErrDuplicate = errors.New("duplicate record")
+
 var ErrTokenReused = errors.New("enrollment token already used")
 
 // EnrollmentRepository tracks redeemed enrollment-token nonces.

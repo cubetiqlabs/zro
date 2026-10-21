@@ -89,6 +89,7 @@ type EdgePoP struct {
 	PublicEndpoint string    `gorm:"size:100;not null" json:"public_endpoint"` // e.g. "173.1.1.1:51820"
 	PublicKey      string    `gorm:"size:64;not null" json:"public_key"`
 	PrivateKey     string    `gorm:"size:64" json:"-"` // encrypted / kept local to PoP
+	KeyHash        string    `gorm:"size:64" json:"-"` // SHA-256 of the per-PoP credential issued at first registration
 	IsAnycast      bool      `gorm:"default:false" json:"is_anycast"`
 	Weight         int       `gorm:"default:100" json:"weight"`
 	IsHealthy      bool      `gorm:"default:true" json:"is_healthy"`
@@ -109,11 +110,11 @@ const (
 // Node represents an IPless client, agent, internal service, or gateway in the mesh.
 type Node struct {
 	ID            uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
-	NetworkID     string     `gorm:"size:16;not null;index" json:"network_id"`
+	NetworkID     string     `gorm:"size:16;not null;index;uniqueIndex:idx_node_network_pubkey;uniqueIndex:idx_node_network_ipv4" json:"network_id"`
 	Hostname      string     `gorm:"size:255;not null" json:"hostname"`
-	PublicKey     string     `gorm:"size:64;not null;index" json:"public_key"`
+	PublicKey     string     `gorm:"size:64;not null;uniqueIndex:idx_node_network_pubkey" json:"public_key"`
 	TokenHash     string     `gorm:"size:64;index" json:"-"`
-	OverlayIPv4   string     `gorm:"size:50;not null;index" json:"overlay_ipv4"`
+	OverlayIPv4   string     `gorm:"size:50;not null;uniqueIndex:idx_node_network_ipv4" json:"overlay_ipv4"`
 	OverlayIPv6   string     `gorm:"size:50;not null" json:"overlay_ipv6"`
 	AssignedPoPID *uuid.UUID `gorm:"type:uuid;index" json:"assigned_pop_id,omitempty"`
 	NodeType      NodeType   `gorm:"size:30;default:'peer'" json:"node_type"`

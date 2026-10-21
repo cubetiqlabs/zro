@@ -33,6 +33,8 @@ type Service struct {
 
 	ipamMu    sync.Mutex
 	ipamCache map[string]*ipam.IPAM // network ID -> allocator
+
+	lastTouch sync.Map // node ID -> time.Time of the last liveness write
 }
 
 // New creates a Service publishing change events to bus.
@@ -87,7 +89,13 @@ type EnrollResponse struct {
 	Peers        []core.Node     `json:"peers"`
 }
 
-// Enroll verifies the token and admits the node into its network.
+// maxAllocAttempts bounds retries when another replica claims the address we picked.
+const maxAllocAttempts = 8
+
+// Enroll verifies the token and admits the node into its network. It is
+// idempotent per (network, public key): re-enrolling the same key returns the
+// same node ID and overlay address with a fresh bearer token, so restarts do
+// not leak nodes or addresses.
 func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollResponse, error) {
 	grant, err := enroll.Authorize(ctx, s.cfg.SecretKey, s.db.Enrollments, enroll.Request{
 		Token: req.Token, PublicKey: req.PublicKey, Hostname: req.Hostname, NodeType: req.NodeType,
@@ -112,84 +120,37 @@ func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollRespons
 		return nil, newErr(KindForbidden, "network is inactive")
 	}
 
-	allocator, err := s.allocator(ctx, network)
-	if err != nil {
-		return nil, internal("IPAM initialization failed", err)
-	}
-	v4, err := allocator.AllocateNext()
-	if err != nil {
-		return nil, newErr(KindExhausted, "IP allocation failed: %v", err)
-	}
-	persisted := false
-	defer func() {
-		if !persisted { // give the address back if anything below fails
-			allocator.Release(v4)
-		}
-	}()
-
-	v6, err := ipam.DeriveIPv6(network.IPv6CIDR, v4)
-	if err != nil {
-		return nil, internal("IPv6 derivation failed", err)
-	}
-
 	token, tokenHash, err := controlauth.GenerateToken("zro_node_")
 	if err != nil {
 		return nil, internal("failed to generate node credentials", err)
 	}
 
-	nodeID := uuid.New()
+	node, err := s.admit(ctx, network, grant, req, tokenHash)
+	if err != nil {
+		return nil, err
+	}
+
+	// Seed delegation with the probes that came with the request.
 	for _, p := range req.Probes {
-		p.NodeID = nodeID
+		p.NodeID = node.ID
 		if p.Timestamp.IsZero() {
 			p.Timestamp = time.Now()
 		}
 		s.delegator.RecordProbe(p)
 	}
-
-	defaultDeny := true
-	if req.DefaultDeny != nil {
-		defaultDeny = *req.DefaultDeny
+	if res, err := s.delegator.Delegate(ctx, node.ID); err == nil && res != nil {
+		node.AssignedPoPID = &res.PrimaryPoP.ID
+		node.AssignedPoP = &res.PrimaryPoP
+		_ = s.db.Nodes.Update(ctx, node)
 	}
-
-	now := time.Now()
-	node := &core.Node{
-		ID:           nodeID,
-		NetworkID:    network.ID,
-		Hostname:     grant.Hostname,
-		PublicKey:    req.PublicKey,
-		TokenHash:    tokenHash,
-		OverlayIPv4:  v4,
-		OverlayIPv6:  v6,
-		NodeType:     grant.NodeType,
-		Tags:         req.Tags,
-		AllowedIPs:   core.StringList{v4 + "/32", v6 + "/128"},
-		AllowedPorts: req.AllowedPorts,
-		DefaultDeny:  defaultDeny,
-		Endpoints:    req.Endpoints,
-		IsActive:     true,
-		LastSeenAt:   now,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-	}
-
-	delegationRes, err := s.delegator.Delegate(ctx, nodeID)
-	if err == nil && delegationRes != nil {
-		node.AssignedPoPID = &delegationRes.PrimaryPoP.ID
-		node.AssignedPoP = &delegationRes.PrimaryPoP
-	}
-
-	if err := s.db.Nodes.Create(ctx, node); err != nil {
-		return nil, internal("failed to persist node", err)
-	}
-	persisted = true
 
 	peers, _ := s.db.Nodes.ListByNetworkID(ctx, network.ID)
 	resp := &EnrollResponse{
 		NodeID:       node.ID,
 		NetworkID:    network.ID,
 		NodeToken:    token,
-		OverlayIPv4:  v4,
-		OverlayIPv6:  v6,
+		OverlayIPv4:  node.OverlayIPv4,
+		OverlayIPv6:  node.OverlayIPv6,
 		DNSDomain:    network.DNSDomain,
 		MTU:          network.MTU,
 		AllowedIPs:   node.AllowedIPs,
@@ -197,9 +158,11 @@ func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollRespons
 		DefaultDeny:  node.DefaultDeny,
 		Peers:        peers,
 	}
-	if delegationRes != nil {
-		resp.PrimaryPoP = delegationRes.PrimaryPoP
-		resp.SecondaryPoP = delegationRes.SecondaryPoP
+	if node.AssignedPoP != nil {
+		resp.PrimaryPoP = *node.AssignedPoP
+		if res, err := s.delegator.Delegate(ctx, node.ID); err == nil && res != nil {
+			resp.SecondaryPoP = res.SecondaryPoP
+		}
 	}
 
 	scope := events.OfNetwork(network)
@@ -212,6 +175,114 @@ func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollRespons
 	})
 	s.publish(scope, "mesh_graph_updated", map[string]any{"network_id": network.ID})
 	return resp, nil
+}
+
+// admit returns the persisted node for this key: the existing one (refreshed)
+// or a new one with a unique overlay address. The database unique indexes on
+// (network, public key) and (network, address) are the arbiter, so concurrent
+// enrollments on several replicas cannot hand out the same address.
+func (s *Service) admit(ctx context.Context, network *core.Network, grant *enroll.Grant, req EnrollRequest, tokenHash string) (*core.Node, error) {
+	defaultDeny := true
+	if req.DefaultDeny != nil {
+		defaultDeny = *req.DefaultDeny
+	}
+	apply := func(n *core.Node) {
+		now := time.Now()
+		n.Hostname = grant.Hostname
+		n.TokenHash = tokenHash
+		n.Tags = req.Tags
+		n.Endpoints = req.Endpoints
+		n.AllowedPorts = req.AllowedPorts
+		n.DefaultDeny = defaultDeny
+		n.IsActive = true
+		n.LastSeenAt = now
+		n.UpdatedAt = now
+	}
+
+	readmit := func() (*core.Node, error) {
+		existing, err := s.db.Nodes.GetByNetworkAndPublicKey(ctx, network.ID, req.PublicKey)
+		if err != nil {
+			return nil, internal("failed to look up node", err)
+		}
+		if existing == nil {
+			return nil, nil
+		}
+		if existing.NodeType != grant.NodeType {
+			return nil, newErr(KindConflict, "this key is already enrolled as a %s", existing.NodeType)
+		}
+		apply(existing)
+		if err := s.db.Nodes.Update(ctx, existing); err != nil {
+			return nil, internal("failed to refresh node", err)
+		}
+		return existing, nil
+	}
+
+	if n, err := readmit(); n != nil || err != nil {
+		return n, err
+	}
+
+	for attempt := 0; attempt < maxAllocAttempts; attempt++ {
+		allocator, err := s.allocator(ctx, network)
+		if err != nil {
+			return nil, internal("IPAM initialization failed", err)
+		}
+		v4, err := allocator.AllocateNext()
+		if err != nil {
+			return nil, newErr(KindExhausted, "IP allocation failed: %v", err)
+		}
+		v6, err := ipam.DeriveIPv6(network.IPv6CIDR, v4)
+		if err != nil {
+			allocator.Release(v4)
+			return nil, internal("IPv6 derivation failed", err)
+		}
+
+		node := &core.Node{
+			ID:          uuid.New(),
+			NetworkID:   network.ID,
+			PublicKey:   req.PublicKey,
+			OverlayIPv4: v4,
+			OverlayIPv6: v6,
+			NodeType:    grant.NodeType,
+			AllowedIPs:  core.StringList{v4 + "/32", v6 + "/128"},
+			CreatedAt:   time.Now(),
+		}
+		apply(node)
+
+		err = s.db.Nodes.Create(ctx, node)
+		if err == nil {
+			return node, nil
+		}
+		if !errors.Is(err, core.ErrDuplicate) {
+			allocator.Release(v4)
+			return nil, internal("failed to persist node", err)
+		}
+
+		// Either a concurrent enrollment of this key won, or another replica took
+		// this address. Prefer the former; otherwise rebuild the allocator from
+		// the database (the source of truth) and pick again.
+		if n, err := readmit(); n != nil || err != nil {
+			allocator.Release(v4)
+			return n, err
+		}
+		s.dropAllocator(network.ID)
+	}
+	return nil, newErr(KindConflict, "could not allocate a unique overlay address; retry")
+}
+
+// dropAllocator discards a cached allocator so it is rebuilt from the database.
+func (s *Service) dropAllocator(networkID string) {
+	s.ipamMu.Lock()
+	delete(s.ipamCache, networkID)
+	s.ipamMu.Unlock()
+}
+
+// releaseIP returns an address to the cached allocator, if one is loaded.
+func (s *Service) releaseIP(networkID, ip string) {
+	s.ipamMu.Lock()
+	defer s.ipamMu.Unlock()
+	if a, ok := s.ipamCache[networkID]; ok {
+		a.Release(ip)
+	}
 }
 
 // allocator returns the cached IPAM allocator for a network.
@@ -540,4 +611,88 @@ func (s *Service) EdgeSync(ctx context.Context) ([]core.EdgePoP, []core.Node, er
 		}
 	}
 	return pops, nodes, nil
+}
+
+// --- Liveness and cleanup ------------------------------------------------
+
+const touchInterval = 30 * time.Second
+
+// Touch records that node is alive. Writes are throttled per node so
+// authenticated traffic does not turn into one UPDATE per request.
+func (s *Service) Touch(ctx context.Context, node *core.Node) {
+	now := time.Now()
+	if last, ok := s.lastTouch.Load(node.ID); ok && now.Sub(last.(time.Time)) < touchInterval {
+		return
+	}
+	s.lastTouch.Store(node.ID, now)
+	_ = s.db.Nodes.TouchLastSeen(ctx, node.ID, now)
+}
+
+// Deregister removes node, its tunnels and its overlay address.
+func (s *Service) Deregister(ctx context.Context, node *core.Node) error {
+	tunnels, err := s.db.Tunnels.ListByNodeID(ctx, node.ID)
+	if err != nil {
+		return internal("failed to list tunnels", err)
+	}
+	for _, t := range tunnels {
+		if err := s.db.Tunnels.Delete(ctx, t.ID); err != nil {
+			return internal("failed to delete tunnel", err)
+		}
+	}
+	if err := s.db.Nodes.Delete(ctx, node.ID); err != nil {
+		return internal("failed to delete node", err)
+	}
+
+	s.releaseIP(node.NetworkID, node.OverlayIPv4)
+	s.delegator.Forget(node.ID)
+	s.lastTouch.Delete(node.ID)
+
+	scope := s.scopeForNetwork(ctx, node.NetworkID)
+	s.publish(scope, "node_left", map[string]any{"network_id": node.NetworkID, "node_id": node.ID, "pubkey": node.PublicKey})
+	s.publish(scope, "mesh_graph_updated", map[string]any{"network_id": node.NetworkID})
+	if len(tunnels) > 0 {
+		s.publish(scope, "gateway_routes_updated", map[string]any{"network_id": node.NetworkID})
+	}
+	return nil
+}
+
+// Maintain runs periodic housekeeping until ctx ends: it reaps nodes unseen for
+// nodeTTL (0 disables reaping), drops expired enrollment redemptions and prunes
+// probe history.
+func (s *Service) Maintain(ctx context.Context, interval, nodeTTL time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.maintainOnce(ctx, nodeTTL)
+		}
+	}
+}
+
+func (s *Service) maintainOnce(ctx context.Context, nodeTTL time.Duration) int {
+	reaped := 0
+	if nodeTTL > 0 {
+		for {
+			stale, err := s.db.Nodes.ListStale(ctx, time.Now().Add(-nodeTTL), 100)
+			if err != nil || len(stale) == 0 {
+				break
+			}
+			progressed := false
+			for i := range stale {
+				if err := s.Deregister(ctx, &stale[i]); err == nil {
+					reaped++
+					progressed = true
+				}
+			}
+			if !progressed {
+				break
+			}
+		}
+	}
+	_ = s.db.Enrollments.PurgeExpired(ctx)
+	s.delegator.Prune(10 * time.Minute)
+	return reaped
 }

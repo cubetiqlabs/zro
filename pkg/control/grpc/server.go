@@ -246,6 +246,14 @@ func (s *Server) GetGatewayRoutes(ctx context.Context, _ *v1.GatewayRoutesReques
 	return out, nil
 }
 
+// Deregister removes the calling node from the mesh.
+func (s *Server) Deregister(ctx context.Context, _ *v1.DeregisterRequest) (*v1.DeregisterResponse, error) {
+	if err := s.svc.Deregister(ctx, node(ctx)); err != nil {
+		return nil, toStatus(err)
+	}
+	return &v1.DeregisterResponse{}, nil
+}
+
 // RegisterTunnel exposes a local service of the calling node.
 func (s *Server) RegisterTunnel(ctx context.Context, req *v1.RegisterTunnelRequest) (*v1.Tunnel, error) {
 	t, err := s.svc.RegisterTunnel(ctx, node(ctx), core.Tunnel{
