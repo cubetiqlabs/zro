@@ -1,12 +1,17 @@
 package wireguard
 
 import (
+	"encoding/base64"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/cubis/zro/pkg/dataplane/relay"
 	"golang.zx2c4.com/wireguard/conn"
 )
 
@@ -18,8 +23,9 @@ const stunMagicCookie = 0x2112A442
 type ControlPacketHandler func(pkt []byte, from *net.UDPAddr)
 
 type sharedPacket struct {
-	data []byte
-	from *net.UDPAddr
+	data     []byte
+	from     *net.UDPAddr
+	relaySrc *[relay.KeyLen]byte // set when the datagram arrived through the relay
 }
 
 // sharedBind implements conn.Bind on top of a caller-owned UDP socket. This
@@ -34,6 +40,8 @@ type sharedBind struct {
 	closed chan struct{}
 	recvCh chan sharedPacket
 	loopWG sync.WaitGroup
+
+	relay relay.Transport // optional fallback path; guarded by mu
 }
 
 func newSharedBind(udpConn *net.UDPConn, handler ControlPacketHandler) *sharedBind {
@@ -56,6 +64,9 @@ func (b *sharedBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	closed := b.closed
 	recvCh := b.recvCh
 	b.loopWG.Add(1)
+	if b.relay != nil {
+		b.startPumpLocked(b.relay)
+	}
 	b.mu.Unlock()
 
 	local, ok := b.conn.LocalAddr().(*net.UDPAddr)
@@ -82,7 +93,11 @@ func (b *sharedBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 			n := copy(bufs[0], pkt.data)
 			sizes[0] = n
 			if len(eps) > 0 {
-				eps[0] = &sharedEndpoint{addr: pkt.from}
+				if pkt.relaySrc != nil {
+					eps[0] = &relayEndpoint{key: *pkt.relaySrc}
+				} else {
+					eps[0] = &sharedEndpoint{addr: pkt.from}
+				}
 			}
 			return 1, nil
 		}
@@ -165,6 +180,20 @@ func (b *sharedBind) SetMark(mark uint32) error { return nil }
 
 // Send writes datagrams to the endpoint through the shared socket.
 func (b *sharedBind) Send(bufs [][]byte, ep conn.Endpoint) error {
+	if re, ok := ep.(*relayEndpoint); ok {
+		b.mu.Lock()
+		t := b.relay
+		b.mu.Unlock()
+		if t == nil {
+			return errNoRelay
+		}
+		for _, buf := range bufs {
+			if err := t.Send(re.key, buf); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	se, ok := ep.(*sharedEndpoint)
 	if !ok {
 		return conn.ErrWrongEndpointType
@@ -179,6 +208,15 @@ func (b *sharedBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 
 // ParseEndpoint converts "host:port" into a shared endpoint.
 func (b *sharedBind) ParseEndpoint(s string) (conn.Endpoint, error) {
+	if enc, ok := strings.CutPrefix(s, relayScheme); ok {
+		raw, err := base64.StdEncoding.DecodeString(enc)
+		if err != nil || len(raw) != relay.KeyLen {
+			return nil, fmt.Errorf("invalid relay endpoint %q", s)
+		}
+		var key [relay.KeyLen]byte
+		copy(key[:], raw)
+		return &relayEndpoint{key: key}, nil
+	}
 	addrPort, err := netip.ParseAddrPort(s)
 	if err != nil {
 		return nil, err
@@ -246,4 +284,87 @@ func IsWireGuardPacket(pkt []byte) bool {
 	default:
 		return false
 	}
+}
+
+// relayScheme prefixes endpoints that reach a peer through the relay:
+// "derp:<base64 public key>".
+const relayScheme = "derp:"
+
+var errNoRelay = errors.New("no relay transport attached")
+
+// RelayEndpoint returns the endpoint string that routes a peer's traffic
+// through the relay, for use in PeerConfig.Endpoint.
+func RelayEndpoint(peerPubKey string) string { return relayScheme + peerPubKey }
+
+// AttachRelay installs the relay used for peers whose endpoint is a relay
+// endpoint. It may be called before or after the bind opens, and again to
+// replace a transport that ended.
+func (b *sharedBind) AttachRelay(t relay.Transport) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.relay = t
+	if b.open {
+		b.startPumpLocked(t)
+	}
+}
+
+// DetachRelay removes t if it is still the attached transport.
+func (b *sharedBind) DetachRelay(t relay.Transport) {
+	b.mu.Lock()
+	if b.relay == t {
+		b.relay = nil
+	}
+	b.mu.Unlock()
+}
+
+// startPumpLocked forwards the relay's datagrams into WireGuard's receive
+// queue. b.mu must be held and the bind open.
+func (b *sharedBind) startPumpLocked(t relay.Transport) {
+	closed, recvCh := b.closed, b.recvCh
+	b.loopWG.Add(1)
+	go func() {
+		defer b.loopWG.Done()
+		in := t.Recv()
+		for {
+			select {
+			case <-closed:
+				return
+			case p, ok := <-in:
+				if !ok {
+					b.DetachRelay(t)
+					return
+				}
+				if !IsWireGuardPacket(p.Payload) {
+					continue // the relay only carries WireGuard traffic
+				}
+				src := p.SrcPubKey
+				select {
+				case recvCh <- sharedPacket{data: p.Payload, relaySrc: &src}:
+				default:
+				}
+			}
+		}
+	}()
+}
+
+// relayEndpoint addresses a peer by public key through the relay.
+type relayEndpoint struct {
+	key [relay.KeyLen]byte
+}
+
+func (e *relayEndpoint) ClearSrc()           {}
+func (e *relayEndpoint) SrcToString() string { return "" }
+func (e *relayEndpoint) SrcIP() netip.Addr   { return netip.Addr{} }
+func (e *relayEndpoint) DstToString() string {
+	return relayScheme + base64.StdEncoding.EncodeToString(e.key[:])
+}
+func (e *relayEndpoint) DstToBytes() []byte { return e.key[:] }
+
+// DstIP is a stable synthetic address (unique local range) so WireGuard's
+// per-source handshake rate limiter keeps relay peers apart.
+func (e *relayEndpoint) DstIP() netip.Addr {
+	var a [16]byte
+	a[0], a[1] = 0xfd, 0xde
+	copy(a[2:], e.key[:14])
+	return netip.AddrFrom16(a)
 }

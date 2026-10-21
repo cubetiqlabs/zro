@@ -22,7 +22,6 @@ import (
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
-	"github.com/cubis/zro/pkg/dataplane/derp"
 	"github.com/cubis/zro/pkg/dataplane/netcfg"
 	"github.com/cubis/zro/pkg/dataplane/router"
 	"github.com/cubis/zro/pkg/dataplane/tun"
@@ -54,7 +53,7 @@ type Daemon struct {
 	routingTable    *router.Table
 	udpConn         *net.UDPConn
 	discoEngine     *disco.Engine
-	derpClient      *derp.Client
+	relay           *relayState
 	tunnelClient    *tunnel.Client
 	httpClient      *http.Client
 	token           controlauth.TokenHolder // bearer token issued at enrollment
@@ -122,6 +121,7 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 		defaultDeny:   cfg.DefaultDeny,
 		meshListeners: make(map[int]*guardedListener),
 		stunWaiters:   make(map[[12]byte]chan *stun.ReflexiveAddress),
+		relay:         newRelayState(),
 		punchWaiters:  make(map[string]chan struct{}),
 	}
 
@@ -335,7 +335,8 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}
 
 	// 6. Launch background workers (latency probes & local tunnels)
-	d.wg.Add(3)
+	d.wg.Add(4)
+	go d.relayWorker(ctx)
 	go d.probeWorker(ctx)
 	go d.tunnelWorker(ctx)
 	go d.realtimeListener(ctx)
@@ -592,9 +593,6 @@ func (d *Daemon) Stop() error {
 	if d.tunDev != nil {
 		_ = d.tunDev.Close()
 	}
-	if d.derpClient != nil {
-		_ = d.derpClient.Close()
-	}
 	if d.grpcClient != nil {
 		_ = d.grpcClient.Close()
 	}
@@ -629,22 +627,11 @@ func (d *Daemon) connectToEdgePoP(pop core.EdgePoP) error {
 		return nil
 	}
 
-	// Establish DERP encrypted packet relay client connection if endpoint is reachable
-	if pop.PublicEndpoint != "" && d.derpClient == nil {
-		go func() {
-			dialCtx, dialCancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer dialCancel()
-			dc, err := derp.ConnectDERP(dialCtx, pop.PublicEndpoint, d.keyPair)
-			if err == nil {
-				d.derpClient = dc
-				slog.Info("Connected to Edge DERP relay fallback", "pop", pop.PoPCode, "endpoint", pop.PublicEndpoint)
-			}
-		}()
-	}
+	d.relay.target(pop)
 
 	// Route overlay traffic through the PoP by default; direct peers override
 	// it with their longer prefixes.
-	return d.popLink.Connect(pop, d.overlayPrefixes)
+	return d.applyPath(pop, pathUDP)
 }
 
 // DiscoverAndConnectPeer implements Section 5 Packet Flow & Smart Routing:
@@ -774,6 +761,15 @@ func (d *Daemon) probeWorker(ctx context.Context) {
 				consecutiveFails = 0
 			}
 
+			// UDP blocked but the TCP relay works: tunnel WireGuard through it.
+			d.relay.mu.Lock()
+			cur := d.relay.mode
+			d.relay.mu.Unlock()
+			if want := nextPath(cur, err == nil, consecutiveFails, d.relay.isUp()); want != cur {
+				slog.Warn("Edge PoP path changed", "pop", primary.PoPCode, "relay", want == pathRelay)
+				_ = d.applyPath(primary, want)
+			}
+
 			// Report probe telemetry to Control Plane
 			sample := core.LatencySample{
 				NodeID:     d.nodeID,
@@ -786,7 +782,7 @@ func (d *Daemon) probeWorker(ctx context.Context) {
 			d.reportProbe(ctx, sample)
 
 			// Failover to secondary Edge PoP if primary is unreachable (consecutive failures >= 2)
-			if consecutiveFails >= 2 && secondary != nil && secondary.PublicEndpoint != "" {
+			if consecutiveFails >= 2 && !d.relay.isUp() && secondary != nil && secondary.PublicEndpoint != "" {
 				slog.Warn("Primary Edge PoP degraded/unreachable, failing over to secondary Edge PoP",
 					"old_primary", primary.PoPCode,
 					"new_primary", secondary.PoPCode)

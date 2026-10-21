@@ -3,6 +3,7 @@ package wireguard
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cubis/zro/pkg/dataplane/relay"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
@@ -320,6 +322,16 @@ func (m *Manager) Reconcile(desired []PeerConfig) error {
 		}
 	}
 	return firstErr
+}
+
+// AttachRelay installs a relay transport (DERP) for peers configured with a
+// RelayEndpoint. It requires the shared-socket bind.
+func (m *Manager) AttachRelay(t relay.Transport) error {
+	if m.sharedBind == nil {
+		return errors.New("relay requires a shared-socket userspace device")
+	}
+	m.sharedBind.AttachRelay(t)
+	return nil
 }
 
 // RemovePeer removes a peer from the WireGuard interface.

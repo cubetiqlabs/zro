@@ -1,6 +1,7 @@
 package edge
 
 import (
+	"encoding/base64"
 	"testing"
 
 	"github.com/cubis/zro/pkg/core"
@@ -72,5 +73,27 @@ func TestPlanPeersRoutesRemoteNodesViaTheirHomePoP(t *testing.T) {
 			}
 			seen[ip] = p.PublicKey
 		}
+	}
+}
+
+func TestRelayAuthorizationFailsClosedAndKnowsTheMesh(t *testing.T) {
+	e := &PoPDaemon{}
+	var anyKey [32]byte
+	if e.isKnownKey(anyKey) {
+		t.Fatal("before the first sync nobody may use the relay")
+	}
+
+	nodeKey := make([]byte, 32)
+	nodeKey[0] = 7
+	st := &meshState{Nodes: []core.Node{{PublicKey: base64.StdEncoding.EncodeToString(nodeKey)}}, PoPs: []core.EdgePoP{{PublicKey: "not-base64!"}}}
+	e.knownKeys.Store(knownKeySet(st))
+
+	var known [32]byte
+	copy(known[:], nodeKey)
+	if !e.isKnownKey(known) {
+		t.Fatal("a mesh node must be allowed")
+	}
+	if e.isKnownKey([32]byte{1}) {
+		t.Fatal("an unknown key must be refused")
 	}
 }

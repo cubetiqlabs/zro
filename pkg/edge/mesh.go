@@ -2,6 +2,7 @@ package edge
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -149,6 +150,7 @@ func (e *PoPDaemon) syncMeshTopology(ctx context.Context) {
 	e.peersMu.Lock()
 	e.peerCount = len(st.Nodes)
 	e.peersMu.Unlock()
+	e.knownKeys.Store(knownKeySet(st))
 
 	if err := e.wgManager.Reconcile(planPeers(e.cfg.PoPCode, st)); err != nil {
 		slog.Warn("Edge peer reconcile reported an error", "error", err)
@@ -165,4 +167,34 @@ func (e *PoPDaemon) syncMeshTopology(ctx context.Context) {
 		}
 		e.routed[cidr] = true
 	}
+}
+
+// knownKeySet collects the public keys of every node and PoP in the mesh.
+func knownKeySet(st *meshState) *map[[32]byte]struct{} {
+	keys := make(map[[32]byte]struct{}, len(st.Nodes)+len(st.PoPs))
+	add := func(b64 string) {
+		if raw, err := base64.StdEncoding.DecodeString(b64); err == nil && len(raw) == 32 {
+			var k [32]byte
+			copy(k[:], raw)
+			keys[k] = struct{}{}
+		}
+	}
+	for _, n := range st.Nodes {
+		add(n.PublicKey)
+	}
+	for _, p := range st.PoPs {
+		add(p.PublicKey)
+	}
+	return &keys
+}
+
+// isKnownKey authorizes a relay client. Until the first sync nobody is known,
+// so the relay fails closed rather than open.
+func (e *PoPDaemon) isKnownKey(pub [32]byte) bool {
+	keys := e.knownKeys.Load()
+	if keys == nil {
+		return false
+	}
+	_, ok := (*keys)[pub]
+	return ok
 }

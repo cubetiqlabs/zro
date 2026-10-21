@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cubis/zro/pkg/config"
@@ -40,6 +41,7 @@ type PoPDaemon struct {
 	popKey       controlauth.TokenHolder // per-PoP credential issued at first registration
 	grpcClient   *controlgrpc.Client
 	peerCount    int
+	knownKeys    atomic.Pointer[map[[32]byte]struct{}] // public keys allowed on the DERP relay
 	peersMu      sync.RWMutex
 
 	cancel context.CancelFunc
@@ -169,6 +171,13 @@ func (e *PoPDaemon) Start(ctx context.Context) error {
 	// Launch DERP Encrypted Packet Relay server over TCP
 	derpSrv, err := derp.NewServer(e.keyPair)
 	if err == nil {
+		// Only keys the mesh knows (nodes and PoPs) may use the relay.
+		derpSrv.Authorize = e.isKnownKey
+		// The PoP's own WireGuard device is reachable through the relay too, so
+		// nodes behind UDP-hostile networks can still handshake with it.
+		if err := e.wgManager.AttachRelay(derpSrv.Local()); err != nil {
+			slog.Warn("DERP relay could not be attached to the edge WireGuard device", "error", err)
+		}
 		e.derpServer = derpSrv
 		tcpListener, err := net.Listen("tcp", listenAddr)
 		if err == nil {

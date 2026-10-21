@@ -2,6 +2,9 @@ package derp
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -10,8 +13,11 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/cubis/zro/pkg/crypto"
+	"github.com/cubis/zro/pkg/dataplane/relay"
+	"golang.org/x/crypto/curve25519"
 )
 
 // DERP Frame Types
@@ -33,13 +39,31 @@ var (
 	ErrClientNotFound = errors.New("derp: destination client not connected to relay")
 )
 
-// Server is a high-performance DERP relay server running on Edge PoPs.
+// Packet is a datagram relayed from a peer; see relay.Packet.
+type Packet = relay.Packet
+
+const (
+	handshakeTimeout = 5 * time.Second
+	idleTimeout      = 60 * time.Second // a healthy client keeps the session alive well within this
+	keepAliveEvery   = 20 * time.Second
+	nonceLen         = 16
+)
+
+// Server is a DERP relay running on Edge PoPs. Clients prove possession of
+// their WireGuard private key during the handshake, and the relay forwards
+// only between authenticated sessions.
 type Server struct {
 	keyPair  *crypto.KeyPair
+	privKey  [KeyLen]byte
 	pubKey   [KeyLen]byte
 	mu       sync.RWMutex
 	clients  map[[KeyLen]byte]*clientSession
 	listener net.Listener
+	local    *localEndpoint
+
+	// Authorize, if set, decides which authenticated public keys may use the
+	// relay. Without it any holder of a valid key pair is admitted.
+	Authorize func(pub [KeyLen]byte) bool
 }
 
 type clientSession struct {
@@ -48,23 +72,39 @@ type clientSession struct {
 	mu     sync.Mutex
 }
 
+func (c *clientSession) write(frame []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(handshakeTimeout))
+	return writeFrame(c.conn, frame)
+}
+
 // NewServer creates a new DERP relay server.
 func NewServer(kp *crypto.KeyPair) (*Server, error) {
-	pubBytes, err := parseKey(kp.PublicKey)
+	pub, err := parseKey(kp.PublicKey)
 	if err != nil {
 		return nil, fmt.Errorf("invalid server public key: %w", err)
 	}
-
-	return &Server{
-		keyPair: kp,
-		pubKey:  pubBytes,
-		clients: make(map[[KeyLen]byte]*clientSession),
-	}, nil
+	priv, err := parseKey(kp.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server private key: %w", err)
+	}
+	s := &Server{keyPair: kp, privKey: priv, pubKey: pub, clients: make(map[[KeyLen]byte]*clientSession)}
+	s.local = newLocalEndpoint(s)
+	return s, nil
 }
+
+// Local returns the relay endpoint of the server's own key: datagrams that
+// clients address to the PoP arrive on its Recv, and Send reaches a client.
+// The PoP's WireGuard device attaches to it so peers behind UDP-hostile
+// networks can still handshake with the PoP.
+func (s *Server) Local() relay.Transport { return s.local }
 
 // Serve accepts incoming DERP client connections.
 func (s *Server) Serve(l net.Listener) error {
+	s.mu.Lock()
 	s.listener = l
+	s.mu.Unlock()
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -76,41 +116,68 @@ func (s *Server) Serve(l net.Listener) error {
 
 // Close terminates the DERP server.
 func (s *Server) Close() error {
-	if s.listener != nil {
-		return s.listener.Close()
+	s.mu.Lock()
+	l := s.listener
+	s.mu.Unlock()
+	if l != nil {
+		return l.Close()
 	}
 	return nil
 }
 
+// authMAC binds a handshake to the server nonce and the client key using the
+// X25519 shared secret, which only the holder of the client's private key (or
+// the server) can compute.
+func authMAC(shared, nonce []byte, clientPub [KeyLen]byte) []byte {
+	mac := hmac.New(sha256.New, shared)
+	mac.Write([]byte("zro-derp-v1"))
+	mac.Write(nonce)
+	mac.Write(clientPub[:])
+	return mac.Sum(nil)
+}
+
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 
-	// 1. Send FrameServerInfo containing server's public key
-	serverInfo := make([]byte, 1+KeyLen)
-	serverInfo[0] = FrameServerInfo
-	copy(serverInfo[1:], s.pubKey[:])
+	// 1. ServerInfo: [type][server pub][nonce]
+	nonce := make([]byte, nonceLen)
+	if _, err := rand.Read(nonce); err != nil {
+		return
+	}
+	serverInfo := make([]byte, 0, 1+KeyLen+nonceLen)
+	serverInfo = append(serverInfo, FrameServerInfo)
+	serverInfo = append(serverInfo, s.pubKey[:]...)
+	serverInfo = append(serverInfo, nonce...)
 	if err := writeFrame(conn, serverInfo); err != nil {
 		return
 	}
 
-	// 2. Read FrameClientInfo with client's public key
+	// 2. ClientInfo: [type][client pub][mac] with proof of key possession.
 	frame, err := readFrame(conn)
-	if err != nil || len(frame) < 1+KeyLen || frame[0] != FrameClientInfo {
+	if err != nil || len(frame) != 1+KeyLen+sha256.Size || frame[0] != FrameClientInfo {
+		return
+	}
+	var clientPubKey [KeyLen]byte
+	copy(clientPubKey[:], frame[1:1+KeyLen])
+	shared, err := curve25519.X25519(s.privKey[:], clientPubKey[:])
+	if err != nil || !hmac.Equal(frame[1+KeyLen:], authMAC(shared, nonce, clientPubKey)) {
+		return
+	}
+	if s.Authorize != nil && !s.Authorize(clientPubKey) {
+		return
+	}
+	if clientPubKey == s.pubKey {
 		return
 	}
 
-	var clientPubKey [KeyLen]byte
-	copy(clientPubKey[:], frame[1:1+KeyLen])
-
-	session := &clientSession{
-		pubKey: clientPubKey,
-		conn:   conn,
-	}
-
+	session := &clientSession{pubKey: clientPubKey, conn: conn}
 	s.mu.Lock()
+	if old := s.clients[clientPubKey]; old != nil {
+		_ = old.conn.Close() // a reconnect replaces the stale session
+	}
 	s.clients[clientPubKey] = session
 	s.mu.Unlock()
-
 	defer func() {
 		s.mu.Lock()
 		if s.clients[clientPubKey] == session {
@@ -121,8 +188,10 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	slog.Debug("DERP client connected to relay", "pubkey", fmt.Sprintf("%x", clientPubKey[:8]))
 
-	// 3. Packet switching loop
+	// 3. Packet switching loop. The source key of relayed packets is always the
+	// authenticated session key, never anything the client wrote.
 	for {
+		_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
 		frame, err := readFrame(conn)
 		if err != nil {
 			return
@@ -133,7 +202,6 @@ func (s *Server) handleConn(conn net.Conn) {
 
 		switch frame[0] {
 		case FrameSendPacket:
-			// Frame: [Type 1B][DstPubKey 32B][Payload NB]
 			if len(frame) < 1+KeyLen {
 				continue
 			}
@@ -141,30 +209,65 @@ func (s *Server) handleConn(conn net.Conn) {
 			copy(dstKey[:], frame[1:1+KeyLen])
 			payload := frame[1+KeyLen:]
 
+			if dstKey == s.pubKey {
+				s.local.deliver(clientPubKey, payload)
+				continue
+			}
 			s.mu.RLock()
-			targetSession, exists := s.clients[dstKey]
+			target := s.clients[dstKey]
 			s.mu.RUnlock()
-
-			if exists {
-				// Relay packet to destination client: [FrameRecvPacket][SrcKey][Payload]
-				out := make([]byte, 1+KeyLen+len(payload))
-				out[0] = FrameRecvPacket
-				copy(out[1:1+KeyLen], clientPubKey[:])
-				copy(out[1+KeyLen:], payload)
-
-				targetSession.mu.Lock()
-				_ = writeFrame(targetSession.conn, out)
-				targetSession.mu.Unlock()
+			if target != nil {
+				_ = target.write(recvFrame(clientPubKey, payload))
 			}
 
 		case FramePing:
-			// Respond with Pong
-			_ = writeFrame(conn, []byte{FramePong})
+			_ = session.write([]byte{FramePong})
 
 		case FrameKeepAlive:
-			// No-op keepalive
+			// Receiving it refreshed the idle deadline.
 		}
 	}
+}
+
+func recvFrame(src [KeyLen]byte, payload []byte) []byte {
+	out := make([]byte, 1+KeyLen+len(payload))
+	out[0] = FrameRecvPacket
+	copy(out[1:1+KeyLen], src[:])
+	copy(out[1+KeyLen:], payload)
+	return out
+}
+
+// localEndpoint is the server's own address on the relay.
+type localEndpoint struct {
+	srv    *Server
+	recvCh chan Packet
+}
+
+func newLocalEndpoint(s *Server) *localEndpoint {
+	return &localEndpoint{srv: s, recvCh: make(chan Packet, 256)}
+}
+
+func (l *localEndpoint) deliver(src [KeyLen]byte, payload []byte) {
+	pkt := Packet{SrcPubKey: src, Payload: append([]byte(nil), payload...)}
+	select {
+	case l.recvCh <- pkt:
+	default: // WireGuard retransmits; never block a client's session on the PoP
+	}
+}
+
+func (l *localEndpoint) Recv() <-chan Packet { return l.recvCh }
+
+func (l *localEndpoint) Send(dst [KeyLen]byte, packet []byte) error {
+	if len(packet) > MaxPacketLen {
+		return ErrPacketTooLarge
+	}
+	l.srv.mu.RLock()
+	target := l.srv.clients[dst]
+	l.srv.mu.RUnlock()
+	if target == nil {
+		return ErrClientNotFound
+	}
+	return target.write(recvFrame(l.srv.pubKey, packet))
 }
 
 // Client is a DERP relay client running inside zro-node.
@@ -176,17 +279,17 @@ type Client struct {
 	mu         sync.Mutex
 	recvCh     chan Packet
 	closed     chan struct{}
+	closeOnce  sync.Once
 }
 
-// Packet represents an encapsulated packet received from a peer via DERP.
-type Packet struct {
-	SrcPubKey [KeyLen]byte
-	Payload   []byte
-}
-
-// ConnectDERP connects to an Edge DERP relay server.
+// ConnectDERP connects to an Edge DERP relay server and proves possession of
+// kp's private key.
 func ConnectDERP(ctx context.Context, serverAddr string, kp *crypto.KeyPair) (*Client, error) {
 	pubBytes, err := parseKey(kp.PublicKey)
+	if err != nil {
+		return nil, err
+	}
+	privBytes, err := parseKey(kp.PrivateKey)
 	if err != nil {
 		return nil, err
 	}
@@ -196,33 +299,40 @@ func ConnectDERP(ctx context.Context, serverAddr string, kp *crypto.KeyPair) (*C
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial DERP server %s: %w", serverAddr, err)
 	}
+	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 
-	// Read ServerInfo
 	frame, err := readFrame(conn)
-	if err != nil || len(frame) < 1+KeyLen || frame[0] != FrameServerInfo {
+	if err != nil || len(frame) != 1+KeyLen+nonceLen || frame[0] != FrameServerInfo {
 		conn.Close()
 		return nil, fmt.Errorf("invalid DERP server handshake")
 	}
+	serverPub, nonce := frame[1:1+KeyLen], frame[1+KeyLen:]
 
-	// Send ClientInfo
-	clientInfo := make([]byte, 1+KeyLen)
-	clientInfo[0] = FrameClientInfo
-	copy(clientInfo[1:], pubBytes[:])
+	shared, err := curve25519.X25519(privBytes[:], serverPub)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("DERP key agreement failed: %w", err)
+	}
+	clientInfo := make([]byte, 0, 1+KeyLen+sha256.Size)
+	clientInfo = append(clientInfo, FrameClientInfo)
+	clientInfo = append(clientInfo, pubBytes[:]...)
+	clientInfo = append(clientInfo, authMAC(shared, nonce, pubBytes)...)
 	if err := writeFrame(conn, clientInfo); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to send DERP client handshake: %w", err)
 	}
+	_ = conn.SetDeadline(time.Time{})
 
 	c := &Client{
 		serverAddr: serverAddr,
 		keyPair:    kp,
 		myPubKey:   pubBytes,
 		conn:       conn,
-		recvCh:     make(chan Packet, 64),
+		recvCh:     make(chan Packet, 256),
 		closed:     make(chan struct{}),
 	}
-
 	go c.readLoop()
+	go c.keepAlive()
 	return c, nil
 }
 
@@ -239,22 +349,46 @@ func (c *Client) Send(dstPubKey [KeyLen]byte, packet []byte) error {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(handshakeTimeout))
 	return writeFrame(c.conn, frame)
 }
 
-// Recv returns a channel receiving packets relayed from peers.
-func (c *Client) Recv() <-chan Packet {
-	return c.recvCh
-}
+// Recv returns a channel receiving packets relayed from peers. It is closed
+// when the connection ends.
+func (c *Client) Recv() <-chan Packet { return c.recvCh }
+
+// Done is closed when the connection to the relay has ended.
+func (c *Client) Done() <-chan struct{} { return c.closed }
 
 // Close disconnects from the DERP relay.
 func (c *Client) Close() error {
-	close(c.closed)
+	c.closeOnce.Do(func() { close(c.closed) })
 	return c.conn.Close()
+}
+
+func (c *Client) keepAlive() {
+	ticker := time.NewTicker(keepAliveEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.closed:
+			return
+		case <-ticker.C:
+			c.mu.Lock()
+			_ = c.conn.SetWriteDeadline(time.Now().Add(handshakeTimeout))
+			err := writeFrame(c.conn, []byte{FrameKeepAlive})
+			c.mu.Unlock()
+			if err != nil {
+				_ = c.Close()
+				return
+			}
+		}
+	}
 }
 
 func (c *Client) readLoop() {
 	defer close(c.recvCh)
+	defer c.closeOnce.Do(func() { close(c.closed) })
 	for {
 		frame, err := readFrame(c.conn)
 		if err != nil {
@@ -272,8 +406,7 @@ func (c *Client) readLoop() {
 
 			select {
 			case c.recvCh <- Packet{SrcPubKey: srcKey, Payload: payload}:
-			case <-c.closed:
-				return
+			default: // WireGuard retransmits; do not stall the connection
 			}
 		}
 	}

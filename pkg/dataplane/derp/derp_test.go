@@ -79,3 +79,142 @@ func TestDERPRelayRoundtrip(t *testing.T) {
 		t.Fatalf("timeout waiting for relayed DERP packet on Client B")
 	}
 }
+
+func startServer(t *testing.T, mutate func(*Server)) (*Server, string) {
+	t.Helper()
+	kp, _ := crypto.GenerateKeyPair()
+	srv, err := NewServer(kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutate != nil {
+		mutate(srv)
+	}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(l) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return srv, l.Addr().String()
+}
+
+func TestHandshakeRejectsKeyImpersonation(t *testing.T) {
+	_, addr := startServer(t, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	victim, _ := crypto.GenerateKeyPair()
+	attacker, _ := crypto.GenerateKeyPair()
+	vc, err := ConnectDERP(ctx, addr, victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vc.Close()
+
+	// The attacker claims the victim's public key but only holds its own private key.
+	forged := &crypto.KeyPair{PublicKey: victim.PublicKey, PrivateKey: attacker.PrivateKey}
+	ac, err := ConnectDERP(ctx, addr, forged)
+	if err == nil {
+		// The server drops the connection after the failed proof; the client
+		// notices on its first read.
+		select {
+		case <-ac.Done():
+		case <-time.After(2 * time.Second):
+			t.Fatal("a client that cannot prove its key must be disconnected")
+		}
+		ac.Close()
+	}
+
+	// The victim's session must be untouched and still reachable.
+	peer, _ := crypto.GenerateKeyPair()
+	pc, err := ConnectDERP(ctx, addr, peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	victimKey, _ := parseKey(victim.PublicKey)
+	time.Sleep(50 * time.Millisecond)
+	if err := pc.Send(victimKey, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case pkt := <-vc.Recv():
+		if string(pkt.Payload) != "hello" {
+			t.Fatalf("unexpected payload %q", pkt.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the victim's session was hijacked or dropped")
+	}
+}
+
+func TestAuthorizeHookGatesTheRelay(t *testing.T) {
+	allowed, _ := crypto.GenerateKeyPair()
+	denied, _ := crypto.GenerateKeyPair()
+	allowedKey, _ := parseKey(allowed.PublicKey)
+	_, addr := startServer(t, func(s *Server) { s.Authorize = func(k [KeyLen]byte) bool { return k == allowedKey } })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ok, err := ConnectDERP(ctx, addr, allowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ok.Close()
+
+	no, err := ConnectDERP(ctx, addr, denied)
+	if err == nil {
+		defer no.Close()
+		select {
+		case <-no.Done():
+		case <-time.After(2 * time.Second):
+			t.Fatal("an unauthorized key must be disconnected")
+		}
+	}
+}
+
+func TestServerLocalEndpointRoundtrip(t *testing.T) {
+	srv, addr := startServer(t, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	kp, _ := crypto.GenerateKeyPair()
+	c, err := ConnectDERP(ctx, addr, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	// client -> server's own key
+	if err := c.Send(srv.pubKey, []byte("to-pop")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case pkt := <-srv.Local().Recv():
+		clientKey, _ := parseKey(kp.PublicKey)
+		if string(pkt.Payload) != "to-pop" || pkt.SrcPubKey != clientKey {
+			t.Fatalf("unexpected local packet %+v", pkt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("packet addressed to the PoP never reached its local endpoint")
+	}
+
+	// server -> client
+	clientKey, _ := parseKey(kp.PublicKey)
+	if err := srv.Local().Send(clientKey, []byte("from-pop")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case pkt := <-c.Recv():
+		if string(pkt.Payload) != "from-pop" || pkt.SrcPubKey != srv.pubKey {
+			t.Fatalf("unexpected packet %+v", pkt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("PoP reply never arrived")
+	}
+	if err := srv.Local().Send([32]byte{9}, []byte("x")); err != ErrClientNotFound {
+		t.Fatalf("expected ErrClientNotFound, got %v", err)
+	}
+}
