@@ -11,12 +11,9 @@ import (
 
 // Device represents an abstract TUN interface (native OS or userspace channel).
 type Device interface {
-	Name() string
-	Read(packets [][]byte, sizes []int, offset int) (int, error)
-	Write(packets [][]byte, offset int) (int, error)
-	MTU() (int, error)
-	Close() error
+	tun.Device
 	IsSimulated() bool
+	DeviceName() string
 }
 
 type osDevice struct {
@@ -24,7 +21,10 @@ type osDevice struct {
 	name string
 }
 
-func (d *osDevice) Name() string {
+func (d *osDevice) DeviceName() string {
+	if n, err := d.Device.Name(); err == nil {
+		return n
+	}
 	return d.name
 }
 
@@ -34,12 +34,13 @@ func (d *osDevice) IsSimulated() bool {
 
 // MemoryDevice is a userspace memory-backed TUN device used in unprivileged containers or unit tests.
 type MemoryDevice struct {
-	mu     sync.Mutex
-	name   string
-	mtu    int
-	inCh   chan []byte
-	outCh  chan []byte
-	closed bool
+	mu      sync.Mutex
+	name    string
+	mtu     int
+	inCh    chan []byte
+	outCh   chan []byte
+	eventCh chan tun.Event
+	closed  bool
 }
 
 // NewMemoryDevice creates a memory-backed userspace TUN device.
@@ -47,17 +48,29 @@ func NewMemoryDevice(name string, mtu int) *MemoryDevice {
 	if mtu <= 0 {
 		mtu = 1420
 	}
+	eventCh := make(chan tun.Event, 1)
+	eventCh <- tun.EventUp
+
 	return &MemoryDevice{
-		name:  name,
-		mtu:   mtu,
-		inCh:  make(chan []byte, 256),
-		outCh: make(chan []byte, 256),
+		name:    name,
+		mtu:     mtu,
+		inCh:    make(chan []byte, 256),
+		outCh:   make(chan []byte, 256),
+		eventCh: eventCh,
 	}
 }
 
-func (m *MemoryDevice) Name() string { return m.name }
+func (m *MemoryDevice) DeviceName() string { return m.name }
+
+func (m *MemoryDevice) Name() (string, error) { return m.name, nil }
+
+func (m *MemoryDevice) File() *os.File { return nil }
 
 func (m *MemoryDevice) MTU() (int, error) { return m.mtu, nil }
+
+func (m *MemoryDevice) BatchSize() int { return 1 }
+
+func (m *MemoryDevice) Events() <-chan tun.Event { return m.eventCh }
 
 func (m *MemoryDevice) IsSimulated() bool { return true }
 
@@ -100,6 +113,7 @@ func (m *MemoryDevice) Close() error {
 		m.closed = true
 		close(m.inCh)
 		close(m.outCh)
+		close(m.eventCh)
 	}
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -130,27 +131,131 @@ func (s *Server) Handler() http.Handler {
 	return s.mux
 }
 
+type contextKey string
+
+const tenantContextKey contextKey = "zro_tenant"
+
+// TenantFromContext returns the authenticated Tenant from the request context.
+func TenantFromContext(ctx context.Context) *core.Tenant {
+	if val := ctx.Value(tenantContextKey); val != nil {
+		if t, ok := val.(*core.Tenant); ok {
+			return t
+		}
+	}
+	return nil
+}
+
+func (s *Server) tenantAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var apiKey string
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			apiKey = strings.TrimPrefix(authHeader, "Bearer ")
+		} else if strings.HasPrefix(authHeader, "ApiKey ") {
+			apiKey = strings.TrimPrefix(authHeader, "ApiKey ")
+		}
+		if apiKey == "" {
+			apiKey = r.Header.Get("X-API-Key")
+		}
+
+		if apiKey != "" {
+			tenant, err := s.db.Tenants.GetByAPIKey(r.Context(), apiKey)
+			if err != nil || tenant == nil || !tenant.IsActive {
+				http.Error(w, `{"error":"unauthorized: invalid or inactive API key"}`, http.StatusUnauthorized)
+				return
+			}
+			ctx := context.WithValue(r.Context(), tenantContextKey, tenant)
+			next(w, r.WithContext(ctx))
+			return
+		}
+
+		// When no API key is provided:
+		if s.cfg.RequireAuth {
+			http.Error(w, `{"error":"unauthorized: API key required in Authorization or X-API-Key header"}`, http.StatusUnauthorized)
+			return
+		}
+
+		// Permissive / dev mode: bind to default tenant
+		tenants, _ := s.db.Tenants.List(r.Context())
+		if len(tenants) > 0 {
+			ctx := context.WithValue(r.Context(), tenantContextKey, &tenants[0])
+			next(w, r.WithContext(ctx))
+			return
+		}
+
+		defaultTenant := &core.Tenant{
+			ID:        uuid.New(),
+			Name:      "Default Organization",
+			Slug:      "default-org",
+			APIKey:    "zro_key_default",
+			IsActive:  true,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+		_ = s.db.Tenants.Create(r.Context(), defaultTenant)
+		ctx := context.WithValue(r.Context(), tenantContextKey, defaultTenant)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+func (s *Server) edgeAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var edgeKey string
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			edgeKey = strings.TrimPrefix(authHeader, "Bearer ")
+		}
+		if edgeKey == "" {
+			edgeKey = r.Header.Get("X-Edge-Key")
+		}
+		if edgeKey == "" {
+			edgeKey = r.Header.Get("X-API-Key")
+		}
+
+		expectedKey := s.cfg.EdgeAPIKey
+		if expectedKey == "" {
+			expectedKey = s.cfg.SecretKey
+		}
+
+		if edgeKey != "" {
+			if expectedKey != "" && edgeKey == expectedKey {
+				next(w, r)
+				return
+			}
+			http.Error(w, `{"error":"unauthorized: invalid edge API key"}`, http.StatusUnauthorized)
+			return
+		}
+
+		if s.cfg.RequireAuth || (expectedKey != "" && s.cfg.EdgeAPIKey != "") {
+			http.Error(w, `{"error":"unauthorized: edge API key required"}`, http.StatusUnauthorized)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
 func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 
 	// Network Management (ZeroTier-styled 16-hex Network ID)
-	s.mux.HandleFunc("POST /api/v1/networks", s.handleCreateNetwork)
-	s.mux.HandleFunc("GET /api/v1/networks", s.handleListNetworks)
+	s.mux.HandleFunc("POST /api/v1/networks", s.tenantAuthMiddleware(s.handleCreateNetwork))
+	s.mux.HandleFunc("GET /api/v1/networks", s.tenantAuthMiddleware(s.handleListNetworks))
 
 	// Edge PoPs, Dynamic Registration & Real-time Heartbeats
 	s.mux.HandleFunc("GET /api/v1/pops", s.handleListPoPs)
-	s.mux.HandleFunc("POST /api/v1/edge/register", s.handleRegisterEdgePoP)
-	s.mux.HandleFunc("POST /api/v1/edge/heartbeat", s.handleEdgeHeartbeat)
-	s.mux.HandleFunc("GET /api/v1/edge/sync", s.handleEdgeSync)
+	s.mux.HandleFunc("POST /api/v1/edge/register", s.edgeAuthMiddleware(s.handleRegisterEdgePoP))
+	s.mux.HandleFunc("POST /api/v1/edge/heartbeat", s.edgeAuthMiddleware(s.handleEdgeHeartbeat))
+	s.mux.HandleFunc("GET /api/v1/edge/sync", s.edgeAuthMiddleware(s.handleEdgeSync))
 
 	// Live Mesh Topology Graph (Real-Time)
-	s.mux.HandleFunc("GET /api/v1/mesh/graph", s.handleGetMeshGraph)
-	s.mux.HandleFunc("GET /api/v1/topology", s.handleGetMeshGraph)
+	s.mux.HandleFunc("GET /api/v1/mesh/graph", s.tenantAuthMiddleware(s.handleGetMeshGraph))
+	s.mux.HandleFunc("GET /api/v1/topology", s.tenantAuthMiddleware(s.handleGetMeshGraph))
 
 	// Microsegmentation & Access Control (Zero-Trust ACLs)
-	s.mux.HandleFunc("POST /api/v1/acl/rules", s.handleCreateACLRule)
-	s.mux.HandleFunc("GET /api/v1/acl/rules", s.handleListACLRules)
-	s.mux.HandleFunc("DELETE /api/v1/acl/rules/{id}", s.handleDeleteACLRule)
+	s.mux.HandleFunc("POST /api/v1/acl/rules", s.tenantAuthMiddleware(s.handleCreateACLRule))
+	s.mux.HandleFunc("GET /api/v1/acl/rules", s.tenantAuthMiddleware(s.handleListACLRules))
+	s.mux.HandleFunc("DELETE /api/v1/acl/rules/{id}", s.tenantAuthMiddleware(s.handleDeleteACLRule))
 
 	// Node Enrollment & Mesh Coordination
 	s.mux.HandleFunc("POST /api/v1/enroll", s.handleEnrollNode)
@@ -211,23 +316,27 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 
 	netID := core.GenerateNetworkID() // ZeroTier-style 16-hex character ID
 
-	// Default tenant if none exists
-	tenants, _ := s.db.Tenants.List(r.Context())
+	tenant := TenantFromContext(r.Context())
 	var tenantID uuid.UUID
-	if len(tenants) > 0 {
-		tenantID = tenants[0].ID
-	} else {
-		tenant := &core.Tenant{
-			ID:        uuid.New(),
-			Name:      "Default Organization",
-			Slug:      "default-org",
-			APIKey:    "zro_key_" + netID,
-			IsActive:  true,
-			CreatedAt: time.Now(),
-			UpdatedAt: time.Now(),
-		}
-		_ = s.db.Tenants.Create(r.Context(), tenant)
+	if tenant != nil {
 		tenantID = tenant.ID
+	} else {
+		tenants, _ := s.db.Tenants.List(r.Context())
+		if len(tenants) > 0 {
+			tenantID = tenants[0].ID
+		} else {
+			defaultTenant := &core.Tenant{
+				ID:        uuid.New(),
+				Name:      "Default Organization",
+				Slug:      "default-org",
+				APIKey:    "zro_key_" + netID,
+				IsActive:  true,
+				CreatedAt: time.Now(),
+				UpdatedAt: time.Now(),
+			}
+			_ = s.db.Tenants.Create(r.Context(), defaultTenant)
+			tenantID = defaultTenant.ID
+		}
 	}
 
 	network := &core.Network{
@@ -257,14 +366,21 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListNetworks(w http.ResponseWriter, r *http.Request) {
-	tenants, err := s.db.Tenants.List(r.Context())
-	if err != nil || len(tenants) == 0 {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode([]core.Network{})
-		return
+	tenant := TenantFromContext(r.Context())
+	var tenantID uuid.UUID
+	if tenant != nil {
+		tenantID = tenant.ID
+	} else {
+		tenants, err := s.db.Tenants.List(r.Context())
+		if err != nil || len(tenants) == 0 {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]core.Network{})
+			return
+		}
+		tenantID = tenants[0].ID
 	}
 
-	networks, err := s.db.Networks.ListByTenantID(r.Context(), tenants[0].ID)
+	networks, err := s.db.Networks.ListByTenantID(r.Context(), tenantID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1232,6 +1348,19 @@ func (s *Server) handleCreateACLRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tenant := TenantFromContext(r.Context())
+	if tenant != nil {
+		net, err := s.db.Networks.GetByID(r.Context(), req.NetworkID)
+		if err != nil || net == nil {
+			http.Error(w, "network not found", http.StatusNotFound)
+			return
+		}
+		if net.TenantID != tenant.ID {
+			http.Error(w, "forbidden: network does not belong to tenant", http.StatusForbidden)
+			return
+		}
+	}
+
 	if req.Priority <= 0 {
 		req.Priority = 100
 	}
@@ -1299,6 +1428,19 @@ func (s *Server) handleListACLRules(w http.ResponseWriter, r *http.Request) {
 	if netID == "" {
 		http.Error(w, "network_id query parameter is required", http.StatusBadRequest)
 		return
+	}
+
+	tenant := TenantFromContext(r.Context())
+	if tenant != nil {
+		net, err := s.db.Networks.GetByID(r.Context(), netID)
+		if err != nil || net == nil {
+			http.Error(w, "network not found", http.StatusNotFound)
+			return
+		}
+		if net.TenantID != tenant.ID {
+			http.Error(w, "forbidden: network does not belong to tenant", http.StatusForbidden)
+			return
+		}
 	}
 
 	rules, err := s.db.ACLs.ListByNetworkID(r.Context(), netID)

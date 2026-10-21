@@ -9,8 +9,12 @@ func TestTUNMemoryDevice(t *testing.T) {
 	dev := NewMemoryDevice("zro-test0", 1420)
 	defer dev.Close()
 
-	if dev.Name() != "zro-test0" {
-		t.Fatalf("expected name zro-test0, got %s", dev.Name())
+	name, err := dev.Name()
+	if err != nil || name != "zro-test0" {
+		t.Fatalf("expected name zro-test0, got %s (err: %v)", name, err)
+	}
+	if dev.DeviceName() != "zro-test0" {
+		t.Fatalf("expected device name zro-test0, got %s", dev.DeviceName())
 	}
 
 	mtu, err := dev.MTU()
@@ -61,7 +65,8 @@ func TestCreateTUNGracefulFallback(t *testing.T) {
 	}
 	defer dev.Close()
 
-	if dev.Name() == "" {
+	name, _ := dev.Name()
+	if name == "" && dev.DeviceName() == "" {
 		t.Fatalf("expected non-empty device name")
 	}
 }

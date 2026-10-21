@@ -13,7 +13,9 @@ import (
 	"sync"
 	"time"
 
+	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
+	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
@@ -50,6 +52,7 @@ type Daemon struct {
 	derpClient   *derp.Client
 	tunnelClient *tunnel.Client
 	httpClient   *http.Client
+	grpcClient   *controlgrpc.Client
 
 	// Zero-Trust Inbound Firewall & Mesh Listeners
 	policyMu      sync.RWMutex
@@ -70,14 +73,24 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 		return nil, fmt.Errorf("failed to generate WireGuard keypair: %w", err)
 	}
 
-	wgMgr, err := wireguard.NewManager(cfg.InterfaceName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize WireGuard manager: %w", err)
+	var tunDev tun.Device
+	if cfg.InterfaceMode == "netstack" {
+		tunDev = tun.NewMemoryDevice(cfg.InterfaceName, cfg.MTU)
+	} else {
+		tunDev, err = tun.CreateTUN(cfg.InterfaceName, cfg.MTU)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize TUN device: %w", err)
+		}
 	}
 
-	tunDev, err := tun.CreateTUN(cfg.InterfaceName, cfg.MTU)
+	wgMgr, err := wireguard.NewManager(cfg.InterfaceName,
+		wireguard.WithTunDevice(tunDev),
+		wireguard.WithPrivateKey(kp.PrivateKey),
+		wireguard.WithListenPort(0),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize TUN device: %w", err)
+		_ = tunDev.Close()
+		return nil, fmt.Errorf("failed to initialize WireGuard manager: %w", err)
 	}
 
 	return &Daemon{
@@ -114,6 +127,20 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.wg.Add(1)
 	go d.udpPacketListener(ctx)
 
+	// Connect gRPC client if plane transport is set to grpc
+	if strings.EqualFold(d.cfg.PlaneTransport, "grpc") {
+		grpcTarget := d.cfg.PlaneEndpoint
+		grpcTarget = strings.TrimPrefix(grpcTarget, "http://")
+		grpcTarget = strings.TrimPrefix(grpcTarget, "https://")
+		gc, err := controlgrpc.NewClient(grpcTarget)
+		if err == nil {
+			d.grpcClient = gc
+			slog.Info("ZRO Node connected to Control Plane via gRPC", "target", grpcTarget)
+		} else {
+			slog.Warn("Failed to initialize gRPC client, falling back to REST", "error", err)
+		}
+	}
+
 	// 2. Section 5.1 Step 2: Fetch PoP catalog and conduct parallel UDP RTT probes
 	pops, _ := d.fetchPoPs(ctx)
 	probes, bestReflexive := d.probePoPs(ctx, pops)
@@ -124,42 +151,101 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}
 
 	// 3. Section 5.1 Steps 3-4: Enroll with Control Plane and report probe telemetry for Smart Delegation
-	enrollReq := server.EnrollRequest{
-		Token:        d.cfg.EnrollmentToken,
-		PublicKey:    d.keyPair.PublicKey,
-		Hostname:     d.cfg.Hostname,
-		NodeType:     core.NodeTypePeer,
-		Tags:         core.StringList(d.cfg.Tags),
-		Endpoints:    core.StringList(endpoints),
-		AllowedPorts: core.StringList(d.allowedPorts),
-		DefaultDeny:  &d.defaultDeny,
-		Probes:       probes,
-	}
-
-	bodyBytes, err := json.Marshal(enrollReq)
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", d.cfg.PlaneEndpoint+"/api/v1/enroll", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := d.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("enrollment request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("enrollment rejected by control plane: status %d", resp.StatusCode)
-	}
-
 	var enrollResp server.EnrollResponse
-	if err := json.NewDecoder(resp.Body).Decode(&enrollResp); err != nil {
-		return fmt.Errorf("failed to decode enrollment response: %w", err)
+
+	if d.grpcClient != nil {
+		var protoProbes []*v1.LatencyProbe
+		for _, p := range probes {
+			protoProbes = append(protoProbes, &v1.LatencyProbe{
+				PopCode:    p.PoPCode,
+				RttNs:      p.RTT.Nanoseconds(),
+				PacketLoss: p.PacketLoss,
+			})
+		}
+
+		gResp, err := d.grpcClient.Enroll(ctx, &v1.EnrollRequest{
+			Token:     d.cfg.EnrollmentToken,
+			PublicKey: d.keyPair.PublicKey,
+			Hostname:  d.cfg.Hostname,
+			NodeType:  "peer",
+			Tags:      d.cfg.Tags,
+			Endpoints: endpoints,
+			Probes:    protoProbes,
+		})
+		if err != nil {
+			return fmt.Errorf("gRPC enrollment failed: %w", err)
+		}
+
+		nodeUUID, _ := uuid.Parse(gResp.NodeId)
+		enrollResp = server.EnrollResponse{
+			NodeID:      nodeUUID,
+			NetworkID:   gResp.NetworkId,
+			OverlayIPv4: gResp.OverlayIpv4,
+			OverlayIPv6: gResp.OverlayIpv6,
+		}
+		if gResp.PrimaryPop != nil {
+			enrollResp.PrimaryPoP = core.EdgePoP{
+				PoPCode:        gResp.PrimaryPop.PopCode,
+				PublicEndpoint: gResp.PrimaryPop.PublicEndpoint,
+				PublicKey:      gResp.PrimaryPop.PublicKey,
+				Region:         gResp.PrimaryPop.Region,
+			}
+		}
+		if gResp.SecondaryPop != nil {
+			sec := core.EdgePoP{
+				PoPCode:        gResp.SecondaryPop.PopCode,
+				PublicEndpoint: gResp.SecondaryPop.PublicEndpoint,
+				PublicKey:      gResp.SecondaryPop.PublicKey,
+				Region:         gResp.SecondaryPop.Region,
+			}
+			enrollResp.SecondaryPoP = &sec
+		}
+		for _, p := range gResp.Peers {
+			enrollResp.Peers = append(enrollResp.Peers, core.Node{
+				Hostname:    p.Hostname,
+				PublicKey:   p.PublicKey,
+				OverlayIPv4: p.OverlayIpv4,
+				OverlayIPv6: p.OverlayIpv6,
+				Endpoints:   core.StringList(p.Endpoints),
+			})
+		}
+	} else {
+		enrollReq := server.EnrollRequest{
+			Token:        d.cfg.EnrollmentToken,
+			PublicKey:    d.keyPair.PublicKey,
+			Hostname:     d.cfg.Hostname,
+			NodeType:     core.NodeTypePeer,
+			Tags:         core.StringList(d.cfg.Tags),
+			Endpoints:    core.StringList(endpoints),
+			AllowedPorts: core.StringList(d.allowedPorts),
+			DefaultDeny:  &d.defaultDeny,
+			Probes:       probes,
+		}
+
+		bodyBytes, err := json.Marshal(enrollReq)
+		if err != nil {
+			return err
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "POST", d.cfg.PlaneEndpoint+"/api/v1/enroll", bytes.NewReader(bodyBytes))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := d.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("enrollment request failed: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("enrollment rejected by control plane: status %d", resp.StatusCode)
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&enrollResp); err != nil {
+			return fmt.Errorf("failed to decode enrollment response: %w", err)
+		}
 	}
 
 	d.nodeID = enrollResp.NodeID
@@ -319,6 +405,9 @@ func (d *Daemon) Stop() error {
 	if d.wgManager != nil {
 		_ = d.wgManager.Close()
 	}
+	if d.grpcClient != nil {
+		_ = d.grpcClient.Close()
+	}
 	d.wg.Wait()
 	return nil
 }
@@ -326,6 +415,19 @@ func (d *Daemon) Stop() error {
 func (d *Daemon) connectToEdgePoP(pop core.EdgePoP) error {
 	if pop.PublicKey == "" {
 		return nil
+	}
+
+	// Establish DERP encrypted packet relay client connection if endpoint is reachable
+	if pop.PublicEndpoint != "" && d.derpClient == nil {
+		go func() {
+			dialCtx, dialCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer dialCancel()
+			dc, err := derp.ConnectDERP(dialCtx, pop.PublicEndpoint, d.keyPair)
+			if err == nil {
+				d.derpClient = dc
+				slog.Info("Connected to Edge DERP relay fallback", "pop", pop.PoPCode, "endpoint", pop.PublicEndpoint)
+			}
+		}()
 	}
 
 	// Route all private overlay traffic through primary PoP as default relay
