@@ -21,7 +21,6 @@ import (
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
-	"github.com/cubis/zro/pkg/dataplane/netcfg"
 	"github.com/cubis/zro/pkg/dataplane/tun"
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
 	"github.com/cubis/zro/pkg/gateway/acme"
@@ -46,6 +45,7 @@ type Daemon struct {
 	popMu        sync.RWMutex
 
 	tunDev          tun.Device
+	dev             *agent.Device
 	wgManager       *wireguard.Manager
 	udpConn         *net.UDPConn
 	proxyEngine     *proxy.Engine
@@ -53,7 +53,9 @@ type Daemon struct {
 	httpClient      *http.Client
 	token           controlauth.TokenHolder // bearer token issued at enrollment
 	popLink         *agent.PoPLink
-	overlayPrefixes []string // routed into the interface; reported by the plane at enrollment
+	dynMu           sync.Mutex      // guards dynamicHosts
+	dynamicHosts    map[string]bool // hostnames installed from the plane (static config routes are never pruned)
+	overlayPrefixes []string        // routed into the interface; reported by the plane at enrollment
 	grpcClient      *controlgrpc.Client
 	httpServer      *http.Server
 	httpsServer     *http.Server
@@ -91,13 +93,11 @@ func NewDaemon(cfg *config.GatewayConfig) (*Daemon, error) {
 		cfg.HealthCheckPath = "/health"
 	}
 
-	tunDev, err := tun.CreateTUN(cfg.InterfaceName, cfg.MTU)
+	dev, err := agent.OpenDevice(cfg.InterfaceMode, cfg.InterfaceName, cfg.MTU)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize TUN device: %w", err)
+		return nil, err
 	}
-	if err := netcfg.EnsureLinkUp(cfg.InterfaceName, cfg.MTU); err != nil {
-		slog.Warn("Could not bring gateway overlay interface up (data plane may be limited)", "interface", cfg.InterfaceName, "error", err)
-	}
+	tunDev := dev.TUN
 
 	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: cfg.ListenPort})
 	if err != nil {
@@ -109,10 +109,12 @@ func NewDaemon(cfg *config.GatewayConfig) (*Daemon, error) {
 		cfg:           cfg,
 		keyPair:       kp,
 		tunDev:        tunDev,
+		dev:           dev,
 		udpConn:       udpConn,
 		proxyEngine:   proxy.NewEngine(),
 		healthChecker: proxy.NewHealthChecker(2 * time.Second),
 		stunWaiters:   make(map[[12]byte]chan *stun.ReflexiveAddress),
+		dynamicHosts:  make(map[string]bool),
 	}
 
 	d.httpClient = &http.Client{
@@ -133,7 +135,12 @@ func NewDaemon(cfg *config.GatewayConfig) (*Daemon, error) {
 
 	d.wgManager = wgMgr
 	d.overlayPrefixes = core.OverlayPrefixes("", "") // refined from the enrollment response
-	d.popLink = &agent.PoPLink{WG: wgMgr, Interface: cfg.InterfaceName, OSRoutes: true}
+	d.popLink = &agent.PoPLink{WG: wgMgr, Interface: cfg.InterfaceName, OSRoutes: !dev.Userspace()}
+	if dev.Userspace() {
+		// Backends live on the overlay, which only the userspace stack can reach.
+		d.proxyEngine.Transport.DialContext = dev.Net.DialContext
+		d.healthChecker.SetDialer(dev.Net.DialContext)
+	}
 	d.loadStaticRoutes()
 	return d, nil
 }
@@ -429,8 +436,8 @@ func (d *Daemon) enrollAndConnect(ctx context.Context) error {
 	d.overlayIPv4 = enrollResp.OverlayIPv4
 	d.overlayIPv6 = enrollResp.OverlayIPv6
 
-	if err := netcfg.ConfigureOverlay(d.cfg.InterfaceName, d.overlayIPv4, d.overlayIPv6, d.cfg.MTU); err != nil {
-		slog.Warn("Failed to configure gateway overlay interface addresses", "interface", d.cfg.InterfaceName, "error", err)
+	if err := d.dev.Configure(d.overlayIPv4, d.overlayIPv6); err != nil {
+		slog.Warn("Failed to configure gateway overlay addresses", "interface", d.cfg.InterfaceName, "error", err)
 	}
 
 	d.popMu.Lock()
@@ -529,75 +536,79 @@ func (d *Daemon) SyncRoutesOnce(ctx context.Context) error {
 	if d.cfg.PlaneEndpoint == "" {
 		return nil
 	}
+	routes, err := d.fetchRoutes(ctx)
+	if err != nil {
+		return err
+	}
+	d.applyRoutes(routes)
+	return nil
+}
 
+// fetchRoutes retrieves this network's routes over gRPC when configured,
+// falling back to REST.
+func (d *Daemon) fetchRoutes(ctx context.Context) ([]server.GatewayRouteItem, error) {
 	if d.grpcClient != nil {
-		gResp, err := d.grpcClient.GetGatewayRoutes(ctx, &v1.GatewayRoutesRequest{
-			GatewayHostname: d.cfg.Hostname,
-		})
-		if err == nil && gResp != nil {
-			for _, r := range gResp.Routes {
-				var backends []*balancer.Backend
+		if g, err := d.grpcClient.GetGatewayRoutes(ctx, &v1.GatewayRoutesRequest{GatewayHostname: d.cfg.Hostname}); err == nil && g != nil {
+			routes := make([]server.GatewayRouteItem, 0, len(g.Routes))
+			for _, r := range g.Routes {
+				item := server.GatewayRouteItem{Hostname: r.Hostname, Protocol: r.Protocol}
 				for _, b := range r.Backends {
-					backends = append(backends, &balancer.Backend{
-						Address: b.Address,
-						Weight:  int(b.Weight),
-						Healthy: b.Healthy,
-					})
+					item.Backends = append(item.Backends, server.GatewayBackendItem{Address: b.Address, Weight: int(b.Weight), Healthy: b.Healthy})
 				}
-				if bal, exists := d.proxyEngine.GetRoute(r.Hostname); exists {
-					bal.UpdateBackends(backends)
-				} else {
-					strat := balancer.Strategy(d.cfg.Strategy)
-					newBal := balancer.NewBalancer(strat, backends)
-					d.proxyEngine.RegisterRoute(r.Hostname, newBal)
-					slog.Info("Discovered and registered dynamic gateway route via gRPC", "hostname", r.Hostname, "backends", len(backends))
-				}
+				routes = append(routes, item)
 			}
-			return nil
+			return routes, nil
 		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", d.cfg.PlaneEndpoint+"/api/v1/gateway/routes", nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("gateway routes endpoint returned %d", resp.StatusCode)
+		return nil, fmt.Errorf("gateway routes endpoint returned %d", resp.StatusCode)
 	}
-
 	var routesResp server.GatewayRoutesResponse
 	if err := json.NewDecoder(resp.Body).Decode(&routesResp); err != nil {
-		return err
+		return nil, err
 	}
+	return routesResp.Routes, nil
+}
 
-	for _, r := range routesResp.Routes {
-		var backends []*balancer.Backend
+// applyRoutes installs the plane's routes and removes dynamic routes the plane
+// no longer lists (a deleted tunnel or a departed node). Routes from the
+// static config are never removed.
+func (d *Daemon) applyRoutes(routes []server.GatewayRouteItem) {
+	d.dynMu.Lock()
+	defer d.dynMu.Unlock()
+
+	seen := make(map[string]bool, len(routes))
+	for _, r := range routes {
+		seen[r.Hostname] = true
+		backends := make([]*balancer.Backend, 0, len(r.Backends))
 		for _, b := range r.Backends {
-			backends = append(backends, &balancer.Backend{
-				Address: b.Address,
-				Weight:  b.Weight,
-				Healthy: b.Healthy,
-			})
+			backends = append(backends, &balancer.Backend{Address: b.Address, Weight: b.Weight, Healthy: b.Healthy})
 		}
-
 		if bal, exists := d.proxyEngine.GetRoute(r.Hostname); exists {
 			bal.UpdateBackends(backends)
 		} else {
-			strat := balancer.Strategy(d.cfg.Strategy)
-			newBal := balancer.NewBalancer(strat, backends)
-			d.proxyEngine.RegisterRoute(r.Hostname, newBal)
-			slog.Info("Discovered and registered dynamic gateway route", "hostname", r.Hostname, "backends", len(backends))
+			d.proxyEngine.RegisterRoute(r.Hostname, balancer.NewBalancer(balancer.Strategy(d.cfg.Strategy), backends))
+			slog.Info("Registered dynamic gateway route", "hostname", r.Hostname, "backends", len(backends))
+		}
+		d.dynamicHosts[r.Hostname] = true
+	}
+	for host := range d.dynamicHosts {
+		if !seen[host] {
+			d.proxyEngine.UnregisterRoute(host)
+			delete(d.dynamicHosts, host)
+			slog.Info("Removed gateway route no longer published by the plane", "hostname", host)
 		}
 	}
-
-	return nil
 }
 
 func (d *Daemon) syncWorker(ctx context.Context) {

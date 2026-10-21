@@ -691,6 +691,7 @@ func TestFullMeshSmoke(t *testing.T) {
 	node1, err := node.NewDaemon(&config.NodeConfig{
 		Hostname:      "app-node-kh",
 		InterfaceName: "zro-smoke1",
+		InterfaceMode: "netstack",
 		MTU:           1420,
 		DefaultDeny:   true,
 	})
@@ -698,11 +699,10 @@ func TestFullMeshSmoke(t *testing.T) {
 		t.Fatalf("smoke: create node 1 failed: %v", err)
 	}
 	defer node1.Stop()
-	node1.SetOverlayIP("100.64.0.2")
-
 	node2, err := node.NewDaemon(&config.NodeConfig{
 		Hostname:      "db-node-sg",
 		InterfaceName: "zro-smoke2",
+		InterfaceMode: "netstack",
 		MTU:           1420,
 		DefaultDeny:   true,
 	})
@@ -710,7 +710,11 @@ func TestFullMeshSmoke(t *testing.T) {
 		t.Fatalf("smoke: create node 2 failed: %v", err)
 	}
 	defer node2.Stop()
-	node2.SetOverlayIP("100.64.0.3")
+	_ = node1.AssignOverlay("100.64.0.2", "")
+	_ = node2.AssignOverlay("100.64.0.3", "")
+	// A real WireGuard session between the two userspace stacks over loopback UDP.
+	_ = node1.AddDirectPeer(core.Node{PublicKey: node2.PublicKey(), OverlayIPv4: "100.64.0.3"}, fmt.Sprintf("127.0.0.1:%d", node2.UDPPort()), true)
+	_ = node2.AddDirectPeer(core.Node{PublicKey: node1.PublicKey(), OverlayIPv4: "100.64.0.2"}, fmt.Sprintf("127.0.0.1:%d", node1.UDPPort()), false)
 
 	// Node 1 (100.64.0.2) hosting PostgreSQL server on port 5432, default deny all
 	// Node 2 (100.64.0.3) connecting over the mesh
@@ -744,6 +748,7 @@ func TestFullMeshSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("smoke: node2 failed to connect to node1 on allowed port 5432: %v", err)
 	}
+	_ = pgConn.SetDeadline(time.Now().Add(5 * time.Second))
 	_, _ = pgConn.Write([]byte("SELECT 1;"))
 	respBuf := make([]byte, 16)
 	nBytes, _ := pgConn.Read(respBuf)
@@ -751,29 +756,46 @@ func TestFullMeshSmoke(t *testing.T) {
 	if string(respBuf[:nBytes]) != "1\n" {
 		t.Fatalf("smoke: expected '1\\n' from postgres service, got %q", string(respBuf[:nBytes]))
 	}
-	t.Log("✅ Smoke Step 16a Passed: Inter-node secure communication verified: Node 2 accessed Node 1 (100.64.0.2:5432) Postgres over mesh")
+	t.Log("✅ Smoke Step 16a Passed: Real TCP over WireGuard between userspace stacks: Node 2 accessed Node 1 (100.64.0.2:5432)")
 
-	// 16b. Node 2 attempts connection to unallowed port 22 (SSH) on Node 1 -> MUST BE REJECTED
+	// 16b. Port 22 is listening on Node 1 but not allowed -> the connection is cut off
 	sshLn, err := node1.ListenMesh(ctx, "tcp", 22)
 	if err != nil {
 		t.Fatalf("smoke: node1 failed to listen on port 22: %v", err)
 	}
 	defer sshLn.Close()
+	go func() {
+		for {
+			c, err := sshLn.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = c.Write([]byte("SSH\n"))
+			_ = c.Close()
+		}
+	}()
 
-	blockedConn, err := node2.DialMesh(ctx, "tcp", "100.64.0.2:22")
-	if err == nil {
-		_ = blockedConn.Close()
-		t.Fatalf("smoke: expected connection to port 22 to be BLOCKED under default-deny all")
+	probe := func() bool {
+		c, err := node2.DialMesh(ctx, "tcp", "100.64.0.2:22")
+		if err != nil {
+			return false
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+		b := make([]byte, 8)
+		n, _ := c.Read(b)
+		return string(b[:n]) == "SSH\n"
 	}
-	t.Logf("✅ Smoke Step 16b Passed: Zero-Trust Inbound Firewall enforced (port 22 blocked: %v)", err)
+	if probe() {
+		t.Fatalf("smoke: expected port 22 to be BLOCKED under default-deny all")
+	}
+	t.Log("✅ Smoke Step 16b Passed: Zero-Trust Inbound Firewall enforced (port 22 blocked)")
 
 	// 16c. Dynamically allow port 22 on Node 1 -> Connection now succeeds
 	node1.AllowPort("22/tcp")
-	allowedConn, err := node2.DialMesh(ctx, "tcp", "100.64.0.2:22")
-	if err != nil {
-		t.Fatalf("smoke: expected connection to port 22 to succeed after dynamic allow, got: %v", err)
+	if !probe() {
+		t.Fatalf("smoke: expected connection to port 22 to succeed after dynamic allow")
 	}
-	_ = allowedConn.Close()
 	t.Log("✅ Smoke Step 16c Passed: Dynamic zero-trust firewall policy update verified (port 22 allowed)")
 }
 

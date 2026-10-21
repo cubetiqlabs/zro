@@ -14,6 +14,11 @@ import (
 	"github.com/cubis/zro/pkg/realtime"
 )
 
+const (
+	p2pKeepalive            = 20 * time.Second
+	responderKeepaliveDelay = 3 * time.Second
+)
+
 // maxConcurrentConnects bounds the hole punches started by one peer refresh.
 const maxConcurrentConnects = 8
 
@@ -154,15 +159,22 @@ func (d *Daemon) answerPunchRequest(ctx context.Context, data json.RawMessage) {
 
 	for _, ep := range req.InitiatorEndpoints {
 		if ok, rtt := d.punchTo(ctx, ep, 2*time.Second); ok {
-			err := d.wgManager.ApplyPeer(wireguard.PeerConfig{
-				PublicKey:           req.InitiatorPubKey,
-				Endpoint:            ep,
-				AllowedIPs:          []string{req.InitiatorOverlay + "/32"},
-				PersistentKeepalive: 20 * time.Second,
-			})
-			if err == nil {
-				slog.Info("Direct P2P path opened at the request of a peer", "endpoint", ep, "rtt", rtt)
+			peer := wireguard.PeerConfig{
+				PublicKey:  req.InitiatorPubKey,
+				Endpoint:   ep,
+				AllowedIPs: []string{req.InitiatorOverlay + "/32"},
 			}
+			// The initiator starts the handshake. If both sides began with a
+			// keepalive, both would initiate at once and their handshakes would
+			// keep colliding, so ours is enabled once the handshake has settled.
+			if err := d.wgManager.ApplyPeer(peer); err != nil {
+				return
+			}
+			slog.Info("Direct P2P path opened at the request of a peer", "endpoint", ep, "rtt", rtt)
+			time.AfterFunc(responderKeepaliveDelay, func() {
+				peer.PersistentKeepalive = p2pKeepalive
+				_ = d.wgManager.ApplyPeer(peer)
+			})
 			return
 		}
 	}

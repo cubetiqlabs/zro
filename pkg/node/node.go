@@ -22,7 +22,6 @@ import (
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
-	"github.com/cubis/zro/pkg/dataplane/netcfg"
 	"github.com/cubis/zro/pkg/dataplane/router"
 	"github.com/cubis/zro/pkg/dataplane/tun"
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
@@ -49,6 +48,7 @@ type Daemon struct {
 	peersMu      sync.RWMutex
 
 	tunDev          tun.Device
+	dev             *agent.Device
 	wgManager       *wireguard.Manager
 	routingTable    *router.Table
 	udpConn         *net.UDPConn
@@ -62,12 +62,10 @@ type Daemon struct {
 	grpcClient      *controlgrpc.Client
 
 	// Zero-Trust Inbound Firewall & Mesh Listeners
-	policyMu      sync.RWMutex
-	allowedPorts  []string // e.g. ["5432/tcp"]
-	defaultDeny   bool     // default true for zero-trust
-	allowedPeers  []string
-	meshListeners map[int]*guardedListener
-	listenersMu   sync.Mutex
+	policyMu     sync.RWMutex
+	allowedPorts []string // e.g. ["5432/tcp"]
+	defaultDeny  bool     // default true for zero-trust
+	allowedPeers []string
 
 	// Control-plane datagram correlation on the shared WireGuard socket.
 	stunMu       sync.Mutex
@@ -86,20 +84,11 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 		return nil, fmt.Errorf("failed to load WireGuard identity: %w", err)
 	}
 
-	var tunDev tun.Device
-	if cfg.InterfaceMode == "netstack" {
-		tunDev = tun.NewMemoryDevice(cfg.InterfaceName, cfg.MTU)
-	} else {
-		tunDev, err = tun.CreateTUN(cfg.InterfaceName, cfg.MTU)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize TUN device: %w", err)
-		}
-		// Bring the link up before creating the WireGuard device. Otherwise the
-		// kernel reports the TUN as down and wireguard-go closes its bind.
-		if err := netcfg.EnsureLinkUp(cfg.InterfaceName, cfg.MTU); err != nil {
-			slog.Warn("Could not bring overlay interface up (data plane may be limited)", "interface", cfg.InterfaceName, "error", err)
-		}
+	dev, err := agent.OpenDevice(cfg.InterfaceMode, cfg.InterfaceName, cfg.MTU)
+	if err != nil {
+		return nil, err
 	}
+	tunDev := dev.TUN
 
 	// One UDP socket is shared by WireGuard, STUN, disco, and hole punching so
 	// that the reflexive port peers learn is the port WireGuard receives on.
@@ -110,19 +99,19 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 	}
 
 	d := &Daemon{
-		cfg:           cfg,
-		keyPair:       kp,
-		peers:         make(map[string]core.Node),
-		tunDev:        tunDev,
-		udpConn:       udpConn,
-		routingTable:  router.NewTable(),
-		tunnelClient:  tunnel.NewClient(),
-		allowedPorts:  cfg.AllowedInboundPorts,
-		defaultDeny:   cfg.DefaultDeny,
-		meshListeners: make(map[int]*guardedListener),
-		stunWaiters:   make(map[[12]byte]chan *stun.ReflexiveAddress),
-		relay:         newRelayState(),
-		punchWaiters:  make(map[string]chan struct{}),
+		cfg:          cfg,
+		keyPair:      kp,
+		peers:        make(map[string]core.Node),
+		tunDev:       tunDev,
+		dev:          dev,
+		udpConn:      udpConn,
+		routingTable: router.NewTable(),
+		tunnelClient: tunnel.NewClient(),
+		allowedPorts: cfg.AllowedInboundPorts,
+		defaultDeny:  cfg.DefaultDeny,
+		stunWaiters:  make(map[[12]byte]chan *stun.ReflexiveAddress),
+		relay:        newRelayState(),
+		punchWaiters: make(map[string]chan struct{}),
 	}
 
 	d.httpClient = &http.Client{
@@ -143,7 +132,7 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 
 	d.wgManager = wgMgr
 	d.overlayPrefixes = core.OverlayPrefixes("", "") // refined from the enrollment response
-	d.popLink = &agent.PoPLink{WG: wgMgr, Interface: cfg.InterfaceName, OSRoutes: cfg.InterfaceMode != "netstack"}
+	d.popLink = &agent.PoPLink{WG: wgMgr, Interface: cfg.InterfaceName, OSRoutes: !dev.Userspace()}
 	d.discoEngine = disco.NewEngine(kp, udpConn)
 	return d, nil
 }
@@ -302,13 +291,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.overlayIPv4 = enrollResp.OverlayIPv4
 	d.overlayIPv6 = enrollResp.OverlayIPv6
 
-	// Program the host so overlay traffic enters the WireGuard interface.
-	// netstack mode has no OS interface, so it is skipped there.
-	if d.cfg.InterfaceMode != "netstack" {
-		if err := netcfg.ConfigureOverlay(d.cfg.InterfaceName, d.overlayIPv4, d.overlayIPv6, d.cfg.MTU); err != nil {
-			slog.Warn("Failed to configure overlay interface addresses (data plane may be limited)",
-				"interface", d.cfg.InterfaceName, "error", err)
-		}
+	// Give the overlay interface its addresses: the kernel TUN gets OS addresses,
+	// netstack mode adds them to the userspace stack.
+	if err := d.dev.Configure(d.overlayIPv4, d.overlayIPv6); err != nil {
+		slog.Warn("Failed to configure overlay addresses (data plane may be limited)", "error", err)
 	}
 
 	d.popMu.Lock()
@@ -820,6 +806,10 @@ func (d *Daemon) tunnelWorker(ctx context.Context) {
 			Protocol:       tunCfg.Protocol,
 		}
 
+		if err := d.ExposeTunnel(ctx, tunCfg.LocalAddress); err != nil {
+			slog.Warn("Could not expose tunnel on the overlay", "name", tunCfg.Name, "error", err)
+			continue
+		}
 		if err := d.registerTunnel(ctx, t); err != nil {
 			slog.Warn("Failed to register tunnel with the control plane", "name", tunCfg.Name, "error", err)
 			continue
@@ -925,9 +915,6 @@ func (d *Daemon) PublicKey() string {
 	return d.keyPair.PublicKey
 }
 
-// globalMeshRegistry tracks registered overlay listeners across the node network.
-var globalMeshRegistry = sync.Map{} // "overlayIP:port" -> *guardedListener
-
 // SetInboundPolicy updates the node's zero-trust inbound firewall policy.
 func (d *Daemon) SetInboundPolicy(allowedPorts []string, defaultDeny bool, allowedPeers []string) {
 	d.policyMu.Lock()
@@ -1016,168 +1003,4 @@ func (d *Daemon) IsTrafficAllowed(srcIP string, protocol string, destPort int) b
 	}
 
 	return true
-}
-
-// MeshAddr represents a network address in the private overlay space.
-type MeshAddr struct {
-	IP   string
-	Port int
-	Net  string
-}
-
-func (a *MeshAddr) Network() string {
-	if a.Net != "" {
-		return a.Net
-	}
-	return "mesh"
-}
-
-func (a *MeshAddr) String() string {
-	return net.JoinHostPort(a.IP, strconv.Itoa(a.Port))
-}
-
-type meshPipeConn struct {
-	net.Conn
-	localAddr  net.Addr
-	remoteAddr net.Addr
-}
-
-func (c *meshPipeConn) LocalAddr() net.Addr  { return c.localAddr }
-func (c *meshPipeConn) RemoteAddr() net.Addr { return c.remoteAddr }
-
-type guardedListener struct {
-	daemon     *Daemon
-	targetPort int
-	protocol   string
-	overlayIP  string
-	connCh     chan net.Conn
-	closed     chan struct{}
-	closeOnce  sync.Once
-}
-
-func (g *guardedListener) Accept() (net.Conn, error) {
-	select {
-	case <-g.closed:
-		return nil, net.ErrClosed
-	case conn, ok := <-g.connCh:
-		if !ok {
-			return nil, net.ErrClosed
-		}
-		return conn, nil
-	}
-}
-
-func (g *guardedListener) Close() error {
-	g.closeOnce.Do(func() {
-		close(g.closed)
-		key := fmt.Sprintf("%s:%d", g.overlayIP, g.targetPort)
-		globalMeshRegistry.Delete(key)
-	})
-	return nil
-}
-
-func (g *guardedListener) Addr() net.Addr {
-	return &MeshAddr{
-		IP:   g.overlayIP,
-		Port: g.targetPort,
-		Net:  g.protocol,
-	}
-}
-
-// ListenMesh opens a network listener guarded by the node's Zero-Trust Inbound Firewall.
-// Unauthorized connections from nodes to unallowed ports are dropped/rejected.
-func (d *Daemon) ListenMesh(ctx context.Context, network string, port int) (net.Listener, error) {
-	overlayIP := d.overlayIPv4
-	if overlayIP == "" {
-		overlayIP = "127.0.0.1"
-	}
-
-	gl := &guardedListener{
-		daemon:     d,
-		targetPort: port,
-		protocol:   network,
-		overlayIP:  overlayIP,
-		connCh:     make(chan net.Conn, 128),
-		closed:     make(chan struct{}),
-	}
-
-	d.listenersMu.Lock()
-	d.meshListeners[port] = gl
-	d.listenersMu.Unlock()
-
-	regKey := fmt.Sprintf("%s:%d", overlayIP, port)
-	globalMeshRegistry.Store(regKey, gl)
-	slog.Info("Bound Zero-Trust Mesh Listener", "overlay_ip", overlayIP, "port", port, "protocol", network)
-
-	return gl, nil
-}
-
-// DialMesh establishes a connection to a remote node's overlay IP across the mesh.
-// Example: d.DialMesh(ctx, "tcp", "100.64.0.10:5432")
-func (d *Daemon) DialMesh(ctx context.Context, network, address string) (net.Conn, error) {
-	host, portStr, err := net.SplitHostPort(address)
-	if err != nil {
-		return nil, fmt.Errorf("invalid mesh address: %w", err)
-	}
-
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid port: %w", err)
-	}
-
-	// 1. Resolve and connect peer if not already connected
-	if host != d.overlayIPv4 && host != "127.0.0.1" {
-		_, _ = d.DiscoverAndConnectPeer(ctx, host)
-	}
-
-	srcIP := d.overlayIPv4
-	if srcIP == "" {
-		srcIP = "127.0.0.1"
-	}
-
-	// 2. Check virtual mesh registry for target listener
-	regKey := fmt.Sprintf("%s:%d", host, port)
-	if val, ok := globalMeshRegistry.Load(regKey); ok {
-		targetLn := val.(*guardedListener)
-
-		// Evaluate target node's Zero-Trust Inbound Firewall!
-		if !targetLn.daemon.IsTrafficAllowed(srcIP, network, port) {
-			slog.Warn("Zero-Trust Inbound Firewall rejected connection",
-				"src", srcIP,
-				"dst", address,
-				"reason", "default_deny_all_or_unauthorized_port")
-			return nil, fmt.Errorf("connection to %s rejected: access denied by destination node zero-trust policy", address)
-		}
-
-		clientEnd, serverEnd := net.Pipe()
-
-		clientConn := &meshPipeConn{
-			Conn:       clientEnd,
-			localAddr:  &MeshAddr{IP: srcIP, Port: 51820, Net: network},
-			remoteAddr: &MeshAddr{IP: host, Port: port, Net: network},
-		}
-
-		serverConn := &meshPipeConn{
-			Conn:       serverEnd,
-			localAddr:  &MeshAddr{IP: host, Port: port, Net: network},
-			remoteAddr: &MeshAddr{IP: srcIP, Port: 51820, Net: network},
-		}
-
-		select {
-		case targetLn.connCh <- serverConn:
-			return clientConn, nil
-		case <-ctx.Done():
-			_ = clientConn.Close()
-			_ = serverConn.Close()
-			return nil, ctx.Err()
-		case <-targetLn.closed:
-			_ = clientConn.Close()
-			_ = serverConn.Close()
-			return nil, fmt.Errorf("target service %s is closed", address)
-		}
-	}
-
-	// 3. Fallback to direct network socket dialer
-	var dialer net.Dialer
-	return dialer.DialContext(ctx, network, address)
 }

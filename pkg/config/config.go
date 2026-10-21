@@ -116,7 +116,8 @@ type GatewayConfig struct {
 	EnrollmentToken       string              `mapstructure:"enrollment_token"`
 	NetworkID             string              `mapstructure:"network_id"`
 	InterfaceName         string              `mapstructure:"interface_name"`
-	ListenPort            int                 `mapstructure:"listen_port"` // shared UDP port; 0 = ephemeral
+	InterfaceMode         string              `mapstructure:"interface_mode"` // "tun" (kernel) or "netstack" (unprivileged userspace)
+	ListenPort            int                 `mapstructure:"listen_port"`    // shared UDP port; 0 = ephemeral
 	MTU                   int                 `mapstructure:"mtu"`
 	Strategy              string              `mapstructure:"strategy"` // "round_robin", "least_conn", "latency"
 	HealthCheckPath       string              `mapstructure:"health_check_path"`
