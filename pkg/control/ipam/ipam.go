@@ -9,10 +9,8 @@ import (
 )
 
 var (
-	ErrSubnetFull     = errors.New("subnet has no available IP addresses")
-	ErrInvalidCIDR    = errors.New("invalid CIDR specification")
-	ErrIPOutOfRange   = errors.New("requested IP is outside of network subnet")
-	ErrIPAlreadyTaken = errors.New("requested IP is already allocated")
+	ErrSubnetFull  = errors.New("subnet has no available IP addresses")
+	ErrInvalidCIDR = errors.New("invalid CIDR specification")
 )
 
 // IPAM manages overlay IP allocation for virtual networks.
@@ -83,29 +81,6 @@ func (i *IPAM) AllocateNext() (string, error) {
 	}
 
 	return "", ErrSubnetFull
-}
-
-// AllocateSpecific attempts to allocate a specific static IP.
-func (i *IPAM) AllocateSpecific(ipStr string) error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-
-	ip := net.ParseIP(ipStr).To4()
-	if ip == nil {
-		return ErrInvalidCIDR
-	}
-
-	val := binary.BigEndian.Uint32(ip)
-	if !i.subnet.Contains(ip) || val <= i.baseIP || val >= i.broadcastIP {
-		return ErrIPOutOfRange
-	}
-
-	if i.allocatedIPv4[val] {
-		return ErrIPAlreadyTaken
-	}
-
-	i.allocatedIPv4[val] = true
-	return nil
 }
 
 // Release frees an allocated IP address back to the pool.

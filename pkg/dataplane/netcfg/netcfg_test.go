@@ -25,7 +25,7 @@ func TestConfigureOverlayRejectsBadInput(t *testing.T) {
 	if err := ConfigureOverlay("zro0", "not-an-ip", "", 1420); err == nil {
 		t.Fatal("expected invalid IPv4 address to fail")
 	}
-	if err := AddHostRoute("zro0", "999.1.1.1"); err == nil {
-		t.Fatal("expected invalid route address to fail")
+	if err := AddSubnetRoute("zro0", "999.1.1.0/24"); err == nil {
+		t.Fatal("expected invalid route CIDR to fail")
 	}
 }

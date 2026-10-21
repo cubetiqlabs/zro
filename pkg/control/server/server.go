@@ -241,18 +241,6 @@ func NodeFromContext(ctx context.Context) *core.Node {
 	return nil
 }
 
-// IsEdgeFromContext reports whether the request was authenticated as edge
-// infrastructure (which is allowed to observe cross-tenant mesh state).
-func IsEdgeFromContext(ctx context.Context) bool {
-	if val, ok := ctx.Value(edgeContextKey).(bool); ok && val {
-		return true
-	}
-	if subject := controlauth.FromContext(ctx); subject != nil {
-		return subject.Kind == controlauth.KindEdge
-	}
-	return false
-}
-
 func withTenant(ctx context.Context, tenant *core.Tenant) context.Context {
 	ctx = controlauth.WithSubject(ctx, &controlauth.Subject{Kind: controlauth.KindTenant, Tenant: tenant})
 	return context.WithValue(ctx, tenantContextKey, tenant)

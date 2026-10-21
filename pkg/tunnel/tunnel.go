@@ -125,31 +125,3 @@ func (c *Client) PipeTCP(ctx context.Context, incoming net.Conn, localAddress st
 	}
 	return first
 }
-
-// IngressRouter routes requests at the Gateway level to active node tunnels.
-type IngressRouter struct {
-	mu     sync.RWMutex
-	routes map[string]string // hostname -> node overlay address (e.g. "api.cubis.tech" -> "100.64.0.10:8080")
-}
-
-// NewIngressRouter creates an Ingress router.
-func NewIngressRouter() *IngressRouter {
-	return &IngressRouter{
-		routes: make(map[string]string),
-	}
-}
-
-// Register maps a public hostname to a target overlay address.
-func (r *IngressRouter) Register(hostname, overlayAddr string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.routes[hostname] = overlayAddr
-}
-
-// Lookup finds the overlay destination for a hostname.
-func (r *IngressRouter) Lookup(hostname string) (string, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	target, exists := r.routes[hostname]
-	return target, exists
-}

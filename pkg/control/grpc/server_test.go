@@ -236,7 +236,7 @@ func TestGRPCControlPlaneService(t *testing.T) {
 		gwRoutesResp.Routes[0].Hostname, gwRoutesResp.Routes[0].Backends[0].Address)
 
 	// 10. Test Broadcast to Real-Time Event Stream
-	ctrlServer.BroadcastEvent("gateway_routes_updated", map[string]string{
+	bus.Publish(events.Scope{}, "gateway_routes_updated", map[string]string{
 		"hostname": "myapp-api.example.com",
 	})
 

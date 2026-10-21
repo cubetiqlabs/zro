@@ -21,7 +21,6 @@ type DB struct {
 	EdgePoPs    core.EdgePoPRepository
 	Nodes       core.NodeRepository
 	ACLs        core.ACLRepository
-	Routes      core.RouteRepository
 	Tunnels     core.TunnelRepository
 	Enrollments core.EnrollmentRepository
 }
@@ -65,7 +64,6 @@ func NewDB(driverName, dsn string) (*DB, error) {
 		&core.EdgePoP{},
 		&core.Node{},
 		&core.ACLRule{},
-		&core.Route{},
 		&core.Tunnel{},
 		&core.EnrollmentRedemption{},
 	); err != nil {
@@ -101,7 +99,6 @@ func NewDB(driverName, dsn string) (*DB, error) {
 		EdgePoPs:    newEdgePoPRepo(gormDB),
 		Nodes:       newNodeRepo(gormDB),
 		ACLs:        newACLRepo(gormDB),
-		Routes:      newRouteRepo(gormDB),
 		Tunnels:     newTunnelRepo(gormDB),
 		Enrollments: newEnrollmentRepo(gormDB),
 	}

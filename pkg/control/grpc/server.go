@@ -368,8 +368,3 @@ func (s *Server) StreamMeshEvents(req *v1.StreamEventsRequest, stream v1.Control
 		}
 	}
 }
-
-// BroadcastEvent publishes an unscoped (control-plane wide) event.
-func (s *Server) BroadcastEvent(eventType string, payload any) {
-	s.bus.Publish(events.Scope{}, eventType, payload)
-}

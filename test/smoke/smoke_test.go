@@ -23,7 +23,6 @@ import (
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/gateway"
 	"github.com/cubis/zro/pkg/node"
-	"github.com/cubis/zro/pkg/p2p/puncher"
 	"github.com/cubis/zro/pkg/p2p/stun"
 	"github.com/cubis/zro/pkg/store"
 	"github.com/cubis/zro/pkg/tunnel"
@@ -303,31 +302,6 @@ func TestFullMeshSmoke(t *testing.T) {
 		t.Fatalf("smoke: STUN discovery failed: %v", err)
 	}
 	t.Logf("✅ Smoke Step 8 Passed: STUN NAT reflexive discovery verified (%s)", discovered.String())
-
-	// 10. Smoke Step 9: P2P Hole Punching Simulation
-	p2pConn1, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
-	defer p2pConn1.Close()
-	p2pConn2, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
-	defer p2pConn2.Close()
-
-	go func() {
-		buf := make([]byte, 256)
-		for {
-			n, remote, err := p2pConn2.ReadFromUDP(buf)
-			if err != nil {
-				return
-			}
-			if bytes.Equal(buf[:n], puncher.MagicPing) {
-				_, _ = p2pConn2.WriteToUDP(puncher.MagicPong, remote)
-			}
-		}
-	}()
-
-	p2pResult, err := puncher.Punch(ctx, p2pConn1, p2pConn2.LocalAddr().String(), 500*time.Millisecond)
-	if err != nil || !p2pResult.Success {
-		t.Fatalf("smoke: P2P punch failed: %v", err)
-	}
-	t.Logf("✅ Smoke Step 9 Passed: Direct P2P Hole Punch established (RTT: %v)", p2pResult.RTT)
 
 	// 11. Smoke Step 10: Ingress Gateway, Multi-Node Clustering, Route Sync & Failover
 	// 10a. Multi-node cluster exposes the same service hostname (myapp-api.example.com) on port 3000

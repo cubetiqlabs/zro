@@ -48,9 +48,6 @@ func New(cfg *config.ControlPlaneConfig, db *store.DB, bus *events.Bus) *Service
 	}
 }
 
-// Delegator exposes the shared smart-routing engine (probe history, PoP health).
-func (s *Service) Delegator() *delegation.Engine { return s.delegator }
-
 // publish emits a change event limited to scope; data also carries the event name.
 func (s *Service) publish(scope events.Scope, name string, data map[string]any) {
 	data["event"] = name

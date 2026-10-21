@@ -50,7 +50,6 @@ type Daemon struct {
 	tunDev          tun.Device
 	dev             *agent.Device
 	wgManager       *wireguard.Manager
-	routingTable    *router.Table
 	udpConn         *net.UDPConn
 	discoEngine     *disco.Engine
 	relay           *relayState
@@ -106,7 +105,6 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 		tunDev:       tunDev,
 		dev:          dev,
 		udpConn:      udpConn,
-		routingTable: router.NewTable(),
 		tunnelClient: tunnel.NewClient(),
 		allowedPorts: cfg.AllowedInboundPorts,
 		defaultDeny:  cfg.DefaultDeny,
@@ -590,28 +588,6 @@ func (d *Daemon) Stop() error {
 	return nil
 }
 
-// Leave permanently removes this node from the mesh, freeing its overlay
-// address and tunnels. It is deliberately not part of Stop: a restart must keep
-// the node's identity.
-func (d *Daemon) Leave(ctx context.Context) error {
-	if d.grpcClient != nil {
-		return d.grpcClient.Deregister(ctx)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, d.cfg.PlaneEndpoint+"/api/v1/node", nil)
-	if err != nil {
-		return err
-	}
-	resp, err := d.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("deregister rejected: status %d", resp.StatusCode)
-	}
-	return nil
-}
-
 func (d *Daemon) connectToEdgePoP(pop core.EdgePoP) error {
 	if pop.PublicKey == "" {
 		return nil
@@ -708,7 +684,6 @@ func (d *Daemon) DiscoverAndConnectPeer(ctx context.Context, targetOverlayIP str
 		}
 	}
 
-	d.routingTable.SetRoute(discResp.TargetOverlayIPv4, routeTarget)
 	return &routeTarget, nil
 }
 
@@ -910,11 +885,6 @@ func (d *Daemon) OverlayIPv4() string {
 	return d.overlayIPv4
 }
 
-// SetOverlayIP sets the overlay IPv4 (used during enrollment or testing).
-func (d *Daemon) SetOverlayIP(ip string) {
-	d.overlayIPv4 = ip
-}
-
 // PublicKey returns the node's WireGuard public key.
 func (d *Daemon) PublicKey() string {
 	return d.keyPair.PublicKey
@@ -941,20 +911,6 @@ func (d *Daemon) AllowPort(portProto string) {
 	}
 	d.allowedPorts = append(d.allowedPorts, portProto)
 	slog.Info("Allowed inbound port", "hostname", d.cfg.Hostname, "port", portProto)
-}
-
-// DenyPort removes an allowed port rule from the node's inbound firewall.
-func (d *Daemon) DenyPort(portProto string) {
-	d.policyMu.Lock()
-	defer d.policyMu.Unlock()
-	var updated []string
-	for _, p := range d.allowedPorts {
-		if p != portProto {
-			updated = append(updated, p)
-		}
-	}
-	d.allowedPorts = updated
-	slog.Info("Denying inbound port", "hostname", d.cfg.Hostname, "port", portProto)
 }
 
 // IsTrafficAllowed evaluates if incoming traffic from srcIP to localPort on protocol is permitted.

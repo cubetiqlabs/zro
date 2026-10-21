@@ -8,7 +8,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"net/http"
 	"strings"
 
@@ -147,6 +146,3 @@ func EdgeKey(r *http.Request) string {
 	}
 	return ""
 }
-
-// ErrInvalidToken is returned when a bearer token cannot be verified.
-var ErrInvalidToken = errors.New("invalid or inactive node token")

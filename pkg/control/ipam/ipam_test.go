@@ -38,16 +38,6 @@ func TestIPAMAllocations(t *testing.T) {
 		t.Fatalf("expected 100.64.0.2 after release, got %s", ipReclaimed)
 	}
 
-	// Test static allocation
-	if err := mgr.AllocateSpecific("100.64.0.50"); err != nil {
-		t.Fatalf("AllocateSpecific failed: %v", err)
-	}
-
-	// Conflict allocation should fail
-	if err := mgr.AllocateSpecific("100.64.0.50"); err != ErrIPAlreadyTaken {
-		t.Fatalf("expected ErrIPAlreadyTaken, got %v", err)
-	}
-
 	// Test IPv6 derivation
 	v6, err := DeriveIPv6("fd00:cafe:1::/64", "100.64.0.10")
 	if err != nil {

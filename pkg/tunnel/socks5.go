@@ -3,7 +3,6 @@ package tunnel
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -167,66 +166,4 @@ func (s *SOCKS5Server) sendReply(conn net.Conn, rep byte) error {
 	reply := []byte{0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
 	_, err := conn.Write(reply)
 	return err
-}
-
-// SOCKS5Dialer connects to a target host:port via a remote SOCKS5 proxy server.
-func SOCKS5DialContext(ctx context.Context, socksProxyAddr, targetAddr string) (net.Conn, error) {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", socksProxyAddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to dial SOCKS5 proxy: %w", err)
-	}
-
-	// Handshake
-	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		conn.Close()
-		return nil, err
-	}
-	authResp := make([]byte, 2)
-	if _, err := io.ReadFull(conn, authResp); err != nil || authResp[1] != 0x00 {
-		conn.Close()
-		return nil, errors.New("socks5 auth rejected")
-	}
-
-	// Connect request
-	host, portStr, err := net.SplitHostPort(targetAddr)
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-	port, _ := strconv.Atoi(portStr)
-
-	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
-	req = append(req, []byte(host)...)
-	portBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(portBytes, uint16(port))
-	req = append(req, portBytes...)
-
-	if _, err := conn.Write(req); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	reply := make([]byte, 4)
-	if _, err := io.ReadFull(conn, reply); err != nil || reply[1] != 0x00 {
-		conn.Close()
-		return nil, fmt.Errorf("socks5 connect failed: code 0x%02x", reply[1])
-	}
-
-	// Read remainder of bind address
-	switch reply[3] {
-	case 0x01: // IPv4 (4 bytes) + 2 port
-		bnd := make([]byte, 6)
-		_, _ = io.ReadFull(conn, bnd)
-	case 0x03: // domain
-		l := make([]byte, 1)
-		_, _ = io.ReadFull(conn, l)
-		bnd := make([]byte, int(l[0])+2)
-		_, _ = io.ReadFull(conn, bnd)
-	case 0x04: // IPv6 (16 bytes) + 2 port
-		bnd := make([]byte, 18)
-		_, _ = io.ReadFull(conn, bnd)
-	}
-
-	return conn, nil
 }

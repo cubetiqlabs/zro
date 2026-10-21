@@ -112,11 +112,6 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// RawClient returns the underlying generated protobuf client.
-func (c *Client) RawClient() v1.ControlPlaneServiceClient {
-	return c.client
-}
-
 // Enroll performs authenticated node or gateway registration over gRPC.
 func (c *Client) Enroll(ctx context.Context, req *v1.EnrollRequest) (*v1.EnrollResponse, error) {
 	return c.client.Enroll(ctx, req)

@@ -69,14 +69,6 @@ type ACLRepository interface {
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 
-// RouteRepository defines operations for subnet routes.
-type RouteRepository interface {
-	Create(ctx context.Context, route *Route) error
-	GetByID(ctx context.Context, id uuid.UUID) (*Route, error)
-	ListByNetworkID(ctx context.Context, networkID string) ([]Route, error)
-	Delete(ctx context.Context, id uuid.UUID) error
-}
-
 // TunnelRepository defines operations for Cloudflared-style exposed services.
 type TunnelRepository interface {
 	Create(ctx context.Context, tunnel *Tunnel) error
