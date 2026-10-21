@@ -118,9 +118,8 @@ func TenantKey(r *http.Request) string {
 	return ""
 }
 
-// NodeToken extracts a node bearer token from headers or the WebSocket/SSE
-// query string. Query-string support exists for browser WebSocket clients that
-// cannot set an Authorization header.
+// NodeToken extracts a node bearer token from request headers. Credentials in
+// the query string are deliberately unsupported: URLs end up in logs.
 func NodeToken(r *http.Request) string {
 	if token := BearerToken(r); token != "" {
 		return token
@@ -128,13 +127,10 @@ func NodeToken(r *http.Request) string {
 	if token := strings.TrimSpace(r.Header.Get("X-Node-Token")); token != "" {
 		return token
 	}
-	if token := strings.TrimSpace(r.URL.Query().Get("node_token")); token != "" {
-		return token
-	}
-	return strings.TrimSpace(r.URL.Query().Get("token"))
+	return ""
 }
 
-// EdgeKey extracts an edge API key from headers or the WebSocket query string.
+// EdgeKey extracts an edge API key from request headers.
 func EdgeKey(r *http.Request) string {
 	if key := BearerToken(r); key != "" {
 		return key
@@ -143,9 +139,6 @@ func EdgeKey(r *http.Request) string {
 		return key
 	}
 	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
-		return key
-	}
-	if key := strings.TrimSpace(r.URL.Query().Get("edge_key")); key != "" {
 		return key
 	}
 	return ""

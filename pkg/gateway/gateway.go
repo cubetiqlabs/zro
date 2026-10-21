@@ -15,6 +15,7 @@ import (
 
 	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
+	controlauth "github.com/cubis/zro/pkg/control/auth"
 	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/core"
@@ -48,6 +49,7 @@ type Daemon struct {
 	proxyEngine   *proxy.Engine
 	healthChecker *proxy.HealthChecker
 	httpClient    *http.Client
+	token         controlauth.TokenHolder // bearer token issued at enrollment
 	grpcClient    *controlgrpc.Client
 	httpServer    *http.Server
 	httpsServer   *http.Server
@@ -106,8 +108,12 @@ func NewDaemon(cfg *config.GatewayConfig) (*Daemon, error) {
 		udpConn:       udpConn,
 		proxyEngine:   proxy.NewEngine(),
 		healthChecker: proxy.NewHealthChecker(2 * time.Second),
-		httpClient:    &http.Client{Timeout: 10 * time.Second},
 		stunWaiters:   make(map[[12]byte]chan *stun.ReflexiveAddress),
+	}
+
+	d.httpClient = &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: controlauth.NewBearerTransport(nil, cfg.PlaneEndpoint, d.token.Get),
 	}
 
 	wgMgr, err := wireguard.NewManager(cfg.InterfaceName,
@@ -406,6 +412,7 @@ func (d *Daemon) enrollAndConnect(ctx context.Context) error {
 		return fmt.Errorf("failed to decode gateway enrollment response: %w", err)
 	}
 
+	d.token.Set(enrollResp.NodeToken)
 	d.nodeID = enrollResp.NodeID
 	d.networkID = enrollResp.NetworkID
 	d.overlayIPv4 = enrollResp.OverlayIPv4

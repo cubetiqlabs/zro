@@ -2,15 +2,20 @@ package core
 
 import (
 	"context"
+	"errors"
+	"time"
 
 	"github.com/google/uuid"
 )
 
 // TenantRepository defines operations for Tenant entities.
 type TenantRepository interface {
-	Create(ctx context.Context, tenant *Tenant) error
 	GetByID(ctx context.Context, id uuid.UUID) (*Tenant, error)
+	// Create takes the plaintext APIKey, stores only its hash, and leaves the plaintext on the struct.
+	Create(ctx context.Context, tenant *Tenant) error
 	GetByAPIKey(ctx context.Context, apiKey string) (*Tenant, error)
+	// RotateAPIKey replaces the tenant key with newKey (plaintext) and invalidates the old one.
+	RotateAPIKey(ctx context.Context, id uuid.UUID, newKey string) error
 	List(ctx context.Context) ([]Tenant, error)
 	Update(ctx context.Context, tenant *Tenant) error
 	Delete(ctx context.Context, id uuid.UUID) error
@@ -73,6 +78,19 @@ type TunnelRepository interface {
 	GetByHostname(ctx context.Context, hostname string) (*Tunnel, error)
 	ListByHostname(ctx context.Context, hostname string) ([]Tunnel, error)
 	ListByNodeID(ctx context.Context, nodeID uuid.UUID) ([]Tunnel, error)
+	ListByNetworkID(ctx context.Context, networkID string) ([]Tunnel, error)
 	ListAll(ctx context.Context) ([]Tunnel, error)
 	Delete(ctx context.Context, id uuid.UUID) error
+}
+
+// ErrTokenReused is returned when an enrollment token was already redeemed by another key.
+var ErrTokenReused = errors.New("enrollment token already used")
+
+// EnrollmentRepository tracks redeemed enrollment-token nonces.
+type EnrollmentRepository interface {
+	// Redeem records nonce for pubKey. Re-redeeming with the same key is
+	// allowed (idempotent re-enroll); a different key gets ErrTokenReused.
+	Redeem(ctx context.Context, nonce, pubKey string, expires time.Time) error
+	// PurgeExpired deletes redemptions whose token has expired.
+	PurgeExpired(ctx context.Context) error
 }

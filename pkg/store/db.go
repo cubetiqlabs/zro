@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/cubis/zro/pkg/core"
@@ -15,13 +16,14 @@ import (
 // DB wraps the GORM database instance and repositories.
 type DB struct {
 	*gorm.DB
-	Tenants  core.TenantRepository
-	Networks core.NetworkRepository
-	EdgePoPs core.EdgePoPRepository
-	Nodes    core.NodeRepository
-	ACLs     core.ACLRepository
-	Routes   core.RouteRepository
-	Tunnels  core.TunnelRepository
+	Tenants     core.TenantRepository
+	Networks    core.NetworkRepository
+	EdgePoPs    core.EdgePoPRepository
+	Nodes       core.NodeRepository
+	ACLs        core.ACLRepository
+	Routes      core.RouteRepository
+	Tunnels     core.TunnelRepository
+	Enrollments core.EnrollmentRepository
 }
 
 // NewDB opens a database connection (PostgreSQL or SQLite) and executes auto-migrations.
@@ -60,6 +62,7 @@ func NewDB(driverName, dsn string) (*DB, error) {
 		&core.ACLRule{},
 		&core.Route{},
 		&core.Tunnel{},
+		&core.EnrollmentRedemption{},
 	); err != nil {
 		return nil, fmt.Errorf("failed to auto-migrate database schema: %w", err)
 	}
@@ -68,17 +71,34 @@ func NewDB(driverName, dsn string) (*DB, error) {
 	_ = gormDB.Exec("DROP INDEX IF EXISTS idx_tunnels_public_hostname").Error
 	_ = gormDB.Exec("CREATE INDEX IF NOT EXISTS idx_tunnels_public_hostname ON tunnels(public_hostname)").Error
 
+	// Hash any tenant API keys stored in plaintext by older versions.
+	var legacy []core.Tenant
+	if err := gormDB.Find(&legacy).Error; err == nil {
+		for _, t := range legacy {
+			if len(t.APIKey) != 64 || strings.Trim(t.APIKey, "0123456789abcdef") != "" {
+				gormDB.Model(&core.Tenant{}).Where("id = ?", t.ID).Update("api_key", core.HashAPIKey(t.APIKey))
+			}
+		}
+	}
+
+	// Backfill tenant/network ownership on tunnels created before they carried it.
+	_ = gormDB.Exec(`UPDATE tunnels SET network_id = (SELECT network_id FROM nodes WHERE nodes.id = tunnels.node_id)
+		WHERE (network_id IS NULL OR network_id = '')`).Error
+	_ = gormDB.Exec(`UPDATE tunnels SET tenant_id = (SELECT tenant_id FROM networks WHERE networks.id = tunnels.network_id)
+		WHERE tenant_id IS NULL OR tenant_id = '00000000-0000-0000-0000-000000000000'`).Error
+
 	slog.Info("Database schema migrated successfully", "driver", driverName)
 
 	dbInstance := &DB{
-		DB:       gormDB,
-		Tenants:  newTenantRepo(gormDB),
-		Networks: newNetworkRepo(gormDB),
-		EdgePoPs: newEdgePoPRepo(gormDB),
-		Nodes:    newNodeRepo(gormDB),
-		ACLs:     newACLRepo(gormDB),
-		Routes:   newRouteRepo(gormDB),
-		Tunnels:  newTunnelRepo(gormDB),
+		DB:          gormDB,
+		Tenants:     newTenantRepo(gormDB),
+		Networks:    newNetworkRepo(gormDB),
+		EdgePoPs:    newEdgePoPRepo(gormDB),
+		Nodes:       newNodeRepo(gormDB),
+		ACLs:        newACLRepo(gormDB),
+		Routes:      newRouteRepo(gormDB),
+		Tunnels:     newTunnelRepo(gormDB),
+		Enrollments: newEnrollmentRepo(gormDB),
 	}
 
 	return dbInstance, nil

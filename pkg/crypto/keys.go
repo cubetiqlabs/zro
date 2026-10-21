@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -84,82 +85,97 @@ func GenerateRandomHex(n int) (string, error) {
 
 // EnrollmentTokenPayload carries node enrollment claims.
 type EnrollmentTokenPayload struct {
-	NetworkID      string
-	Hostname       string
-	ExpiresAt      time.Time
-	BoundPublicKey string
+	NetworkID      string    `json:"net"`
+	Hostname       string    `json:"host"`
+	NodeType       string    `json:"nt,omitempty"` // empty means "peer"
+	BoundPublicKey string    `json:"pk,omitempty"`
+	Nonce          string    `json:"n"` // unique per token; the control plane redeems each nonce once
+	ExpiresAt      time.Time `json:"-"`
+	Expiry         int64     `json:"exp"`
 }
 
-// GenerateEnrollmentToken creates a signed, time-bound node enrollment token, optionally bound to a WireGuard public key.
-func GenerateEnrollmentToken(secretKey string, networkID, hostname string, duration time.Duration, boundPubKey ...string) string {
-	exp := time.Now().Add(duration).Unix()
-	var pubKey string
-	if len(boundPubKey) > 0 {
-		pubKey = boundPubKey[0]
-	}
+// DefaultSecretKey is the well-known placeholder shipped in example configs.
+// It must never sign production tokens.
+const DefaultSecretKey = "change-me-in-production-cluster-secret"
 
-	payload := fmt.Sprintf("%s:%s:%d:%s", networkID, hostname, exp, pubKey)
+const enrollmentTokenPrefix = "zro_tok_"
+
+func signEnrollmentPayload(secretKey string, raw []byte) string {
 	mac := hmac.New(sha256.New, []byte(secretKey))
-	mac.Write([]byte(payload))
-	sig := hex.EncodeToString(mac.Sum(nil))
-	encodedPayload := base64.RawURLEncoding.EncodeToString([]byte(payload))
-	return fmt.Sprintf("zro_tok_%s.%s", encodedPayload, sig)
+	mac.Write(raw)
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// VerifyEnrollmentToken validates a signed node enrollment token and checks public key binding if bound.
+// SignEnrollmentToken signs the given claims. A nonce is generated when empty.
+func SignEnrollmentToken(secretKey string, p EnrollmentTokenPayload) (string, error) {
+	if p.Nonce == "" {
+		nonce := make([]byte, 16)
+		if _, err := rand.Read(nonce); err != nil {
+			return "", err
+		}
+		p.Nonce = hex.EncodeToString(nonce)
+	}
+	if p.Expiry == 0 {
+		return "", errors.New("token expiry is required")
+	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s%s.%s", enrollmentTokenPrefix, base64.RawURLEncoding.EncodeToString(raw), signEnrollmentPayload(secretKey, raw)), nil
+}
+
+// GenerateEnrollmentToken creates a signed, time-bound peer enrollment token,
+// optionally bound to a WireGuard public key.
+func GenerateEnrollmentToken(secretKey string, networkID, hostname string, duration time.Duration, boundPubKey ...string) string {
+	p := EnrollmentTokenPayload{NetworkID: networkID, Hostname: hostname, Expiry: time.Now().Add(duration).Unix()}
+	if len(boundPubKey) > 0 {
+		p.BoundPublicKey = boundPubKey[0]
+	}
+	tok, err := SignEnrollmentToken(secretKey, p)
+	if err != nil { // only reachable if the system RNG fails
+		panic(fmt.Sprintf("crypto: enrollment token signing failed: %v", err))
+	}
+	return tok
+}
+
+// VerifyEnrollmentToken validates a signed node enrollment token. If the token
+// is bound to a public key, the caller must present exactly that key.
 func VerifyEnrollmentToken(secretKey, token string, clientPubKey ...string) (*EnrollmentTokenPayload, error) {
-	if !strings.HasPrefix(token, "zro_tok_") {
+	if !strings.HasPrefix(token, enrollmentTokenPrefix) {
 		return nil, errors.New("invalid token format")
 	}
-	parts := strings.Split(strings.TrimPrefix(token, "zro_tok_"), ".")
+	parts := strings.Split(strings.TrimPrefix(token, enrollmentTokenPrefix), ".")
 	if len(parts) != 2 {
 		return nil, errors.New("malformed token structure")
 	}
-
-	rawPayload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	raw, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
 		return nil, errors.New("failed to decode token payload")
 	}
-
-	mac := hmac.New(sha256.New, []byte(secretKey))
-	mac.Write(rawPayload)
-	expectedSig := hex.EncodeToString(mac.Sum(nil))
-
-	if !hmac.Equal([]byte(parts[1]), []byte(expectedSig)) {
+	if !hmac.Equal([]byte(parts[1]), []byte(signEnrollmentPayload(secretKey, raw))) {
 		return nil, errors.New("invalid token signature")
 	}
 
-	subParts := strings.Split(string(rawPayload), ":")
-	if len(subParts) < 3 {
+	var p EnrollmentTokenPayload
+	if err := json.Unmarshal(raw, &p); err != nil || p.NetworkID == "" || p.Nonce == "" {
 		return nil, errors.New("invalid payload elements")
 	}
-
-	var expSec int64
-	if _, err := fmt.Sscanf(subParts[2], "%d", &expSec); err != nil {
-		return nil, errors.New("invalid token expiration")
-	}
-
-	exp := time.Unix(expSec, 0)
-	if time.Now().After(exp) {
+	p.ExpiresAt = time.Unix(p.Expiry, 0)
+	if time.Now().After(p.ExpiresAt) {
 		return nil, errors.New("token expired")
 	}
-
-	var boundKey string
-	if len(subParts) >= 4 {
-		boundKey = subParts[3]
+	if p.BoundPublicKey != "" && (len(clientPubKey) == 0 || clientPubKey[0] != p.BoundPublicKey) {
+		return nil, errors.New("token is bound to a different public key")
 	}
+	return &p, nil
+}
 
-	// If token was bound to a specific WireGuard public key, enforce match
-	if boundKey != "" && len(clientPubKey) > 0 && clientPubKey[0] != "" {
-		if boundKey != clientPubKey[0] {
-			return nil, fmt.Errorf("token bound to public key %s, received %s", boundKey, clientPubKey[0])
-		}
+// ValidatePublicKey requires a base64-encoded 32-byte WireGuard key.
+func ValidatePublicKey(key string) error {
+	raw, err := base64.StdEncoding.DecodeString(key)
+	if err != nil || len(raw) != KeySize {
+		return errors.New("public key must be a base64-encoded 32-byte key")
 	}
-
-	return &EnrollmentTokenPayload{
-		NetworkID:      subParts[0],
-		Hostname:       subParts[1],
-		ExpiresAt:      exp,
-		BoundPublicKey: boundKey,
-	}, nil
+	return nil
 }

@@ -18,18 +18,18 @@ var (
 
 // PoPScore holds calculated ranking metric for a PoP relative to a node.
 type PoPScore struct {
-	PoP     core.EdgePoP
-	RTT     time.Duration
-	Loss    float64
-	Score   float64 // lower score is better
+	PoP   core.EdgePoP
+	RTT   time.Duration
+	Loss  float64
+	Score float64 // lower score is better
 }
 
 // DelegationResult represents the Edge PoP assignment for a node.
 type DelegationResult struct {
-	PrimaryPoP   core.EdgePoP   `json:"primary_pop"`
-	SecondaryPoP *core.EdgePoP  `json:"secondary_pop,omitempty"`
-	AssignedAt   time.Time      `json:"assigned_at"`
-	Reason       string         `json:"reason"`
+	PrimaryPoP   core.EdgePoP  `json:"primary_pop"`
+	SecondaryPoP *core.EdgePoP `json:"secondary_pop,omitempty"`
+	AssignedAt   time.Time     `json:"assigned_at"`
+	Reason       string        `json:"reason"`
 }
 
 // Engine coordinates smart routing delegation based on latency probes and PoP health.

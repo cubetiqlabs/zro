@@ -16,6 +16,7 @@ import (
 
 	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
+	controlauth "github.com/cubis/zro/pkg/control/auth"
 	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/core"
@@ -54,6 +55,7 @@ type Daemon struct {
 	derpClient   *derp.Client
 	tunnelClient *tunnel.Client
 	httpClient   *http.Client
+	token        controlauth.TokenHolder // bearer token issued at enrollment
 	grpcClient   *controlgrpc.Client
 
 	// Zero-Trust Inbound Firewall & Mesh Listeners
@@ -112,12 +114,16 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 		udpConn:       udpConn,
 		routingTable:  router.NewTable(),
 		tunnelClient:  tunnel.NewClient(),
-		httpClient:    &http.Client{Timeout: 10 * time.Second},
 		allowedPorts:  cfg.AllowedInboundPorts,
 		defaultDeny:   cfg.DefaultDeny,
 		meshListeners: make(map[int]*guardedListener),
 		stunWaiters:   make(map[[12]byte]chan *stun.ReflexiveAddress),
 		punchWaiters:  make(map[string]chan struct{}),
+	}
+
+	d.httpClient = &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: controlauth.NewBearerTransport(nil, cfg.PlaneEndpoint, d.token.Get),
 	}
 
 	wgMgr, err := wireguard.NewManager(cfg.InterfaceName,
@@ -274,6 +280,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}
 
+	d.token.Set(enrollResp.NodeToken)
 	d.nodeID = enrollResp.NodeID
 	d.networkID = enrollResp.NetworkID
 	d.overlayIPv4 = enrollResp.OverlayIPv4

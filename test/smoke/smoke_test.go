@@ -248,7 +248,7 @@ func TestFullMeshSmoke(t *testing.T) {
 		InitiatorEndpoints: core.StringList{"192.168.1.100:51820"},
 	}
 	discBody, _ := json.Marshal(p2pDiscReq)
-	resp, err = http.Post(ts.URL+"/api/v1/p2p/discover", "application/json", bytes.NewReader(discBody))
+	resp, err = authedDo(http.MethodPost, ts.URL+"/api/v1/p2p/discover", enroll1Resp.NodeToken, discBody)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("smoke: P2P discovery failed: status %d", resp.StatusCode)
 	}
@@ -273,7 +273,7 @@ func TestFullMeshSmoke(t *testing.T) {
 		PacketLoss: 0.0,
 	}
 	probeBody, _ := json.Marshal(probeSample)
-	resp, err = http.Post(ts.URL+"/api/v1/probes", "application/json", bytes.NewReader(probeBody))
+	resp, err = authedDo(http.MethodPost, ts.URL+"/api/v1/probes", enroll1Resp.NodeToken, probeBody)
 	if err != nil || resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("smoke: probe submission failed, status: %d", resp.StatusCode)
 	}
@@ -342,7 +342,7 @@ func TestFullMeshSmoke(t *testing.T) {
 		Protocol:       "http",
 	}
 	tun1Body, _ := json.Marshal(tun1Req)
-	rTun1, err := http.Post(ts.URL+"/api/v1/tunnels", "application/json", bytes.NewReader(tun1Body))
+	rTun1, err := authedDo(http.MethodPost, ts.URL+"/api/v1/tunnels", enroll1Resp.NodeToken, tun1Body)
 	if err != nil || rTun1.StatusCode != http.StatusCreated {
 		t.Fatalf("smoke: failed to register tunnel for node 1, status: %d", rTun1.StatusCode)
 	}
@@ -356,7 +356,7 @@ func TestFullMeshSmoke(t *testing.T) {
 		Protocol:       "http",
 	}
 	tun2Body, _ := json.Marshal(tun2Req)
-	rTun2, err := http.Post(ts.URL+"/api/v1/tunnels", "application/json", bytes.NewReader(tun2Body))
+	rTun2, err := authedDo(http.MethodPost, ts.URL+"/api/v1/tunnels", enroll2Resp.NodeToken, tun2Body)
 	if err != nil || rTun2.StatusCode != http.StatusCreated {
 		t.Fatalf("smoke: failed to register clustered tunnel for node 2, status: %d", rTun2.StatusCode)
 	}
@@ -364,7 +364,7 @@ func TestFullMeshSmoke(t *testing.T) {
 	t.Log("✅ Smoke Step 10a Passed: Multi-node cluster tunnels registered for myapp-api.example.com")
 
 	// 10b. Control Plane Gateway Dynamic Routes API (aggregates node overlay IPs)
-	resp, err = http.Get(ts.URL + "/api/v1/gateway/routes")
+	resp, err = authedDo(http.MethodGet, ts.URL+"/api/v1/gateway/routes", enroll1Resp.NodeToken, nil)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("smoke: failed to get gateway routes, status: %d", resp.StatusCode)
 	}
@@ -398,7 +398,13 @@ func TestFullMeshSmoke(t *testing.T) {
 
 	// 10c. Gateway Node Enrollment (NodeTypeGateway) with overlay IP & PoP delegation
 	kpGW1, _ := crypto.GenerateKeyPair()
-	tokenGW1 := crypto.GenerateEnrollmentToken(secretKey, createdNet.ID, "gw1", 1*time.Hour, kpGW1.PublicKey)
+	tokenGW1, err := crypto.SignEnrollmentToken(secretKey, crypto.EnrollmentTokenPayload{
+		NetworkID: createdNet.ID, Hostname: "gw1", NodeType: "gateway", BoundPublicKey: kpGW1.PublicKey,
+		Expiry: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("smoke: gateway token: %v", err)
+	}
 	enrollGW1Req := server.EnrollRequest{
 		Token:     tokenGW1,
 		PublicKey: kpGW1.PublicKey,
@@ -569,7 +575,7 @@ func TestFullMeshSmoke(t *testing.T) {
 		Protocol:       "http",
 	}
 	tunWSBytes, _ := json.Marshal(tunWS)
-	resp, _ = http.Post(ts.URL+"/api/v1/tunnels", "application/json", bytes.NewReader(tunWSBytes))
+	resp, _ = authedDo(http.MethodPost, ts.URL+"/api/v1/tunnels", enroll1Resp.NodeToken, tunWSBytes)
 	_ = resp.Body.Close()
 
 	var wsPushMsg string
@@ -760,4 +766,16 @@ func TestFullMeshSmoke(t *testing.T) {
 	}
 	_ = allowedConn.Close()
 	t.Log("✅ Smoke Step 16c Passed: Dynamic zero-trust firewall policy update verified (port 22 allowed)")
+}
+
+
+// authedDo sends a JSON request authenticated with a node token.
+func authedDo(method, url, token string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequest(method, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	return http.DefaultClient.Do(req)
 }

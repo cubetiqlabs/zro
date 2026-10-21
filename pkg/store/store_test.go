@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -99,5 +100,24 @@ func TestStoreRepositories(t *testing.T) {
 	}
 	if len(ips) != 1 || ips[0] != "100.64.0.10" {
 		t.Fatalf("expected ['100.64.0.10'], got %v", ips)
+	}
+}
+
+func TestEnrollmentRedeemSingleUse(t *testing.T) {
+	db, err := NewDB("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	exp := time.Now().Add(time.Hour)
+
+	if err := db.Enrollments.Redeem(ctx, "n1", "keyA", exp); err != nil {
+		t.Fatalf("first redeem: %v", err)
+	}
+	if err := db.Enrollments.Redeem(ctx, "n1", "keyA", exp); err != nil {
+		t.Fatalf("same key must be idempotent: %v", err)
+	}
+	if err := db.Enrollments.Redeem(ctx, "n1", "keyB", exp); !errors.Is(err, core.ErrTokenReused) {
+		t.Fatalf("different key must be rejected, got %v", err)
 	}
 }

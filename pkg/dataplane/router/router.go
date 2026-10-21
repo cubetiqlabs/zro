@@ -9,7 +9,7 @@ import (
 // RouteTarget defines the forwarding target for an overlay IP or subnet.
 type RouteTarget struct {
 	PublicKey   string `json:"public_key"`
-	Endpoint    string `json:"endpoint,omitempty"` // Direct UDP endpoint (e.g. "203.0.113.5:51820")
+	Endpoint    string `json:"endpoint,omitempty"`     // Direct UDP endpoint (e.g. "203.0.113.5:51820")
 	ViaPoPCode  string `json:"via_pop_code,omitempty"` // PoP code if relayed (e.g. "KH", "SG")
 	IsDirectP2P bool   `json:"is_direct_p2p"`
 	Metric      int    `json:"metric"`
@@ -17,8 +17,8 @@ type RouteTarget struct {
 
 // Table represents an in-memory high-speed routing table for the overlay network.
 type Table struct {
-	mu     sync.RWMutex
-	routes map[string]RouteTarget // exact /32 or /128 IP match
+	mu      sync.RWMutex
+	routes  map[string]RouteTarget // exact /32 or /128 IP match
 	subnets []subnetRoute
 }
 

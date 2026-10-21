@@ -249,6 +249,7 @@ func TestSmartRoutingAndP2PDiscovery(t *testing.T) {
 	}
 	discBody, _ := json.Marshal(p2pDiscReq)
 	discReq := httptest.NewRequest("POST", "/api/v1/p2p/discover", bytes.NewReader(discBody))
+	discReq.Header.Set("Authorization", "Bearer "+res1.NodeToken)
 	discRec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(discRec, discReq)
 
@@ -309,7 +310,7 @@ func TestMeshGraphAndEdgeHeartbeatsAndACLs(t *testing.T) {
 		PoPCode:        "KH",
 		Region:         "Cambodia",
 		PublicEndpoint: "173.1.1.1:51820",
-		PublicKey:      "kh-key=",
+		PublicKey:      "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
 		Weight:         100,
 	})
 	popReq := httptest.NewRequest("POST", "/api/v1/edge/register", bytes.NewReader(popReqBody))
@@ -629,4 +630,169 @@ func TestServerAuthAndTenantIsolation(t *testing.T) {
 	}
 	_ = rEdgeValid.Body.Close()
 	t.Log("✅ TestServerAuthAndTenantIsolation passed: 401 enforcement, API key validation, multi-tenant isolation, and edge authentication verified")
+}
+
+func TestPhase1AuthMatrix(t *testing.T) {
+	db, err := store.NewDB("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const secret = "matrix-secret"
+	srv := NewServer(&config.ControlPlaneConfig{
+		SecretKey: secret, AdminAPIKey: "admin-key", RequireAuth: true,
+		DefaultCIDRv4: "100.64.0.0/16", DefaultCIDRv6: "fd00:cafe::/64",
+	}, db)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	do := func(method, path, bearer string, body any) (int, []byte) {
+		var rdr *bytes.Reader
+		if body != nil {
+			b, _ := json.Marshal(body)
+			rdr = bytes.NewReader(b)
+		} else {
+			rdr = bytes.NewReader(nil)
+		}
+		req, _ := http.NewRequest(method, ts.URL+path, rdr)
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(resp.Body)
+		return resp.StatusCode, buf.Bytes()
+	}
+
+	// Admin API: wrong key is rejected, tenants are created with a one-time key.
+	if code, _ := do("GET", "/api/v1/tenants", "nope", nil); code != http.StatusUnauthorized {
+		t.Fatalf("wrong admin key: got %d", code)
+	}
+	mkTenant := func(slug string) (id, key string) {
+		code, body := do("POST", "/api/v1/tenants", "admin-key", map[string]string{"name": slug, "slug": slug})
+		var out tenantResponse
+		_ = json.Unmarshal(body, &out)
+		if code != http.StatusCreated || out.APIKey == "" {
+			t.Fatalf("create tenant %s: %d %s", slug, code, body)
+		}
+		return out.ID.String(), out.APIKey
+	}
+	_, keyA := mkTenant("alpha")
+	tenantBID, keyB := mkTenant("beta")
+	if _, body := do("GET", "/api/v1/tenants", "admin-key", nil); bytes.Contains(body, []byte(keyA)) {
+		t.Fatal("tenant listing must never expose API keys")
+	}
+
+	mkNet := func(key string) string {
+		code, body := do("POST", "/api/v1/networks", key, CreateNetworkRequest{Name: "n"})
+		var n core.Network
+		_ = json.Unmarshal(body, &n)
+		if code != http.StatusCreated {
+			t.Fatalf("create network: %d %s", code, body)
+		}
+		return n.ID
+	}
+	netA, netB := mkNet(keyA), mkNet(keyB)
+
+	enrollNode := func(netID, host string) (EnrollResponse, string) {
+		kp, _ := crypto.GenerateKeyPair()
+		tok := crypto.GenerateEnrollmentToken(secret, netID, host, time.Hour, kp.PublicKey)
+		code, body := do("POST", "/api/v1/enroll", "", EnrollRequest{Token: tok, PublicKey: kp.PublicKey, Hostname: host})
+		var resp EnrollResponse
+		_ = json.Unmarshal(body, &resp)
+		if code != http.StatusOK || resp.NodeToken == "" {
+			t.Fatalf("enroll %s: %d %s", host, code, body)
+		}
+		return resp, tok
+	}
+	nodeA, tokA := enrollNode(netA, "a1")
+	nodeB, _ := enrollNode(netB, "b1")
+
+	// Enrollment: hostname mismatch, wrong role and replay by another key are refused.
+	kp2, _ := crypto.GenerateKeyPair()
+	if code, _ := do("POST", "/api/v1/enroll", "", EnrollRequest{Token: tokA, PublicKey: kp2.PublicKey}); code != http.StatusUnauthorized {
+		t.Fatalf("token bound to another key must fail, got %d", code)
+	}
+	unbound, _ := crypto.SignEnrollmentToken(secret, crypto.EnrollmentTokenPayload{NetworkID: netA, Hostname: "x", Expiry: time.Now().Add(time.Hour).Unix()})
+	kp3, _ := crypto.GenerateKeyPair()
+	if code, _ := do("POST", "/api/v1/enroll", "", EnrollRequest{Token: unbound, PublicKey: kp2.PublicKey, Hostname: "x"}); code != http.StatusOK {
+		t.Fatalf("first redemption should succeed, got %d", code)
+	}
+	if code, _ := do("POST", "/api/v1/enroll", "", EnrollRequest{Token: unbound, PublicKey: kp3.PublicKey, Hostname: "x"}); code != http.StatusConflict {
+		t.Fatalf("replay by another key must conflict, got %d", code)
+	}
+	if code, _ := do("POST", "/api/v1/enroll", "", EnrollRequest{Token: unbound, PublicKey: kp2.PublicKey, Hostname: "x", NodeType: core.NodeTypeGateway}); code != http.StatusForbidden {
+		t.Fatalf("peer token must not enroll a gateway, got %d", code)
+	}
+
+	// Node endpoints demand a token.
+	for _, path := range []string{"/api/v1/gateway/routes", "/api/v1/network/" + netA + "/peers", "/api/v1/tunnels"} {
+		if code, _ := do("GET", path, "", nil); code != http.StatusUnauthorized {
+			t.Fatalf("%s without token: got %d", path, code)
+		}
+	}
+	if code, _ := do("POST", "/api/v1/probes", "", core.LatencySample{PoPCode: "KH"}); code != http.StatusUnauthorized {
+		t.Fatalf("probes without token: got %d", code)
+	}
+
+	// Cross-network reads are denied; probing another network's node IP finds nothing.
+	if code, _ := do("GET", "/api/v1/network/"+netA+"/peers", nodeB.NodeToken, nil); code != http.StatusForbidden {
+		t.Fatalf("peers of another network: got %d", code)
+	}
+	if code, _ := do("POST", "/api/v1/p2p/discover", nodeB.NodeToken, P2PDiscoverRequest{TargetNodeID: &nodeA.NodeID}); code != http.StatusNotFound {
+		t.Fatalf("p2p to another network's node: got %d", code)
+	}
+
+	// Tunnels: owned by the caller's network, hostnames cannot be hijacked, bad input rejected.
+	tun := core.Tunnel{PublicHostname: "App.Example.com", LocalAddress: "127.0.0.1:8080"}
+	if code, body := do("POST", "/api/v1/tunnels", nodeA.NodeToken, tun); code != http.StatusCreated {
+		t.Fatalf("register tunnel: %d %s", code, body)
+	}
+	if code, _ := do("POST", "/api/v1/tunnels", nodeB.NodeToken, tun); code != http.StatusConflict {
+		t.Fatalf("hostname hijack must conflict, got %d", code)
+	}
+	if code, _ := do("POST", "/api/v1/tunnels", nodeA.NodeToken, core.Tunnel{PublicHostname: "bad host!", LocalAddress: "127.0.0.1:1"}); code != http.StatusBadRequest {
+		t.Fatalf("invalid hostname: got %d", code)
+	}
+	_, body := do("GET", "/api/v1/gateway/routes", nodeB.NodeToken, nil)
+	if bytes.Contains(body, []byte("app.example.com")) {
+		t.Fatal("gateway routes leaked another network's tunnel")
+	}
+	var list []core.Tunnel
+	_, body = do("GET", "/api/v1/tunnels", nodeA.NodeToken, nil)
+	_ = json.Unmarshal(body, &list)
+	if len(list) != 1 {
+		t.Fatalf("expected 1 tunnel, got %d", len(list))
+	}
+	if code, _ := do("DELETE", "/api/v1/tunnels/"+list[0].ID.String(), nodeB.NodeToken, nil); code != http.StatusNotFound {
+		t.Fatalf("deleting another node's tunnel: got %d", code)
+	}
+	if code, _ := do("DELETE", "/api/v1/tunnels/"+list[0].ID.String(), nodeA.NodeToken, nil); code != http.StatusNoContent {
+		t.Fatalf("deleting own tunnel: got %d", code)
+	}
+
+	// Mesh graph honors ownership; no cross-tenant default.
+	if code, _ := do("GET", "/api/v1/mesh/graph?network_id="+netA, keyB, nil); code != http.StatusForbidden {
+		t.Fatalf("graph of another tenant's network: got %d", code)
+	}
+	if code, _ := do("GET", "/api/v1/mesh/graph?network_id="+netB, keyB, nil); code != http.StatusOK {
+		t.Fatalf("graph of own network: got %d", code)
+	}
+
+	// Key rotation invalidates the old key; hashed storage still authenticates the new one.
+	code, body := do("POST", "/api/v1/tenants/"+tenantBID+"/rotate-key", "admin-key", nil)
+	var rotated tenantResponse
+	_ = json.Unmarshal(body, &rotated)
+	if code != http.StatusOK || rotated.APIKey == "" || rotated.APIKey == keyB {
+		t.Fatalf("rotate: %d %s", code, body)
+	}
+	if code, _ := do("GET", "/api/v1/networks", keyB, nil); code != http.StatusUnauthorized {
+		t.Fatalf("old key must stop working, got %d", code)
+	}
+	if code, _ := do("GET", "/api/v1/networks", rotated.APIKey, nil); code != http.StatusOK {
+		t.Fatalf("new key must work, got %d", code)
+	}
 }

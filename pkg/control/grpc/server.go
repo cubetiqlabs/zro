@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -12,10 +13,10 @@ import (
 	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
 	"github.com/cubis/zro/pkg/control/delegation"
+	"github.com/cubis/zro/pkg/control/enroll"
 	"github.com/cubis/zro/pkg/control/events"
 	"github.com/cubis/zro/pkg/control/ipam"
 	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/store"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
@@ -57,14 +58,24 @@ func (s *Server) SetEventSource(bus *events.Bus, scope func(context.Context) (ev
 
 // Enroll handles cryptographic node and gateway enrollment over gRPC.
 func (s *Server) Enroll(ctx context.Context, req *v1.EnrollRequest) (*v1.EnrollResponse, error) {
-	payload, err := crypto.VerifyEnrollmentToken(s.cfg.SecretKey, req.Token, req.PublicKey)
+	grant, err := enroll.Authorize(ctx, s.cfg.SecretKey, s.db.Enrollments, enroll.Request{
+		Token: req.Token, PublicKey: req.PublicKey, Hostname: req.Hostname, NodeType: core.NodeType(req.NodeType),
+	})
 	if err != nil {
-		return nil, status.Errorf(codes.Unauthenticated, "enrollment rejected: %v", err)
+		switch {
+		case errors.Is(err, enroll.ErrUnauthenticated):
+			return nil, status.Error(codes.Unauthenticated, err.Error())
+		case errors.Is(err, enroll.ErrForbidden):
+			return nil, status.Error(codes.PermissionDenied, err.Error())
+		case errors.Is(err, enroll.ErrConflict):
+			return nil, status.Error(codes.AlreadyExists, err.Error())
+		}
+		return nil, status.Error(codes.Internal, "enrollment failed")
 	}
 
-	network, err := s.db.Networks.GetByID(ctx, payload.NetworkID)
+	network, err := s.db.Networks.GetByID(ctx, grant.NetworkID)
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "network %s not found", payload.NetworkID)
+		return nil, status.Errorf(codes.NotFound, "network %s not found", grant.NetworkID)
 	}
 
 	allocator, err := s.getOrCreateIPAM(ctx, network)
@@ -93,19 +104,14 @@ func (s *Server) Enroll(ctx context.Context, req *v1.EnrollRequest) (*v1.EnrollR
 		})
 	}
 
-	nodeType := core.NodeType(req.NodeType)
-	if nodeType == "" {
-		nodeType = core.NodeTypePeer
-	}
-
 	node := &core.Node{
 		ID:          nodeID,
 		NetworkID:   network.ID,
-		Hostname:    req.Hostname,
+		Hostname:    grant.Hostname,
 		PublicKey:   req.PublicKey,
 		OverlayIPv4: v4,
 		OverlayIPv6: v6,
-		NodeType:    nodeType,
+		NodeType:    grant.NodeType,
 		Tags:        core.StringList(req.Tags),
 		Endpoints:   core.StringList(req.Endpoints),
 		IsActive:    true,

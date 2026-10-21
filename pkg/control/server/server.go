@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +20,7 @@ import (
 	"github.com/cubis/zro/pkg/config"
 	controlauth "github.com/cubis/zro/pkg/control/auth"
 	"github.com/cubis/zro/pkg/control/delegation"
+	"github.com/cubis/zro/pkg/control/enroll"
 	controlevents "github.com/cubis/zro/pkg/control/events"
 	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
 	"github.com/cubis/zro/pkg/control/ipam"
@@ -81,6 +84,9 @@ func NewServer(cfg *config.ControlPlaneConfig, db *store.DB) *Server {
 
 // Start begins listening on the configured address.
 func (s *Server) Start() error {
+	if err := s.validateSecrets(); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 
@@ -112,6 +118,19 @@ func (s *Server) Start() error {
 
 	slog.Info("ZRO Control Plane starting", "listen_addr", s.cfg.ListenAddr, "public_url", s.cfg.PublicURL)
 	return s.httpServer.ListenAndServe()
+}
+
+// validateSecrets refuses to run with a missing or well-known signing secret
+// when authentication is enforced, and warns in permissive mode.
+func (s *Server) validateSecrets() error {
+	weak := s.cfg.SecretKey == "" || s.cfg.SecretKey == crypto.DefaultSecretKey
+	switch {
+	case weak && s.cfg.RequireAuth:
+		return errors.New("control_plane.secret_key is empty or the shipped default; set a unique secret before enabling require_auth")
+	case weak:
+		slog.Warn("control_plane.secret_key is empty or the shipped default; enrollment tokens are forgeable. Do not expose this plane")
+	}
+	return nil
 }
 
 // Shutdown gracefully stops the server.
@@ -218,7 +237,7 @@ func (s *Server) defaultTenant(ctx context.Context) *core.Tenant {
 	}
 	_ = s.db.Tenants.Create(ctx, defaultTenant)
 	slog.Warn("Created permissive-mode default tenant; enable control_plane.require_auth for production",
-		"tenant_id", defaultTenant.ID, "api_key", defaultTenant.APIKey)
+		"tenant_id", defaultTenant.ID)
 	return defaultTenant
 }
 
@@ -247,21 +266,15 @@ func (s *Server) tenantAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// nodeAuthMiddleware authenticates node-facing endpoints. In permissive mode a
-// missing token is allowed for backwards compatibility, but a supplied token is
-// always validated. Production deployments must set RequireAuth=true.
+// nodeAuthMiddleware authenticates node-facing endpoints. Every node receives a
+// token at enrollment, so a valid node token is always required.
 func (s *Server) nodeAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := controlauth.NodeToken(r)
 		if token == "" {
-			if s.cfg.RequireAuth {
-				http.Error(w, `{"error":"unauthorized: node token required"}`, http.StatusUnauthorized)
-				return
-			}
-			next(w, r)
+			http.Error(w, `{"error":"unauthorized: node token required"}`, http.StatusUnauthorized)
 			return
 		}
-
 		node, err := s.db.Nodes.GetByTokenHash(r.Context(), controlauth.HashToken(token))
 		if err != nil || node == nil || !node.IsActive {
 			http.Error(w, `{"error":"unauthorized: invalid or inactive node token"}`, http.StatusUnauthorized)
@@ -367,22 +380,9 @@ func (s *Server) grpcStreamScope(ctx context.Context) (controlevents.Scope, erro
 	return scope, nil
 }
 
-func (s *Server) expectedEdgeKey() string {
-	expectedKey := s.cfg.EdgeAPIKey
-	if expectedKey == "" {
-		expectedKey = s.cfg.SecretKey
-	}
-	return expectedKey
-}
-
 func (s *Server) isValidEdgeKey(r *http.Request) bool {
 	key := controlauth.EdgeKey(r)
-	if key == "" {
-		// WebSocket clients that only have an edge key commonly send it in the
-		// generic token query parameter.
-		key = strings.TrimSpace(r.URL.Query().Get("token"))
-	}
-	expected := s.expectedEdgeKey()
+	expected := s.cfg.EdgeAPIKey
 	if key == "" || expected == "" {
 		return false
 	}
@@ -411,8 +411,7 @@ func (s *Server) edgeAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // authorizeNetwork resolves a network and verifies that the current principal
-// may observe or mutate it. In permissive mode with no principal attached it
-// preserves the legacy open behavior.
+// may observe or mutate it. Requests without a principal are denied.
 func (s *Server) authorizeNetwork(ctx context.Context, networkID string) (*core.Network, bool) {
 	network, err := s.db.Networks.GetByID(ctx, networkID)
 	if err != nil || network == nil {
@@ -421,7 +420,7 @@ func (s *Server) authorizeNetwork(ctx context.Context, networkID string) (*core.
 
 	subject := controlauth.FromContext(ctx)
 	if subject == nil {
-		return network, !s.cfg.RequireAuth
+		return network, false
 	}
 
 	switch subject.Kind {
@@ -442,6 +441,12 @@ func (s *Server) registerRoutes() {
 	// Network Management (ZeroTier-styled 16-hex Network ID)
 	s.mux.HandleFunc("POST /api/v1/networks", s.tenantAuthMiddleware(s.handleCreateNetwork))
 	s.mux.HandleFunc("GET /api/v1/networks", s.tenantAuthMiddleware(s.handleListNetworks))
+
+	// Tenant administration (bootstrap admin key; disabled when admin_api_key is empty)
+	s.mux.HandleFunc("POST /api/v1/tenants", s.adminAuthMiddleware(s.handleCreateTenant))
+	s.mux.HandleFunc("GET /api/v1/tenants", s.adminAuthMiddleware(s.handleListTenants))
+	s.mux.HandleFunc("DELETE /api/v1/tenants/{id}", s.adminAuthMiddleware(s.handleDeleteTenant))
+	s.mux.HandleFunc("POST /api/v1/tenants/{id}/rotate-key", s.adminAuthMiddleware(s.handleRotateTenantKey))
 
 	// Edge PoPs, Dynamic Registration & Real-time Heartbeats
 	s.mux.HandleFunc("GET /api/v1/pops", s.handleListPoPs)
@@ -466,6 +471,8 @@ func (s *Server) registerRoutes() {
 
 	// Ingress & Tunneling
 	s.mux.HandleFunc("POST /api/v1/tunnels", s.nodeAuthMiddleware(s.handleRegisterTunnel))
+	s.mux.HandleFunc("GET /api/v1/tunnels", s.nodeAuthMiddleware(s.handleListTunnels))
+	s.mux.HandleFunc("DELETE /api/v1/tunnels/{id}", s.nodeAuthMiddleware(s.handleDeleteTunnel))
 	s.mux.HandleFunc("GET /api/v1/gateway/routes", s.nodeAuthMiddleware(s.handleGetGatewayRoutes))
 	s.mux.HandleFunc("GET /api/v1/events", s.streamAuthMiddleware(s.handleEventStream))
 
@@ -594,6 +601,8 @@ type RegisterEdgePoPRequest struct {
 	IsAnycast      bool   `json:"is_anycast"`
 }
 
+var popCodeRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,15}$`)
+
 func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 	var req RegisterEdgePoPRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -601,8 +610,12 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.PoPCode == "" || req.PublicEndpoint == "" || req.PublicKey == "" {
-		http.Error(w, "pop_code, public_endpoint, and public_key are required", http.StatusBadRequest)
+	if !popCodeRE.MatchString(req.PoPCode) || req.PublicEndpoint == "" {
+		http.Error(w, "valid pop_code and public_endpoint are required", http.StatusBadRequest)
+		return
+	}
+	if err := crypto.ValidatePublicKey(req.PublicKey); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -621,7 +634,10 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 		pop.IsHealthy = true
 		pop.LastSeenAt = time.Now()
 		pop.UpdatedAt = time.Now()
-		_ = s.db.EdgePoPs.Update(r.Context(), &pop)
+		if err := s.db.EdgePoPs.Update(r.Context(), &pop); err != nil {
+			http.Error(w, "failed to update PoP", http.StatusInternalServerError)
+			return
+		}
 	} else {
 		pop = core.EdgePoP{
 			ID:             uuid.New(),
@@ -636,7 +652,10 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:      time.Now(),
 			UpdatedAt:      time.Now(),
 		}
-		_ = s.db.EdgePoPs.Create(r.Context(), &pop)
+		if err := s.db.EdgePoPs.Create(r.Context(), &pop); err != nil {
+			http.Error(w, "failed to register PoP", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	slog.Info("Edge Data Plane PoP registered dynamically", "pop_code", pop.PoPCode, "endpoint", pop.PublicEndpoint, "pubkey", pop.PublicKey)
@@ -806,16 +825,26 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// High security: Verify token with public key binding
-	payload, err := crypto.VerifyEnrollmentToken(s.cfg.SecretKey, req.Token, req.PublicKey)
+	grant, err := enroll.Authorize(r.Context(), s.cfg.SecretKey, s.db.Enrollments, enroll.Request{
+		Token: req.Token, PublicKey: req.PublicKey, Hostname: req.Hostname, NodeType: req.NodeType,
+	})
 	if err != nil {
-		http.Error(w, fmt.Sprintf("enrollment rejected (authentication failure): %v", err), http.StatusUnauthorized)
+		code := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, enroll.ErrUnauthenticated):
+			code = http.StatusUnauthorized
+		case errors.Is(err, enroll.ErrForbidden):
+			code = http.StatusForbidden
+		case errors.Is(err, enroll.ErrConflict):
+			code = http.StatusConflict
+		}
+		http.Error(w, err.Error(), code)
 		return
 	}
 
-	network, err := s.db.Networks.GetByID(r.Context(), payload.NetworkID)
+	network, err := s.db.Networks.GetByID(r.Context(), grant.NetworkID)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("network %s not found", payload.NetworkID), http.StatusNotFound)
+		http.Error(w, fmt.Sprintf("network %s not found", grant.NetworkID), http.StatusNotFound)
 		return
 	}
 	if !network.IsActive {
@@ -868,12 +897,12 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 	node := &core.Node{
 		ID:           nodeID,
 		NetworkID:    network.ID,
-		Hostname:     req.Hostname,
+		Hostname:     grant.Hostname,
 		PublicKey:    req.PublicKey,
 		TokenHash:    tokenHash,
 		OverlayIPv4:  v4,
 		OverlayIPv6:  v6,
-		NodeType:     req.NodeType,
+		NodeType:     grant.NodeType,
 		Tags:         req.Tags,
 		AllowedIPs:   core.StringList{v4 + "/32", v6 + "/128"},
 		AllowedPorts: req.AllowedPorts,
@@ -883,10 +912,6 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 		LastSeenAt:   time.Now(),
 		CreatedAt:    time.Now(),
 		UpdatedAt:    time.Now(),
-	}
-
-	if node.NodeType == "" {
-		node.NodeType = core.NodeTypePeer
 	}
 
 	// Delegate optimal Edge PoP
@@ -966,24 +991,11 @@ func (s *Server) handleP2PDiscover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Fetch Initiator Node. An authenticated node may only act as itself.
+	// 1. The authenticated node is the initiator; a node may only act as itself.
 	initiator := NodeFromContext(r.Context())
-	if initiator != nil {
-		if req.InitiatorNodeID != uuid.Nil && req.InitiatorNodeID != initiator.ID {
-			http.Error(w, "forbidden: initiator node does not match authenticated node", http.StatusForbidden)
-			return
-		}
-	} else {
-		if req.InitiatorNodeID == uuid.Nil {
-			http.Error(w, "initiator_node_id is required", http.StatusBadRequest)
-			return
-		}
-		var err error
-		initiator, err = s.db.Nodes.GetByID(r.Context(), req.InitiatorNodeID)
-		if err != nil {
-			http.Error(w, "initiator node not found", http.StatusNotFound)
-			return
-		}
+	if req.InitiatorNodeID != uuid.Nil && req.InitiatorNodeID != initiator.ID {
+		http.Error(w, "forbidden: initiator node does not match authenticated node", http.StatusForbidden)
+		return
 	}
 
 	// Update initiator's endpoints if newer endpoints were provided
@@ -1007,9 +1019,9 @@ func (s *Server) handleP2PDiscover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Ensure both nodes belong to the same network (zero-trust security boundary)
+	// 3. Zero-trust boundary: a target in another network is indistinguishable from a missing one.
 	if initiator.NetworkID != target.NetworkID {
-		http.Error(w, "nodes belong to different networks", http.StatusForbidden)
+		http.Error(w, "target node not found in network", http.StatusNotFound)
 		return
 	}
 
@@ -1046,15 +1058,8 @@ func (s *Server) handleReportProbes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if node := NodeFromContext(r.Context()); node != nil {
-		// Never trust a body-supplied node ID when the request is authenticated.
-		sample.NodeID = node.ID
-	}
-	if sample.NodeID == uuid.Nil {
-		http.Error(w, "node_id is required", http.StatusBadRequest)
-		return
-	}
-
+	// Never trust a body-supplied node ID.
+	sample.NodeID = NodeFromContext(r.Context()).ID
 	sample.Timestamp = time.Now()
 	s.delegator.RecordProbe(sample)
 
@@ -1083,43 +1088,83 @@ func (s *Server) handleGetPeers(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(peers)
 }
 
+// hostnameRE matches an RFC 1123 DNS name (lower-case, dot-separated labels).
+var hostnameRE = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// validTunnel checks the client-supplied tunnel fields.
+func validTunnel(t *core.Tunnel) error {
+	t.PublicHostname = strings.ToLower(strings.TrimSpace(t.PublicHostname))
+	if len(t.PublicHostname) > 253 || !hostnameRE.MatchString(t.PublicHostname) {
+		return errors.New("public_hostname must be a valid DNS name")
+	}
+	host, port, err := net.SplitHostPort(t.LocalAddress)
+	if err != nil || host == "" {
+		return errors.New("local_address must be host:port")
+	}
+	if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+		return errors.New("local_address has an invalid port")
+	}
+	switch t.Protocol {
+	case "":
+		t.Protocol = "http"
+	case "http", "tcp", "grpc":
+	default:
+		return errors.New("protocol must be http, tcp or grpc")
+	}
+	if t.Name == "" {
+		t.Name = t.PublicHostname
+	}
+	return nil
+}
+
 func (s *Server) handleRegisterTunnel(w http.ResponseWriter, r *http.Request) {
-	var tunnel core.Tunnel
-	if err := json.NewDecoder(r.Body).Decode(&tunnel); err != nil {
+	var req core.Tunnel
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid tunnel payload", http.StatusBadRequest)
 		return
 	}
-
-	if tunnel.PublicHostname == "" || tunnel.LocalAddress == "" {
-		http.Error(w, "public_hostname and local_address are required", http.StatusBadRequest)
+	if err := validTunnel(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
+	// Ownership comes from the authenticated node, never from the body.
 	node := NodeFromContext(r.Context())
-	if node != nil {
-		tunnel.NodeID = node.ID
-	} else if tunnel.NodeID == uuid.Nil {
-		http.Error(w, "node_id is required", http.StatusBadRequest)
+	network, err := s.db.Networks.GetByID(r.Context(), node.NetworkID)
+	if err != nil || network == nil {
+		http.Error(w, "network not found", http.StatusNotFound)
 		return
 	}
 
-	// Resolve the owning node so the event can be scoped to its network.
-	ownerNode := node
-	if ownerNode == nil {
-		var err error
-		ownerNode, err = s.db.Nodes.GetByID(r.Context(), tunnel.NodeID)
-		if err != nil || ownerNode == nil {
-			http.Error(w, "node not found", http.StatusNotFound)
+	// A hostname belongs to a single network; nodes of that network may share it
+	// (load balancing), nodes of any other network may not take it over.
+	existing, err := s.db.Tunnels.ListByHostname(r.Context(), req.PublicHostname)
+	if err != nil {
+		http.Error(w, "failed to check hostname", http.StatusInternalServerError)
+		return
+	}
+	for _, t := range existing {
+		if t.NetworkID != network.ID {
+			http.Error(w, "hostname is already in use", http.StatusConflict)
 			return
 		}
 	}
 
-	tunnel.ID = uuid.New()
-	tunnel.CreatedAt = time.Now()
-	tunnel.UpdatedAt = time.Now()
-
+	now := time.Now()
+	tunnel := core.Tunnel{
+		ID:             uuid.New(),
+		NodeID:         node.ID,
+		TenantID:       network.TenantID,
+		NetworkID:      network.ID,
+		Name:           req.Name,
+		LocalAddress:   req.LocalAddress,
+		PublicHostname: req.PublicHostname,
+		Protocol:       req.Protocol,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
 	if err := s.db.Tunnels.Create(r.Context(), &tunnel); err != nil {
-		http.Error(w, fmt.Sprintf("failed to create tunnel: %v", err), http.StatusConflict)
+		http.Error(w, "failed to create tunnel", http.StatusConflict)
 		return
 	}
 
@@ -1127,9 +1172,9 @@ func (s *Server) handleRegisterTunnel(w http.ResponseWriter, r *http.Request) {
 		_ = s.syncInternalGateway(r.Context())
 	}
 
-	s.broadcastDelta(s.scopeForNetwork(r.Context(), ownerNode.NetworkID), map[string]any{
+	s.broadcastDelta(networkScope(network), map[string]any{
 		"event":         "gateway_routes_updated",
-		"network_id":    ownerNode.NetworkID,
+		"network_id":    network.ID,
 		"hostname":      tunnel.PublicHostname,
 		"local_address": tunnel.LocalAddress,
 		"node_id":       tunnel.NodeID,
@@ -1138,6 +1183,47 @@ func (s *Server) handleRegisterTunnel(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(tunnel)
+}
+
+// handleListTunnels returns the tunnels of the caller's network.
+func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request) {
+	tunnels, err := s.db.Tunnels.ListByNetworkID(r.Context(), NodeFromContext(r.Context()).NetworkID)
+	if err != nil {
+		http.Error(w, "failed to list tunnels", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(tunnels)
+}
+
+// handleDeleteTunnel removes a tunnel owned by the calling node.
+func (s *Server) handleDeleteTunnel(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "invalid tunnel id", http.StatusBadRequest)
+		return
+	}
+	node := NodeFromContext(r.Context())
+	tunnel, err := s.db.Tunnels.GetByID(r.Context(), id)
+	if err != nil || tunnel == nil || tunnel.NodeID != node.ID {
+		http.Error(w, "tunnel not found", http.StatusNotFound)
+		return
+	}
+	if err := s.db.Tunnels.Delete(r.Context(), id); err != nil {
+		http.Error(w, "failed to delete tunnel", http.StatusInternalServerError)
+		return
+	}
+	if s.cfg.EnableGateway {
+		_ = s.syncInternalGateway(r.Context())
+	}
+	if network, err := s.db.Networks.GetByID(r.Context(), node.NetworkID); err == nil && network != nil {
+		s.broadcastDelta(networkScope(network), map[string]any{
+			"event":      "gateway_routes_updated",
+			"network_id": network.ID,
+			"hostname":   tunnel.PublicHostname,
+		})
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
@@ -1253,13 +1339,9 @@ type GatewayRoutesResponse struct {
 }
 
 func (s *Server) handleGetGatewayRoutes(w http.ResponseWriter, r *http.Request) {
-	networkID := ""
-	if node := NodeFromContext(r.Context()); node != nil {
-		networkID = node.NetworkID
-	}
-	routes, err := s.buildGatewayRoutes(r.Context(), networkID)
+	routes, err := s.buildGatewayRoutes(r.Context(), NodeFromContext(r.Context()).NetworkID)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to build gateway routes: %v", err), http.StatusInternalServerError)
+		http.Error(w, "failed to build gateway routes", http.StatusInternalServerError)
 		return
 	}
 
@@ -1267,20 +1349,30 @@ func (s *Server) handleGetGatewayRoutes(w http.ResponseWriter, r *http.Request) 
 	_ = json.NewEncoder(w).Encode(GatewayRoutesResponse{Routes: routes})
 }
 
+// buildGatewayRoutes groups tunnels into per-hostname routes. An empty
+// networkID covers every network and is reserved for the plane's embedded gateway.
 func (s *Server) buildGatewayRoutes(ctx context.Context, networkID string) ([]GatewayRouteItem, error) {
-	tunnels, err := s.db.Tunnels.ListAll(ctx)
+	var tunnels []core.Tunnel
+	var err error
+	if networkID == "" {
+		tunnels, err = s.db.Tunnels.ListAll(ctx)
+	} else {
+		tunnels, err = s.db.Tunnels.ListByNetworkID(ctx, networkID)
+	}
 	if err != nil {
 		return nil, err
 	}
 
+	nodes := make(map[uuid.UUID]*core.Node)
 	routesMap := make(map[string]*GatewayRouteItem)
 
 	for _, t := range tunnels {
-		node, err := s.db.Nodes.GetByID(ctx, t.NodeID)
-		if err != nil || node == nil || !node.IsActive || node.OverlayIPv4 == "" {
-			continue
+		node, cached := nodes[t.NodeID]
+		if !cached {
+			node, _ = s.db.Nodes.GetByID(ctx, t.NodeID)
+			nodes[t.NodeID] = node
 		}
-		if networkID != "" && node.NetworkID != networkID {
+		if node == nil || !node.IsActive || node.OverlayIPv4 == "" {
 			continue
 		}
 
@@ -1404,15 +1496,16 @@ func (s *Server) handleGetMeshGraph(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	netID := r.URL.Query().Get("network_id")
 
-	// If no network_id provided, pick first available network
+	// The tenant middleware guarantees a tenant principal. Default to the
+	// tenant's first network; an explicit network must belong to the tenant.
 	if netID == "" {
-		tenants, _ := s.db.Tenants.List(ctx)
-		if len(tenants) > 0 {
-			nets, _ := s.db.Networks.ListByTenantID(ctx, tenants[0].ID)
-			if len(nets) > 0 {
-				netID = nets[0].ID
-			}
+		nets, _ := s.db.Networks.ListByTenantID(ctx, TenantFromContext(ctx).ID)
+		if len(nets) > 0 {
+			netID = nets[0].ID
 		}
+	} else if _, ok := s.authorizeNetwork(ctx, netID); !ok {
+		http.Error(w, "forbidden: network access denied", http.StatusForbidden)
+		return
 	}
 
 	var graphNodes []MeshGraphNode
@@ -1735,4 +1828,129 @@ func (s *Server) handleDeleteACLRule(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
+}
+
+// adminAuthMiddleware guards tenant administration with the bootstrap admin key.
+func (s *Server) adminAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		expected := s.cfg.AdminAPIKey
+		if expected == "" {
+			http.Error(w, `{"error":"tenant administration is disabled; set control_plane.admin_api_key"}`, http.StatusForbidden)
+			return
+		}
+		key := controlauth.BearerToken(r)
+		if key == "" {
+			key = strings.TrimSpace(r.Header.Get("X-Admin-Key"))
+		}
+		if subtle.ConstantTimeCompare([]byte(key), []byte(expected)) != 1 {
+			http.Error(w, `{"error":"unauthorized: invalid admin key"}`, http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+type tenantResponse struct {
+	ID        uuid.UUID `json:"id"`
+	Name      string    `json:"name"`
+	Slug      string    `json:"slug"`
+	IsActive  bool      `json:"is_active"`
+	CreatedAt time.Time `json:"created_at"`
+	APIKey    string    `json:"api_key,omitempty"` // plaintext, only on create and rotate
+}
+
+func toTenantResponse(t *core.Tenant, withKey bool) tenantResponse {
+	resp := tenantResponse{ID: t.ID, Name: t.Name, Slug: t.Slug, IsActive: t.IsActive, CreatedAt: t.CreatedAt}
+	if withKey {
+		resp.APIKey = t.APIKey
+	}
+	return resp
+}
+
+var slugRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,98}[a-z0-9]$`)
+
+func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+		Slug string `json:"slug"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Name) == "" || !slugRE.MatchString(req.Slug) {
+		http.Error(w, "name and a lower-case slug are required", http.StatusBadRequest)
+		return
+	}
+	key, _, err := controlauth.GenerateToken("zro_key_")
+	if err != nil {
+		http.Error(w, "failed to generate API key", http.StatusInternalServerError)
+		return
+	}
+	now := time.Now()
+	tenant := &core.Tenant{ID: uuid.New(), Name: req.Name, Slug: req.Slug, APIKey: key, IsActive: true, CreatedAt: now, UpdatedAt: now}
+	if err := s.db.Tenants.Create(r.Context(), tenant); err != nil {
+		http.Error(w, "failed to create tenant (slug may be taken)", http.StatusConflict)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(toTenantResponse(tenant, true))
+}
+
+func (s *Server) handleListTenants(w http.ResponseWriter, r *http.Request) {
+	tenants, err := s.db.Tenants.List(r.Context())
+	if err != nil {
+		http.Error(w, "failed to list tenants", http.StatusInternalServerError)
+		return
+	}
+	out := make([]tenantResponse, 0, len(tenants))
+	for i := range tenants {
+		out = append(out, toTenantResponse(&tenants[i], false))
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+func (s *Server) handleDeleteTenant(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "invalid tenant id", http.StatusBadRequest)
+		return
+	}
+	nets, err := s.db.Networks.ListByTenantID(r.Context(), id)
+	if err != nil {
+		http.Error(w, "failed to check tenant networks", http.StatusInternalServerError)
+		return
+	}
+	if len(nets) > 0 {
+		http.Error(w, "tenant still owns networks; delete them first", http.StatusConflict)
+		return
+	}
+	if err := s.db.Tenants.Delete(r.Context(), id); err != nil {
+		http.Error(w, "failed to delete tenant", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleRotateTenantKey(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "invalid tenant id", http.StatusBadRequest)
+		return
+	}
+	key, _, err := controlauth.GenerateToken("zro_key_")
+	if err != nil {
+		http.Error(w, "failed to generate API key", http.StatusInternalServerError)
+		return
+	}
+	if err := s.db.Tenants.RotateAPIKey(r.Context(), id, key); err != nil {
+		http.Error(w, "tenant not found", http.StatusNotFound)
+		return
+	}
+	tenant, err := s.db.Tenants.GetByID(r.Context(), id)
+	if err != nil {
+		http.Error(w, "tenant not found", http.StatusNotFound)
+		return
+	}
+	tenant.APIKey = key
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(toTenantResponse(tenant, true))
 }

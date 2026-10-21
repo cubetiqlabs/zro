@@ -2,6 +2,7 @@ package core
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
@@ -48,10 +49,11 @@ func (s *StringList) Scan(value any) error {
 
 // Tenant represents an organization or account in ZRO.
 type Tenant struct {
-	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
-	Name      string    `gorm:"size:255;not null" json:"name"`
-	Slug      string    `gorm:"size:100;uniqueIndex;not null" json:"slug"`
-	APIKey    string    `gorm:"size:128;uniqueIndex;not null" json:"api_key"`
+	ID   uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	Name string    `gorm:"size:255;not null" json:"name"`
+	Slug string    `gorm:"size:100;uniqueIndex;not null" json:"slug"`
+	// APIKey holds the SHA-256 of the tenant key; the plaintext is shown once at creation.
+	APIKey    string    `gorm:"size:128;uniqueIndex;not null" json:"-"`
 	IsActive  bool      `gorm:"default:true" json:"is_active"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -106,27 +108,27 @@ const (
 
 // Node represents an IPless client, agent, internal service, or gateway in the mesh.
 type Node struct {
-	ID             uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
-	NetworkID      string     `gorm:"size:16;not null;index" json:"network_id"`
-	Hostname       string     `gorm:"size:255;not null" json:"hostname"`
-	PublicKey      string     `gorm:"size:64;not null;index" json:"public_key"`
-	TokenHash      string     `gorm:"size:64;index" json:"-"`
-	OverlayIPv4    string     `gorm:"size:50;not null;index" json:"overlay_ipv4"`
-	OverlayIPv6    string     `gorm:"size:50;not null" json:"overlay_ipv6"`
-	AssignedPoPID  *uuid.UUID `gorm:"type:uuid;index" json:"assigned_pop_id,omitempty"`
-	NodeType       NodeType   `gorm:"size:30;default:'peer'" json:"node_type"`
-	Tags           StringList `gorm:"type:text" json:"tags"`
-	AllowedIPs     StringList `gorm:"type:text" json:"allowed_ips"`
-	AllowedPorts   StringList `gorm:"type:text" json:"allowed_ports"` // e.g. ["5432/tcp", "80/tcp"]
-	DefaultDeny    bool       `gorm:"default:true" json:"default_deny"`
-	Endpoints      StringList `gorm:"type:text" json:"endpoints"` // reflexive/STUN public addresses
-	IsActive       bool       `gorm:"default:true" json:"is_active"`
-	LastSeenAt     time.Time  `json:"last_seen_at"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	ID            uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
+	NetworkID     string     `gorm:"size:16;not null;index" json:"network_id"`
+	Hostname      string     `gorm:"size:255;not null" json:"hostname"`
+	PublicKey     string     `gorm:"size:64;not null;index" json:"public_key"`
+	TokenHash     string     `gorm:"size:64;index" json:"-"`
+	OverlayIPv4   string     `gorm:"size:50;not null;index" json:"overlay_ipv4"`
+	OverlayIPv6   string     `gorm:"size:50;not null" json:"overlay_ipv6"`
+	AssignedPoPID *uuid.UUID `gorm:"type:uuid;index" json:"assigned_pop_id,omitempty"`
+	NodeType      NodeType   `gorm:"size:30;default:'peer'" json:"node_type"`
+	Tags          StringList `gorm:"type:text" json:"tags"`
+	AllowedIPs    StringList `gorm:"type:text" json:"allowed_ips"`
+	AllowedPorts  StringList `gorm:"type:text" json:"allowed_ports"` // e.g. ["5432/tcp", "80/tcp"]
+	DefaultDeny   bool       `gorm:"default:true" json:"default_deny"`
+	Endpoints     StringList `gorm:"type:text" json:"endpoints"` // reflexive/STUN public addresses
+	IsActive      bool       `gorm:"default:true" json:"is_active"`
+	LastSeenAt    time.Time  `json:"last_seen_at"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 
-	AssignedPoP *EdgePoP  `gorm:"foreignKey:AssignedPoPID" json:"assigned_pop,omitempty"`
-	Tunnels     []Tunnel  `gorm:"foreignKey:NodeID" json:"tunnels,omitempty"`
+	AssignedPoP *EdgePoP `gorm:"foreignKey:AssignedPoPID" json:"assigned_pop,omitempty"`
+	Tunnels     []Tunnel `gorm:"foreignKey:NodeID" json:"tunnels,omitempty"`
 }
 
 // ACLAction represents whether to allow or drop traffic.
@@ -142,12 +144,12 @@ type ACLRule struct {
 	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
 	NetworkID string    `gorm:"size:16;not null;index" json:"network_id"`
 	Priority  int       `gorm:"default:100;not null" json:"priority"`
-	SourceIP  string    `gorm:"size:50;default:'*'" json:"source_ip"`   // e.g. "100.64.0.11" or "*"
-	DestIP    string    `gorm:"size:50;default:'*'" json:"dest_ip"`     // e.g. "100.64.0.10" or "*"
-	SourceTag string    `gorm:"size:100;not null" json:"source_tag"` // e.g. "tag:web" or "*"
-	DestTag   string    `gorm:"size:100;not null" json:"dest_tag"`   // e.g. "tag:db" or "*"
-	Protocol  string    `gorm:"size:20;default:'*'" json:"protocol"` // "tcp", "udp", "icmp", "*"
-	Ports     string    `gorm:"size:100;default:'*'" json:"ports"`   // "80,443", "5432", "*"
+	SourceIP  string    `gorm:"size:50;default:'*'" json:"source_ip"` // e.g. "100.64.0.11" or "*"
+	DestIP    string    `gorm:"size:50;default:'*'" json:"dest_ip"`   // e.g. "100.64.0.10" or "*"
+	SourceTag string    `gorm:"size:100;not null" json:"source_tag"`  // e.g. "tag:web" or "*"
+	DestTag   string    `gorm:"size:100;not null" json:"dest_tag"`    // e.g. "tag:db" or "*"
+	Protocol  string    `gorm:"size:20;default:'*'" json:"protocol"`  // "tcp", "udp", "icmp", "*"
+	Ports     string    `gorm:"size:100;default:'*'" json:"ports"`    // "80,443", "5432", "*"
 	Action    ACLAction `gorm:"size:20;default:'ALLOW'" json:"action"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -169,19 +171,36 @@ type Route struct {
 type Tunnel struct {
 	ID             uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
 	NodeID         uuid.UUID `gorm:"type:uuid;not null;index" json:"node_id"`
+	TenantID       uuid.UUID `gorm:"type:uuid;index" json:"tenant_id"`
+	NetworkID      string    `gorm:"size:16;index" json:"network_id"`
 	Name           string    `gorm:"size:100;not null" json:"name"`
-	LocalAddress   string    `gorm:"size:100;not null" json:"local_address"`   // e.g. "127.0.0.1:8080"
-	PublicHostname string    `gorm:"size:255;index" json:"public_hostname"` // e.g. "api.cubis.tech"
-	Protocol       string    `gorm:"size:20;default:'http'" json:"protocol"`   // "http", "tcp", "grpc"
+	LocalAddress   string    `gorm:"size:100;not null" json:"local_address"` // e.g. "127.0.0.1:8080"
+	PublicHostname string    `gorm:"size:255;index" json:"public_hostname"`  // e.g. "api.cubis.tech"
+	Protocol       string    `gorm:"size:20;default:'http'" json:"protocol"` // "http", "tcp", "grpc"
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // LatencySample represents a single latency probe result from a node to an Edge PoP.
 type LatencySample struct {
-	NodeID    uuid.UUID     `json:"node_id"`
-	PoPCode   string        `json:"pop_code"`
-	RTT       time.Duration `json:"rtt"`
-	PacketLoss float64      `json:"packet_loss"`
-	Timestamp time.Time     `json:"timestamp"`
+	NodeID     uuid.UUID     `json:"node_id"`
+	PoPCode    string        `json:"pop_code"`
+	RTT        time.Duration `json:"rtt"`
+	PacketLoss float64       `json:"packet_loss"`
+	Timestamp  time.Time     `json:"timestamp"`
+}
+
+// EnrollmentRedemption records a redeemed enrollment-token nonce so a token
+// cannot be replayed by a different key.
+type EnrollmentRedemption struct {
+	Nonce     string    `gorm:"size:64;primaryKey"`
+	PublicKey string    `gorm:"size:64;not null"`
+	ExpiresAt time.Time `gorm:"index"`
+	CreatedAt time.Time
+}
+
+// HashAPIKey returns the stored representation of a tenant API key.
+func HashAPIKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
 }
