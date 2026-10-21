@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
+	"github.com/cubis/zro/pkg/dataplane/netcfg"
 	"github.com/cubis/zro/pkg/dataplane/tun"
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
 	"github.com/cubis/zro/pkg/gateway/acme"
@@ -30,24 +32,28 @@ import (
 
 // Daemon represents the running ingress gateway and cloud-native load balancer.
 type Daemon struct {
-	cfg           *config.GatewayConfig
-	keyPair       *crypto.KeyPair
-	nodeID        uuid.UUID
-	networkID     string
-	overlayIPv4   string
-	overlayIPv6   string
-	primaryPoP    core.EdgePoP
-	secondaryPoP  *core.EdgePoP
-	popMu         sync.RWMutex
+	cfg          *config.GatewayConfig
+	keyPair      *crypto.KeyPair
+	nodeID       uuid.UUID
+	networkID    string
+	overlayIPv4  string
+	overlayIPv6  string
+	primaryPoP   core.EdgePoP
+	secondaryPoP *core.EdgePoP
+	popMu        sync.RWMutex
 
 	tunDev        tun.Device
 	wgManager     *wireguard.Manager
+	udpConn       *net.UDPConn
 	proxyEngine   *proxy.Engine
 	healthChecker *proxy.HealthChecker
 	httpClient    *http.Client
 	grpcClient    *controlgrpc.Client
 	httpServer    *http.Server
 	httpsServer   *http.Server
+
+	stunMu      sync.Mutex
+	stunWaiters map[[12]byte]chan *stun.ReflexiveAddress
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -83,28 +89,123 @@ func NewDaemon(cfg *config.GatewayConfig) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize TUN device: %w", err)
 	}
+	if err := netcfg.EnsureLinkUp(cfg.InterfaceName, cfg.MTU); err != nil {
+		slog.Warn("Could not bring gateway overlay interface up (data plane may be limited)", "interface", cfg.InterfaceName, "error", err)
+	}
 
-	wgMgr, err := wireguard.NewManager(cfg.InterfaceName,
-		wireguard.WithTunDevice(tunDev),
-		wireguard.WithPrivateKey(kp.PrivateKey),
-		wireguard.WithListenPort(0),
-	)
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: cfg.ListenPort})
 	if err != nil {
 		_ = tunDev.Close()
-		return nil, fmt.Errorf("failed to initialize WireGuard manager: %w", err)
+		return nil, fmt.Errorf("failed to bind shared UDP socket: %w", err)
 	}
 
 	d := &Daemon{
 		cfg:           cfg,
 		keyPair:       kp,
 		tunDev:        tunDev,
-		wgManager:     wgMgr,
+		udpConn:       udpConn,
 		proxyEngine:   proxy.NewEngine(),
 		healthChecker: proxy.NewHealthChecker(2 * time.Second),
 		httpClient:    &http.Client{Timeout: 10 * time.Second},
+		stunWaiters:   make(map[[12]byte]chan *stun.ReflexiveAddress),
 	}
+
+	wgMgr, err := wireguard.NewManager(cfg.InterfaceName,
+		wireguard.WithTunDevice(tunDev),
+		wireguard.WithPrivateKey(kp.PrivateKey),
+		wireguard.WithSharedSocket(udpConn, d.handleControlPacket),
+	)
+	if err != nil {
+		_ = udpConn.Close()
+		_ = tunDev.Close()
+		return nil, fmt.Errorf("failed to initialize WireGuard manager: %w", err)
+	}
+
+	d.wgManager = wgMgr
 	d.loadStaticRoutes()
 	return d, nil
+}
+
+// discoverReflexive runs a STUN exchange on the shared socket so the endpoint
+// advertised to the control plane matches WireGuard's actual NAT mapping.
+func (d *Daemon) discoverReflexive(serverAddr string, timeout time.Duration) (*stun.ReflexiveAddress, error) {
+	srv, err := net.ResolveUDPAddr("udp", serverAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve STUN server: %w", err)
+	}
+
+	req, txID, err := stun.NewBindingRequest()
+	if err != nil {
+		return nil, err
+	}
+
+	respCh := make(chan *stun.ReflexiveAddress, 1)
+	d.stunMu.Lock()
+	d.stunWaiters[txID] = respCh
+	d.stunMu.Unlock()
+	defer func() {
+		d.stunMu.Lock()
+		delete(d.stunWaiters, txID)
+		d.stunMu.Unlock()
+	}()
+
+	if _, err := d.udpConn.WriteToUDP(req, srv); err != nil {
+		return nil, fmt.Errorf("failed to send STUN request: %w", err)
+	}
+
+	deadline := time.Now().Add(timeout)
+	for attempt := 0; attempt < 3; attempt++ {
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			break
+		}
+		if remainingAttempts := 3 - attempt; wait > timeout/time.Duration(remainingAttempts) {
+			wait = timeout / time.Duration(remainingAttempts)
+		}
+		select {
+		case reflexive := <-respCh:
+			return reflexive, nil
+		case <-time.After(wait):
+			if time.Now().After(deadline) {
+				break
+			}
+			if _, err := d.udpConn.WriteToUDP(req, srv); err != nil {
+				return nil, fmt.Errorf("failed to send STUN request: %w", err)
+			}
+		}
+	}
+	return nil, errors.New("STUN reflexive discovery timed out")
+}
+
+// handleControlPacket is called by the shared WireGuard bind for non-WireGuard
+// datagrams.
+func (d *Daemon) handleControlPacket(packet []byte, remoteAddr *net.UDPAddr) {
+	if stun.IsBindingResponse(packet) {
+		if len(packet) < 20 {
+			return
+		}
+		var txID [12]byte
+		copy(txID[:], packet[8:20])
+		d.stunMu.Lock()
+		waiter := d.stunWaiters[txID]
+		d.stunMu.Unlock()
+		if waiter == nil {
+			return
+		}
+		reflexive, err := stun.ParseResponse(packet, txID[:])
+		if err != nil {
+			return
+		}
+		select {
+		case waiter <- reflexive:
+		default:
+		}
+		return
+	}
+
+	if stun.IsBindingRequest(packet) {
+		_ = stun.ServeSTUN(d.udpConn, packet, remoteAddr)
+	}
 }
 
 // Start boots the gateway daemon, enrolls with the control plane, connects to the overlay mesh,
@@ -213,6 +314,9 @@ func (d *Daemon) Stop() error {
 	if d.wgManager != nil {
 		_ = d.wgManager.Close()
 	}
+	if d.udpConn != nil {
+		_ = d.udpConn.Close()
+	}
 	if d.tunDev != nil {
 		_ = d.tunDev.Close()
 	}
@@ -255,11 +359,15 @@ func (d *Daemon) loadStaticRoutes() {
 
 func (d *Daemon) enrollAndConnect(ctx context.Context) error {
 	pops, _ := d.fetchPoPs(ctx)
-	probes, bestReflexive := d.probePoPs(ctx, pops)
+	probes, bestPoP := d.probePoPs(ctx, pops)
 
 	var endpoints []string
-	if bestReflexive != "" {
-		endpoints = append(endpoints, bestReflexive)
+	if bestPoP != "" {
+		if reflexive, err := d.discoverReflexive(bestPoP, 2*time.Second); err == nil && reflexive != nil {
+			endpoints = append(endpoints, reflexive.String())
+		} else if err != nil {
+			slog.Warn("Could not discover gateway reflexive endpoint on shared socket", "stun_server", bestPoP, "error", err)
+		}
 	}
 
 	enrollReq := server.EnrollRequest{
@@ -303,6 +411,10 @@ func (d *Daemon) enrollAndConnect(ctx context.Context) error {
 	d.overlayIPv4 = enrollResp.OverlayIPv4
 	d.overlayIPv6 = enrollResp.OverlayIPv6
 
+	if err := netcfg.ConfigureOverlay(d.cfg.InterfaceName, d.overlayIPv4, d.overlayIPv6, d.cfg.MTU); err != nil {
+		slog.Warn("Failed to configure gateway overlay interface addresses", "interface", d.cfg.InterfaceName, "error", err)
+	}
+
 	d.popMu.Lock()
 	d.primaryPoP = enrollResp.PrimaryPoP
 	d.secondaryPoP = enrollResp.SecondaryPoP
@@ -335,7 +447,29 @@ func (d *Daemon) connectToEdgePoP(pop core.EdgePoP) error {
 		PersistentKeepalive: 20 * time.Second,
 	}
 
+	// Send overlay traffic into the gateway's WireGuard interface.
+	for _, cidr := range []string{"100.64.0.0/10", "fd00:cafe::/64"} {
+		if err := netcfg.AddSubnetRoute(d.cfg.InterfaceName, cidr); err != nil {
+			slog.Debug("Failed to add overlay subnet route", "cidr", cidr, "error", err)
+		}
+	}
+
 	return d.wgManager.ApplyPeer(peerCfg)
+}
+
+// addBackendRoute ensures the host routes a backend's overlay address into the
+// WireGuard interface. Backend addresses are "host:port".
+func (d *Daemon) addBackendRoute(address string) {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	if net.ParseIP(host) == nil {
+		return
+	}
+	if err := netcfg.AddHostRoute(d.cfg.InterfaceName, host); err != nil {
+		slog.Debug("Failed to add backend overlay route", "backend", address, "error", err)
+	}
 }
 
 func (d *Daemon) fetchPoPs(ctx context.Context) ([]core.EdgePoP, error) {
@@ -365,7 +499,7 @@ func (d *Daemon) probePoPs(ctx context.Context, pops []core.EdgePoP) ([]core.Lat
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var samples []core.LatencySample
-	var bestReflexive string
+	var bestPoP string
 	bestRTT := time.Duration(1<<62 - 1)
 
 	for _, pop := range pops {
@@ -375,7 +509,7 @@ func (d *Daemon) probePoPs(ctx context.Context, pops []core.EdgePoP) ([]core.Lat
 		wg.Add(1)
 		go func(p core.EdgePoP) {
 			defer wg.Done()
-			rtt, refAddr, err := stun.ProbeEndpoint(p.PublicEndpoint, 1200*time.Millisecond)
+			rtt, _, err := stun.ProbeEndpoint(p.PublicEndpoint, 1200*time.Millisecond)
 			mu.Lock()
 			defer mu.Unlock()
 
@@ -386,9 +520,9 @@ func (d *Daemon) probePoPs(ctx context.Context, pops []core.EdgePoP) ([]core.Lat
 					PacketLoss: 0.0,
 					Timestamp:  time.Now(),
 				})
-				if rtt < bestRTT && refAddr != nil {
+				if rtt < bestRTT {
 					bestRTT = rtt
-					bestReflexive = refAddr.String()
+					bestPoP = p.PublicEndpoint
 				}
 			} else {
 				samples = append(samples, core.LatencySample{
@@ -402,7 +536,7 @@ func (d *Daemon) probePoPs(ctx context.Context, pops []core.EdgePoP) ([]core.Lat
 	}
 
 	wg.Wait()
-	return samples, bestReflexive
+	return samples, bestPoP
 }
 
 // SyncRoutesOnce fetches dynamic routes from the Control Plane and updates the proxy engine.
@@ -424,6 +558,7 @@ func (d *Daemon) SyncRoutesOnce(ctx context.Context) error {
 						Weight:  int(b.Weight),
 						Healthy: b.Healthy,
 					})
+					d.addBackendRoute(b.Address)
 				}
 				if bal, exists := d.proxyEngine.GetRoute(r.Hostname); exists {
 					bal.UpdateBackends(backends)
@@ -466,6 +601,7 @@ func (d *Daemon) SyncRoutesOnce(ctx context.Context) error {
 				Weight:  b.Weight,
 				Healthy: b.Healthy,
 			})
+			d.addBackendRoute(b.Address)
 		}
 
 		if bal, exists := d.proxyEngine.GetRoute(r.Hostname); exists {

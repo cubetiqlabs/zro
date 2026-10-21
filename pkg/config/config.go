@@ -9,8 +9,8 @@ import (
 
 // AppConfig is the root configuration struct for all ZRO components.
 type AppConfig struct {
-	Mode         string             `mapstructure:"mode"`          // "plane", "edge", "node", "gw", "all"
-	LogLevel     string             `mapstructure:"log_level"`     // "debug", "info", "warn", "error"
+	Mode         string             `mapstructure:"mode"`      // "plane", "edge", "node", "gw", "all"
+	LogLevel     string             `mapstructure:"log_level"` // "debug", "info", "warn", "error"
 	ControlPlane ControlPlaneConfig `mapstructure:"control_plane"`
 	Edge         EdgeConfig         `mapstructure:"edge"`
 	Node         NodeConfig         `mapstructure:"node"`
@@ -35,10 +35,12 @@ type ControlPlaneConfig struct {
 
 // EdgeConfig configures a global Edge Data Plane PoP.
 type EdgeConfig struct {
-	PoPCode             string `mapstructure:"pop_code"`        // "KH", "SG", "US", "HK", "DE"
+	PoPCode             string `mapstructure:"pop_code"` // "KH", "SG", "US", "HK", "DE"
 	Region              string `mapstructure:"region"`
 	PublicEndpoint      string `mapstructure:"public_endpoint"` // "auto", "private", or "173.1.1.1:51820"
 	ListenPort          int    `mapstructure:"listen_port"`
+	InterfaceName       string `mapstructure:"interface_name"`
+	MTU                 int    `mapstructure:"mtu"`
 	WireGuardPrivateKey string `mapstructure:"wireguard_private_key"`
 	PlaneEndpoint       string `mapstructure:"plane_endpoint"`
 	PlaneTransport      string `mapstructure:"plane_transport"` // "rest" or "grpc"
@@ -64,11 +66,12 @@ type NodeConfig struct {
 	PlaneTransport      string              `mapstructure:"plane_transport"` // "rest" or "grpc"
 	InterfaceMode       string              `mapstructure:"interface_mode"`  // "tun" or "netstack"
 	InterfaceName       string              `mapstructure:"interface_name"`  // "zro0"
+	ListenPort          int                 `mapstructure:"listen_port"`     // shared UDP port; 0 = ephemeral
 	MTU                 int                 `mapstructure:"mtu"`
 	EnableP2P           bool                `mapstructure:"enable_p2p"`
 	Tags                []string            `mapstructure:"tags"`
 	AllowedInboundPorts []string            `mapstructure:"allowed_inbound_ports"` // e.g. ["5432/tcp"]
-	DefaultDeny         bool                `mapstructure:"default_deny"`           // zero-trust default deny all
+	DefaultDeny         bool                `mapstructure:"default_deny"`          // zero-trust default deny all
 	Tunnels             []LocalTunnelConfig `mapstructure:"tunnels"`
 }
 
@@ -87,6 +90,7 @@ type GatewayConfig struct {
 	EnrollmentToken       string              `mapstructure:"enrollment_token"`
 	NetworkID             string              `mapstructure:"network_id"`
 	InterfaceName         string              `mapstructure:"interface_name"`
+	ListenPort            int                 `mapstructure:"listen_port"` // shared UDP port; 0 = ephemeral
 	MTU                   int                 `mapstructure:"mtu"`
 	Strategy              string              `mapstructure:"strategy"` // "round_robin", "least_conn", "latency"
 	HealthCheckPath       string              `mapstructure:"health_check_path"`
@@ -125,6 +129,8 @@ func Load(cfgFile string) (*AppConfig, error) {
 	v.SetDefault("edge.pop_code", "KH")
 	v.SetDefault("edge.region", "Asia/Phnom_Penh")
 	v.SetDefault("edge.listen_port", 51820)
+	v.SetDefault("edge.interface_name", "zro-edge")
+	v.SetDefault("edge.mtu", 1420)
 	v.SetDefault("edge.public_endpoint", "auto")
 	v.SetDefault("edge.use_private_ip", false)
 	v.SetDefault("edge.plane_endpoint", "https://zro-plane.cubis.tech:443")

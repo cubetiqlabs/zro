@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -20,6 +21,7 @@ import (
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/dataplane/derp"
+	"github.com/cubis/zro/pkg/dataplane/netcfg"
 	"github.com/cubis/zro/pkg/dataplane/router"
 	"github.com/cubis/zro/pkg/dataplane/tun"
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
@@ -62,8 +64,14 @@ type Daemon struct {
 	meshListeners map[int]*guardedListener
 	listenersMu   sync.Mutex
 
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
+	// Control-plane datagram correlation on the shared WireGuard socket.
+	stunMu       sync.Mutex
+	stunWaiters  map[[12]byte]chan *stun.ReflexiveAddress
+	punchMu      sync.Mutex
+	punchWaiters map[string]chan struct{}
+
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // NewDaemon initializes a new node daemon.
@@ -81,31 +89,51 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize TUN device: %w", err)
 		}
+		// Bring the link up before creating the WireGuard device. Otherwise the
+		// kernel reports the TUN as down and wireguard-go closes its bind.
+		if err := netcfg.EnsureLinkUp(cfg.InterfaceName, cfg.MTU); err != nil {
+			slog.Warn("Could not bring overlay interface up (data plane may be limited)", "interface", cfg.InterfaceName, "error", err)
+		}
 	}
 
-	wgMgr, err := wireguard.NewManager(cfg.InterfaceName,
-		wireguard.WithTunDevice(tunDev),
-		wireguard.WithPrivateKey(kp.PrivateKey),
-		wireguard.WithListenPort(0),
-	)
+	// One UDP socket is shared by WireGuard, STUN, disco, and hole punching so
+	// that the reflexive port peers learn is the port WireGuard receives on.
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: cfg.ListenPort})
 	if err != nil {
 		_ = tunDev.Close()
-		return nil, fmt.Errorf("failed to initialize WireGuard manager: %w", err)
+		return nil, fmt.Errorf("failed to bind shared UDP socket: %w", err)
 	}
 
-	return &Daemon{
+	d := &Daemon{
 		cfg:           cfg,
 		keyPair:       kp,
 		peers:         make(map[string]core.Node),
 		tunDev:        tunDev,
-		wgManager:     wgMgr,
+		udpConn:       udpConn,
 		routingTable:  router.NewTable(),
 		tunnelClient:  tunnel.NewClient(),
 		httpClient:    &http.Client{Timeout: 10 * time.Second},
 		allowedPorts:  cfg.AllowedInboundPorts,
 		defaultDeny:   cfg.DefaultDeny,
 		meshListeners: make(map[int]*guardedListener),
-	}, nil
+		stunWaiters:   make(map[[12]byte]chan *stun.ReflexiveAddress),
+		punchWaiters:  make(map[string]chan struct{}),
+	}
+
+	wgMgr, err := wireguard.NewManager(cfg.InterfaceName,
+		wireguard.WithTunDevice(tunDev),
+		wireguard.WithPrivateKey(kp.PrivateKey),
+		wireguard.WithSharedSocket(udpConn, d.handleControlPacket),
+	)
+	if err != nil {
+		_ = udpConn.Close()
+		_ = tunDev.Close()
+		return nil, fmt.Errorf("failed to initialize WireGuard manager: %w", err)
+	}
+
+	d.wgManager = wgMgr
+	d.discoEngine = disco.NewEngine(kp, udpConn)
+	return d, nil
 }
 
 // Start boots the client daemon, enrolls with the control plane, and establishes mesh connectivity.
@@ -113,19 +141,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	d.cancel = cancel
 
-	// 1. Bind local UDP listener for STUN, Disco, and WireGuard peering
-	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	if err != nil {
-		return fmt.Errorf("failed to bind UDP socket: %w", err)
-	}
-	d.udpConn = udpConn
-	d.discoEngine = disco.NewEngine(d.keyPair, udpConn)
-
-	slog.Info("ZRO Node agent initialized", "pubkey", d.keyPair.PublicKey, "local_udp", udpConn.LocalAddr().String())
-
-	// Launch UDP packet listener for incoming STUN, Disco, and P2P hole punch packets
-	d.wg.Add(1)
-	go d.udpPacketListener(ctx)
+	// 1. The shared UDP socket (bound in NewDaemon) is driven by the WireGuard
+	// bind's single read loop, which dispatches non-WireGuard datagrams to
+	// handleControlPacket.
+	slog.Info("ZRO Node agent initialized", "pubkey", d.keyPair.PublicKey, "local_udp", d.udpConn.LocalAddr().String())
 
 	// Connect gRPC client if plane transport is set to grpc
 	if strings.EqualFold(d.cfg.PlaneTransport, "grpc") {
@@ -143,11 +162,18 @@ func (d *Daemon) Start(ctx context.Context) error {
 
 	// 2. Section 5.1 Step 2: Fetch PoP catalog and conduct parallel UDP RTT probes
 	pops, _ := d.fetchPoPs(ctx)
-	probes, bestReflexive := d.probePoPs(ctx, pops)
+	probes, bestPoP := d.probePoPs(ctx, pops)
 
+	// Discover our reflexive endpoint on the shared socket, not on the
+	// short-lived probe socket. Only then does the advertised address match
+	// the NAT mapping WireGuard receives on.
 	var endpoints []string
-	if bestReflexive != "" {
-		endpoints = append(endpoints, bestReflexive)
+	if bestPoP != "" {
+		if reflexive, err := d.discoverReflexive(bestPoP, 2*time.Second); err == nil && reflexive != nil {
+			endpoints = append(endpoints, reflexive.String())
+		} else if err != nil {
+			slog.Warn("Could not discover reflexive endpoint on shared socket", "stun_server", bestPoP, "error", err)
+		}
 	}
 
 	// 3. Section 5.1 Steps 3-4: Enroll with Control Plane and report probe telemetry for Smart Delegation
@@ -253,6 +279,15 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.overlayIPv4 = enrollResp.OverlayIPv4
 	d.overlayIPv6 = enrollResp.OverlayIPv6
 
+	// Program the host so overlay traffic enters the WireGuard interface.
+	// netstack mode has no OS interface, so it is skipped there.
+	if d.cfg.InterfaceMode != "netstack" {
+		if err := netcfg.ConfigureOverlay(d.cfg.InterfaceName, d.overlayIPv4, d.overlayIPv6, d.cfg.MTU); err != nil {
+			slog.Warn("Failed to configure overlay interface addresses (data plane may be limited)",
+				"interface", d.cfg.InterfaceName, "error", err)
+		}
+	}
+
 	d.popMu.Lock()
 	d.primaryPoP = enrollResp.PrimaryPoP
 	d.secondaryPoP = enrollResp.SecondaryPoP
@@ -311,7 +346,7 @@ func (d *Daemon) probePoPs(ctx context.Context, pops []core.EdgePoP) ([]core.Lat
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var samples []core.LatencySample
-	var bestReflexive string
+	var bestPoP string
 	bestRTT := time.Duration(1<<62 - 1)
 
 	for _, pop := range pops {
@@ -321,7 +356,7 @@ func (d *Daemon) probePoPs(ctx context.Context, pops []core.EdgePoP) ([]core.Lat
 		wg.Add(1)
 		go func(p core.EdgePoP) {
 			defer wg.Done()
-			rtt, refAddr, err := stun.ProbeEndpoint(p.PublicEndpoint, 1200*time.Millisecond)
+			rtt, _, err := stun.ProbeEndpoint(p.PublicEndpoint, 1200*time.Millisecond)
 			mu.Lock()
 			defer mu.Unlock()
 
@@ -332,9 +367,9 @@ func (d *Daemon) probePoPs(ctx context.Context, pops []core.EdgePoP) ([]core.Lat
 					PacketLoss: 0.0,
 					Timestamp:  time.Now(),
 				})
-				if rtt < bestRTT && refAddr != nil {
+				if rtt < bestRTT {
 					bestRTT = rtt
-					bestReflexive = refAddr.String()
+					bestPoP = p.PublicEndpoint
 				}
 			} else {
 				// Failed probe penalty
@@ -349,41 +384,171 @@ func (d *Daemon) probePoPs(ctx context.Context, pops []core.EdgePoP) ([]core.Lat
 	}
 
 	wg.Wait()
-	return samples, bestReflexive
+	return samples, bestPoP
 }
 
-func (d *Daemon) udpPacketListener(ctx context.Context) {
-	defer d.wg.Done()
-	buf := make([]byte, 2048)
+// discoverReflexive performs a STUN binding exchange on the shared socket. It
+// registers a waiter keyed by transaction ID; the WireGuard bind's read loop
+// delivers the response through handleControlPacket.
+func (d *Daemon) discoverReflexive(serverAddr string, timeout time.Duration) (*stun.ReflexiveAddress, error) {
+	srv, err := net.ResolveUDPAddr("udp", serverAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve STUN server: %w", err)
+	}
+
+	req, txID, err := stun.NewBindingRequest()
+	if err != nil {
+		return nil, err
+	}
+
+	respCh := make(chan *stun.ReflexiveAddress, 1)
+	d.stunMu.Lock()
+	d.stunWaiters[txID] = respCh
+	d.stunMu.Unlock()
+	defer func() {
+		d.stunMu.Lock()
+		delete(d.stunWaiters, txID)
+		d.stunMu.Unlock()
+	}()
+
+	if _, err := d.udpConn.WriteToUDP(req, srv); err != nil {
+		return nil, fmt.Errorf("failed to send STUN request: %w", err)
+	}
+
+	deadline := time.Now().Add(timeout)
+	for attempt := 0; attempt < 3; attempt++ {
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			break
+		}
+		if remainingAttempts := 3 - attempt; wait > timeout/time.Duration(remainingAttempts) {
+			wait = timeout / time.Duration(remainingAttempts)
+		}
+		select {
+		case reflexive := <-respCh:
+			return reflexive, nil
+		case <-time.After(wait):
+			if time.Now().After(deadline) {
+				break
+			}
+			if _, err := d.udpConn.WriteToUDP(req, srv); err != nil {
+				return nil, fmt.Errorf("failed to send STUN request: %w", err)
+			}
+		}
+	}
+	return nil, errors.New("STUN reflexive discovery timed out")
+}
+
+// handleControlPacket is invoked by the shared WireGuard bind for every
+// datagram that is not a WireGuard protocol packet.
+func (d *Daemon) handleControlPacket(packet []byte, remoteAddr *net.UDPAddr) {
+	// P2P hole punching: answer pings and wake the matching waiter on pongs.
+	if puncher.IsPing(packet) {
+		_, _ = d.udpConn.WriteToUDP(puncher.MagicPong, remoteAddr)
+		return
+	}
+	if puncher.IsPong(packet) {
+		d.signalPunch(remoteAddr)
+		return
+	}
+
+	// STUN responses for a pending reflexive discovery.
+	if stun.IsBindingResponse(packet) {
+		if len(packet) < 20 {
+			return
+		}
+		var txID [12]byte
+		copy(txID[:], packet[8:20])
+		d.stunMu.Lock()
+		waiter := d.stunWaiters[txID]
+		d.stunMu.Unlock()
+		if waiter == nil {
+			return
+		}
+		reflexive, err := stun.ParseResponse(packet, txID[:])
+		if err != nil {
+			return
+		}
+		select {
+		case waiter <- reflexive:
+		default:
+		}
+		return
+	}
+
+	// Incoming STUN binding requests are answered directly (nodes also act as
+	// small STUN reflectors for peers on the same overlay).
+	if stun.IsBindingRequest(packet) {
+		_ = stun.ServeSTUN(d.udpConn, packet, remoteAddr)
+		return
+	}
+
+	// Disco protocol messages.
+	if d.discoEngine != nil {
+		_, _ = d.discoEngine.HandlePacket(packet, remoteAddr)
+	}
+}
+
+func (d *Daemon) signalPunch(from *net.UDPAddr) {
+	key := from.String()
+	ipKey := from.IP.String()
+
+	d.punchMu.Lock()
+	defer d.punchMu.Unlock()
+	for candidate, waiter := range d.punchWaiters {
+		if candidate == key || candidate == ipKey {
+			select {
+			case waiter <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+// punchTo opens a NAT mapping with a peer by sending periodic pings and
+// waiting for a pong on the shared socket.
+func (d *Daemon) punchTo(ctx context.Context, remote string, timeout time.Duration) (bool, time.Duration) {
+	addr, err := net.ResolveUDPAddr("udp", remote)
+	if err != nil {
+		return false, 0
+	}
+
+	key := addr.String()
+	ipKey := addr.IP.String()
+	waiter := make(chan struct{}, 1)
+
+	d.punchMu.Lock()
+	d.punchWaiters[key] = waiter
+	d.punchWaiters[ipKey] = waiter
+	d.punchMu.Unlock()
+	defer func() {
+		d.punchMu.Lock()
+		if d.punchWaiters[key] == waiter {
+			delete(d.punchWaiters, key)
+		}
+		if d.punchWaiters[ipKey] == waiter {
+			delete(d.punchWaiters, ipKey)
+		}
+		d.punchMu.Unlock()
+	}()
+
+	start := time.Now()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	// Send the first ping immediately; optimize the common case.
+	_, _ = d.udpConn.WriteToUDP(puncher.MagicPing, addr)
 
 	for {
 		select {
 		case <-ctx.Done():
-			return
-		default:
-			_ = d.udpConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-			n, remoteAddr, err := d.udpConn.ReadFromUDP(buf)
-			if err != nil {
-				continue
-			}
-
-			packet := buf[:n]
-
-			// Handle P2P Hole Punching Pings
-			if bytes.Equal(packet, puncher.MagicPing) {
-				_, _ = d.udpConn.WriteToUDP(puncher.MagicPong, remoteAddr)
-				continue
-			}
-
-			// Handle STUN queries
-			if len(packet) >= 20 {
-				_ = stun.ServeSTUN(d.udpConn, packet, remoteAddr)
-			}
-
-			// Handle Disco protocol messages
-			if d.discoEngine != nil {
-				_, _ = d.discoEngine.HandlePacket(packet, remoteAddr)
-			}
+			return false, 0
+		case <-time.After(timeout):
+			return false, 0
+		case <-waiter:
+			return true, time.Since(start)
+		case <-ticker.C:
+			_, _ = d.udpConn.WriteToUDP(puncher.MagicPing, addr)
 		}
 	}
 }
@@ -393,6 +558,10 @@ func (d *Daemon) Stop() error {
 	if d.cancel != nil {
 		d.cancel()
 	}
+	// Close WireGuard first: it owns the read loop on the shared socket.
+	if d.wgManager != nil {
+		_ = d.wgManager.Close()
+	}
 	if d.udpConn != nil {
 		_ = d.udpConn.Close()
 	}
@@ -401,9 +570,6 @@ func (d *Daemon) Stop() error {
 	}
 	if d.derpClient != nil {
 		_ = d.derpClient.Close()
-	}
-	if d.wgManager != nil {
-		_ = d.wgManager.Close()
 	}
 	if d.grpcClient != nil {
 		_ = d.grpcClient.Close()
@@ -487,13 +653,13 @@ func (d *Daemon) DiscoverAndConnectPeer(ctx context.Context, targetOverlayIP str
 	var directEndpoint string
 	if d.cfg.EnableP2P && len(discResp.TargetEndpoints) > 0 {
 		for _, ep := range discResp.TargetEndpoints {
-			punchRes, err := puncher.Punch(ctx, d.udpConn, ep, 500*time.Millisecond)
-			if err == nil && punchRes.Success {
+			ok, rtt := d.punchTo(ctx, ep, 500*time.Millisecond)
+			if ok {
 				directEndpoint = ep
 				slog.Info("Direct P2P tunnel established with zero relay latency",
 					"target", discResp.TargetHostname,
 					"endpoint", ep,
-					"rtt", punchRes.RTT)
+					"rtt", rtt)
 				break
 			}
 		}
@@ -555,6 +721,19 @@ func (d *Daemon) connectPeer(ctx context.Context, peer core.Node) {
 	d.peersMu.Lock()
 	d.peers[peer.PublicKey] = peer
 	d.peersMu.Unlock()
+
+	if d.cfg.InterfaceMode != "netstack" {
+		if peer.OverlayIPv4 != "" {
+			if err := netcfg.AddHostRoute(d.cfg.InterfaceName, peer.OverlayIPv4); err != nil {
+				slog.Debug("Failed to add overlay route", "peer", peer.OverlayIPv4, "error", err)
+			}
+		}
+		if peer.OverlayIPv6 != "" {
+			if err := netcfg.AddHostRoute(d.cfg.InterfaceName, peer.OverlayIPv6); err != nil {
+				slog.Debug("Failed to add overlay route", "peer", peer.OverlayIPv6, "error", err)
+			}
+		}
+	}
 
 	_, _ = d.DiscoverAndConnectPeer(ctx, peer.OverlayIPv4)
 }
