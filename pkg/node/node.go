@@ -155,9 +155,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// Connect gRPC client if plane transport is set to grpc
 	if strings.EqualFold(d.cfg.PlaneTransport, "grpc") {
 		grpcTarget := d.cfg.PlaneEndpoint
-		grpcTarget = strings.TrimPrefix(grpcTarget, "http://")
-		grpcTarget = strings.TrimPrefix(grpcTarget, "https://")
-		gc, err := controlgrpc.NewClient(grpcTarget)
+		if d.cfg.GRPCEndpoint != "" {
+			grpcTarget = d.cfg.GRPCEndpoint
+		}
+		gc, err := controlgrpc.DialPlane(d.cfg.PlaneEndpoint, d.cfg.PlaneGRPC, d.token.Get)
 		if err == nil {
 			d.grpcClient = gc
 			slog.Info("ZRO Node connected to Control Plane via gRPC", "target", grpcTarget)
@@ -196,13 +197,15 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 
 		gResp, err := d.grpcClient.Enroll(ctx, &v1.EnrollRequest{
-			Token:     d.cfg.EnrollmentToken,
-			PublicKey: d.keyPair.PublicKey,
-			Hostname:  d.cfg.Hostname,
-			NodeType:  "peer",
-			Tags:      d.cfg.Tags,
-			Endpoints: endpoints,
-			Probes:    protoProbes,
+			Token:        d.cfg.EnrollmentToken,
+			PublicKey:    d.keyPair.PublicKey,
+			Hostname:     d.cfg.Hostname,
+			NodeType:     "peer",
+			Tags:         d.cfg.Tags,
+			Endpoints:    endpoints,
+			Probes:       protoProbes,
+			AllowedPorts: d.allowedPorts,
+			DefaultDeny:  &d.defaultDeny,
 		})
 		if err != nil {
 			return fmt.Errorf("gRPC enrollment failed: %w", err)
@@ -212,6 +215,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		enrollResp = server.EnrollResponse{
 			NodeID:      nodeUUID,
 			NetworkID:   gResp.NetworkId,
+			NodeToken:   gResp.NodeToken,
 			OverlayIPv4: gResp.OverlayIpv4,
 			OverlayIPv6: gResp.OverlayIpv6,
 		}
@@ -624,35 +628,12 @@ func (d *Daemon) DiscoverAndConnectPeer(ctx context.Context, targetOverlayIP str
 		endpoints = append(endpoints, d.udpConn.LocalAddr().String())
 	}
 
-	discReq := server.P2PDiscoverRequest{
+	discResp, err := d.discoverPeer(ctx, server.P2PDiscoverRequest{
 		InitiatorNodeID:    d.nodeID,
 		TargetOverlayIP:    targetOverlayIP,
 		InitiatorEndpoints: core.StringList(endpoints),
-	}
-
-	body, err := json.Marshal(discReq)
+	})
 	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", d.cfg.PlaneEndpoint+"/api/v1/p2p/discover", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := d.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("p2p discovery request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("p2p discovery rejected: status %d", resp.StatusCode)
-	}
-
-	var discResp server.P2PDiscoverResponse
-	if err := json.NewDecoder(resp.Body).Decode(&discResp); err != nil {
 		return nil, err
 	}
 
@@ -786,15 +767,7 @@ func (d *Daemon) probeWorker(ctx context.Context) {
 				Timestamp:  time.Now(),
 			}
 
-			body, _ := json.Marshal(sample)
-			req, err := http.NewRequestWithContext(ctx, "POST", d.cfg.PlaneEndpoint+"/api/v1/probes", bytes.NewReader(body))
-			if err == nil {
-				req.Header.Set("Content-Type", "application/json")
-				res, err := d.httpClient.Do(req)
-				if err == nil {
-					_ = res.Body.Close()
-				}
-			}
+			d.reportProbe(ctx, sample)
 
 			// Failover to secondary Edge PoP if primary is unreachable (consecutive failures >= 2)
 			if consecutiveFails >= 2 && secondary != nil && secondary.PublicEndpoint != "" {
@@ -835,17 +808,94 @@ func (d *Daemon) tunnelWorker(ctx context.Context) {
 			Protocol:       tunCfg.Protocol,
 		}
 
-		body, _ := json.Marshal(t)
-		req, err := http.NewRequestWithContext(ctx, "POST", d.cfg.PlaneEndpoint+"/api/v1/tunnels", bytes.NewReader(body))
-		if err == nil {
-			req.Header.Set("Content-Type", "application/json")
-			res, err := d.httpClient.Do(req)
-			if err == nil {
-				_ = res.Body.Close()
-				slog.Info("Exposed local service tunnel", "name", tunCfg.Name, "hostname", tunCfg.PublicHostname, "local", tunCfg.LocalAddress)
-			}
+		if err := d.registerTunnel(ctx, t); err != nil {
+			slog.Warn("Failed to register tunnel with the control plane", "name", tunCfg.Name, "error", err)
+			continue
 		}
+		slog.Info("Exposed local service tunnel", "name", tunCfg.Name, "hostname", tunCfg.PublicHostname, "local", tunCfg.LocalAddress)
 	}
+}
+
+// discoverPeer asks the plane for a peer's coordinates over gRPC when it is
+// configured, otherwise over REST.
+func (d *Daemon) discoverPeer(ctx context.Context, req server.P2PDiscoverRequest) (*server.P2PDiscoverResponse, error) {
+	if d.grpcClient != nil {
+		g, err := d.grpcClient.DiscoverP2P(ctx, &v1.P2PDiscoverRequest{
+			InitiatorNodeId:    req.InitiatorNodeID.String(),
+			TargetOverlayIp:    req.TargetOverlayIP,
+			InitiatorEndpoints: req.InitiatorEndpoints,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("p2p discovery rejected: %w", err)
+		}
+		targetID, _ := uuid.Parse(g.TargetNodeId)
+		out := &server.P2PDiscoverResponse{
+			TargetNodeID:      targetID,
+			TargetHostname:    g.TargetHostname,
+			TargetPublicKey:   g.TargetPublicKey,
+			TargetOverlayIPv4: g.TargetOverlayIpv4,
+			TargetOverlayIPv6: g.TargetOverlayIpv6,
+			TargetEndpoints:   core.StringList(g.TargetEndpoints),
+		}
+		if g.PrimaryPop != nil {
+			out.PrimaryPoP = &core.EdgePoP{PoPCode: g.PrimaryPop.PopCode, PublicEndpoint: g.PrimaryPop.PublicEndpoint, PublicKey: g.PrimaryPop.PublicKey, Region: g.PrimaryPop.Region}
+		}
+		return out, nil
+	}
+
+	var out server.P2PDiscoverResponse
+	if err := d.postPlane(ctx, "/api/v1/p2p/discover", req, http.StatusOK, &out); err != nil {
+		return nil, fmt.Errorf("p2p discovery failed: %w", err)
+	}
+	return &out, nil
+}
+
+// reportProbe sends a latency sample to the plane (best effort).
+func (d *Daemon) reportProbe(ctx context.Context, sample core.LatencySample) {
+	if d.grpcClient != nil {
+		_, _ = d.grpcClient.ReportProbes(ctx, &v1.ProbeReportRequest{
+			NodeId: d.nodeID.String(), PopCode: sample.PoPCode, RttNs: sample.RTT.Nanoseconds(), PacketLoss: sample.PacketLoss,
+		})
+		return
+	}
+	_ = d.postPlane(ctx, "/api/v1/probes", sample, http.StatusAccepted, nil)
+}
+
+// registerTunnel registers an exposed service with the plane.
+func (d *Daemon) registerTunnel(ctx context.Context, t core.Tunnel) error {
+	if d.grpcClient != nil {
+		_, err := d.grpcClient.RegisterTunnel(ctx, &v1.RegisterTunnelRequest{
+			Name: t.Name, LocalAddress: t.LocalAddress, PublicHostname: t.PublicHostname, Protocol: t.Protocol,
+		})
+		return err
+	}
+	return d.postPlane(ctx, "/api/v1/tunnels", t, http.StatusCreated, nil)
+}
+
+// postPlane POSTs JSON to the plane over REST, expecting wantStatus, and
+// decodes the response into out when it is non-nil.
+func (d *Daemon) postPlane(ctx context.Context, path string, body any, wantStatus int, out any) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.cfg.PlaneEndpoint+path, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != wantStatus {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	if out != nil {
+		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	return nil
 }
 
 // OverlayIPv4 returns the assigned static overlay IPv4.

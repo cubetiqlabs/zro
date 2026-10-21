@@ -223,9 +223,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// Connect gRPC client if plane transport is set to grpc
 	if strings.EqualFold(d.cfg.PlaneTransport, "grpc") {
 		grpcTarget := d.cfg.PlaneEndpoint
-		grpcTarget = strings.TrimPrefix(grpcTarget, "http://")
-		grpcTarget = strings.TrimPrefix(grpcTarget, "https://")
-		gc, err := controlgrpc.NewClient(grpcTarget)
+		if d.cfg.GRPCEndpoint != "" {
+			grpcTarget = d.cfg.GRPCEndpoint
+		}
+		gc, err := controlgrpc.DialPlane(d.cfg.PlaneEndpoint, d.cfg.PlaneGRPC, d.token.Get)
 		if err == nil {
 			d.grpcClient = gc
 			slog.Info("ZRO Ingress Gateway connected to Control Plane via gRPC", "target", grpcTarget)

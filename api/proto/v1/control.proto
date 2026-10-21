@@ -21,6 +21,11 @@ service ControlPlaneService {
   // Dynamic route discovery for Ingress Gateways
   rpc GetGatewayRoutes(GatewayRoutesRequest) returns (GatewayRoutesResponse);
 
+  // Ingress tunnels owned by the calling node (node token required)
+  rpc RegisterTunnel(RegisterTunnelRequest) returns (Tunnel);
+  rpc ListTunnels(ListTunnelsRequest) returns (ListTunnelsResponse);
+  rpc DeleteTunnel(DeleteTunnelRequest) returns (DeleteTunnelResponse);
+
   // Real-time bidirectional/streaming event bus for instant updates (zero polling)
   rpc StreamMeshEvents(StreamEventsRequest) returns (stream MeshEvent);
 }
@@ -39,6 +44,8 @@ message EnrollRequest {
   repeated string tags = 5;
   repeated string endpoints = 6;
   repeated LatencyProbe probes = 7;
+  repeated string allowed_ports = 8;
+  optional bool default_deny = 9;
 }
 
 message EdgePoP {
@@ -73,6 +80,10 @@ message EnrollResponse {
   EdgePoP primary_pop = 7;
   EdgePoP secondary_pop = 8;
   repeated Node peers = 9;
+  string node_token = 10; // bearer token for node-facing RPCs; shown once
+  repeated string allowed_ips = 11;
+  repeated string allowed_ports = 12;
+  bool default_deny = 13;
 }
 
 message ProbeReportRequest {
@@ -100,6 +111,8 @@ message P2PDiscoverResponse {
   string target_overlay_ipv4 = 4;
   repeated string target_endpoints = 5;
   EdgePoP primary_pop = 6;
+  string target_overlay_ipv6 = 7;
+  EdgePoP secondary_pop = 8;
 }
 
 message EdgeSyncRequest {
@@ -143,3 +156,30 @@ message MeshEvent {
   int64 timestamp = 2;
   string payload_json = 3;
 }
+
+message Tunnel {
+  string id = 1;
+  string name = 2;
+  string local_address = 3;
+  string public_hostname = 4;
+  string protocol = 5;
+}
+
+message RegisterTunnelRequest {
+  string name = 1;
+  string local_address = 2;
+  string public_hostname = 3;
+  string protocol = 4;
+}
+
+message ListTunnelsRequest {}
+
+message ListTunnelsResponse {
+  repeated Tunnel tunnels = 1;
+}
+
+message DeleteTunnelRequest {
+  string id = 1;
+}
+
+message DeleteTunnelResponse {}

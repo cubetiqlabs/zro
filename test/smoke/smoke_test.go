@@ -17,7 +17,6 @@ import (
 
 	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
-	controlevents "github.com/cubis/zro/pkg/control/events"
 	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/core"
@@ -29,8 +28,6 @@ import (
 	"github.com/cubis/zro/pkg/store"
 	"github.com/cubis/zro/pkg/tunnel"
 	"golang.org/x/net/websocket"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 func TestFullMeshSmoke(t *testing.T) {
@@ -592,16 +589,19 @@ func TestFullMeshSmoke(t *testing.T) {
 	}
 	defer grpcLis.Close()
 
-	grpcSrv := grpc.NewServer()
-	ctrlGRPC := controlgrpc.NewServer(cfg, db)
-	ctrlGRPC.SetEventSource(controlevents.NewBus(), func(context.Context) (controlevents.Scope, error) { return controlevents.Global(), nil })
-	v1.RegisterControlPlaneServiceServer(grpcSrv, ctrlGRPC)
+	grpcSrv := srv.NewGRPCServer()
 	go func() {
 		_ = grpcSrv.Serve(grpcLis)
 	}()
 	defer grpcSrv.GracefulStop()
 
-	grpcClient, err := controlgrpc.NewClient(grpcLis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	var grpcToken atomic.Value
+	grpcToken.Store("")
+	grpcClient, err := controlgrpc.Dial(controlgrpc.DialOptions{
+		Endpoint: grpcLis.Addr().String(),
+		Insecure: true,
+		Token:    func() string { return grpcToken.Load().(string) },
+	})
 	if err != nil {
 		t.Fatalf("smoke: failed to connect gRPC client: %v", err)
 	}
@@ -620,8 +620,17 @@ func TestFullMeshSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("smoke: gRPC Enroll failed: %v", err)
 	}
-	if grpcEnrollResp.OverlayIpv4 == "" {
-		t.Fatalf("smoke: expected overlay IP from gRPC enroll")
+	if grpcEnrollResp.OverlayIpv4 == "" || grpcEnrollResp.NodeToken == "" {
+		t.Fatalf("smoke: expected overlay IP and node token from gRPC enroll")
+	}
+	grpcToken.Store(grpcEnrollResp.NodeToken)
+	if _, err := grpcClient.RegisterTunnel(ctx, &v1.RegisterTunnelRequest{
+		Name: "grpc-tun", LocalAddress: "127.0.0.1:7000", PublicHostname: "grpc-tun.example.com",
+	}); err != nil {
+		t.Fatalf("smoke: gRPC RegisterTunnel failed: %v", err)
+	}
+	if lt, err := grpcClient.ListTunnels(ctx); err != nil || len(lt.Tunnels) == 0 {
+		t.Fatalf("smoke: gRPC ListTunnels failed: %v", err)
 	}
 	t.Logf("✅ Smoke Step 13 Passed: High-Performance gRPC API & Real-Time Event Bus verified (Node Overlay: %s)",
 		grpcEnrollResp.OverlayIpv4)
@@ -767,7 +776,6 @@ func TestFullMeshSmoke(t *testing.T) {
 	_ = allowedConn.Close()
 	t.Log("✅ Smoke Step 16c Passed: Dynamic zero-trust firewall policy update verified (port 22 allowed)")
 }
-
 
 // authedDo sends a JSON request authenticated with a node token.
 func authedDo(method, url, token string, body []byte) (*http.Response, error) {

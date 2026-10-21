@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,20 +12,17 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
 	controlauth "github.com/cubis/zro/pkg/control/auth"
-	"github.com/cubis/zro/pkg/control/delegation"
-	"github.com/cubis/zro/pkg/control/enroll"
 	controlevents "github.com/cubis/zro/pkg/control/events"
 	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
-	"github.com/cubis/zro/pkg/control/ipam"
+	"github.com/cubis/zro/pkg/control/service"
 	"github.com/cubis/zro/pkg/control/ws"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
@@ -33,6 +32,9 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
@@ -41,9 +43,7 @@ import (
 type Server struct {
 	cfg          *config.ControlPlaneConfig
 	db           *store.DB
-	delegator    *delegation.Engine
-	ipamCache    map[string]*ipam.IPAM // network ID (16-hex) -> IPAM allocator
-	ipamMu       sync.RWMutex
+	svc          *service.Service
 	httpServer   *http.Server
 	mux          *http.ServeMux
 	gatewayProxy *proxy.Engine
@@ -60,19 +60,20 @@ type Server struct {
 
 // NewServer creates a new instance of the Control Plane API Server.
 func NewServer(cfg *config.ControlPlaneConfig, db *store.DB) *Server {
-	delegator := delegation.NewEngine(db.EdgePoPs)
 	mux := http.NewServeMux()
+	bus := controlevents.NewBus()
+	svc := service.New(cfg, db, bus)
 
 	s := &Server{
-		cfg:       cfg,
-		db:        db,
-		delegator: delegator,
-		ipamCache: make(map[string]*ipam.IPAM),
-		mux:       mux,
-		bus:       controlevents.NewBus(),
-		grpcCtrl:  controlgrpc.NewServer(cfg, db),
+		cfg:      cfg,
+		db:       db,
+		svc:      svc,
+		mux:      mux,
+		bus:      bus,
+		grpcCtrl: controlgrpc.NewServer(cfg, db, svc),
 	}
-	s.grpcCtrl.SetEventSource(s.bus, s.grpcStreamScope)
+	s.grpcCtrl.SetEventSource(bus, s.grpcStreamScope)
+	s.grpcCtrl.SetAuthenticator(s.grpcAuthenticate)
 
 	if cfg.EnableGateway {
 		s.gatewayProxy = proxy.NewEngine()
@@ -95,17 +96,20 @@ func (s *Server) Start() error {
 
 	// Start gRPC server in background if configured
 	if s.cfg.GRPCListenAddr != "" {
+		creds, err := s.grpcTransportCredentials()
+		if err != nil {
+			return err
+		}
 		lis, err := net.Listen("tcp", s.cfg.GRPCListenAddr)
-		if err == nil {
+		if err != nil {
+			slog.Warn("Failed to bind gRPC listener (skipping gRPC server)", "addr", s.cfg.GRPCListenAddr, "error", err)
+		} else {
 			s.grpcLis = lis
-			s.grpcServer = grpc.NewServer()
-			v1.RegisterControlPlaneServiceServer(s.grpcServer, s.grpcCtrl)
+			s.grpcServer = s.NewGRPCServer(grpc.Creds(creds))
 			go func() {
-				slog.Info("ZRO Control Plane gRPC server listening", "addr", s.cfg.GRPCListenAddr)
+				slog.Info("ZRO Control Plane gRPC server listening", "addr", s.cfg.GRPCListenAddr, "tls", s.cfg.GRPCTLSCert != "")
 				_ = s.grpcServer.Serve(lis)
 			}()
-		} else {
-			slog.Warn("Failed to bind gRPC listener (skipping gRPC server)", "addr", s.cfg.GRPCListenAddr, "error", err)
 		}
 	}
 
@@ -118,6 +122,50 @@ func (s *Server) Start() error {
 
 	slog.Info("ZRO Control Plane starting", "listen_addr", s.cfg.ListenAddr, "public_url", s.cfg.PublicURL)
 	return s.httpServer.ListenAndServe()
+}
+
+// grpcTransportCredentials builds the gRPC listener's transport security.
+// Bearer tokens travel in metadata, so plaintext is only allowed when the
+// operator opts in explicitly (for example behind a TLS-terminating proxy).
+func (s *Server) grpcTransportCredentials() (credentials.TransportCredentials, error) {
+	if s.cfg.GRPCTLSCert == "" && s.cfg.GRPCTLSKey == "" {
+		if !s.cfg.GRPCInsecure {
+			return nil, errors.New("grpc_listen_addr is set without grpc_tls_cert/grpc_tls_key; configure TLS or set grpc_insecure: true")
+		}
+		slog.Warn("gRPC is running WITHOUT TLS; node tokens are sent in clear text. Use only behind a TLS terminator")
+		return insecure.NewCredentials(), nil
+	}
+	cert, err := tls.LoadX509KeyPair(s.cfg.GRPCTLSCert, s.cfg.GRPCTLSKey)
+	if err != nil {
+		return nil, fmt.Errorf("loading gRPC TLS key pair: %w", err)
+	}
+	tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	if s.cfg.GRPCTLSClientCA != "" {
+		pem, err := os.ReadFile(s.cfg.GRPCTLSClientCA)
+		if err != nil {
+			return nil, fmt.Errorf("reading gRPC client CA: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, errors.New("grpc_tls_client_ca contains no valid certificates")
+		}
+		tlsCfg.ClientCAs = pool
+		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return credentials.NewTLS(tlsCfg), nil
+}
+
+// NewGRPCServer builds the authenticated gRPC server around the control-plane
+// service. Pass grpc.Creds to enable TLS; Start does so from configuration.
+func (s *Server) NewGRPCServer(opts ...grpc.ServerOption) *grpc.Server {
+	srv := grpc.NewServer(append([]grpc.ServerOption{
+		grpc.UnaryInterceptor(s.grpcCtrl.UnaryInterceptor()),
+		grpc.StreamInterceptor(s.grpcCtrl.StreamInterceptor()),
+		grpc.MaxRecvMsgSize(1 << 20),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 10 * time.Second, PermitWithoutStream: true}),
+	}, opts...)...)
+	v1.RegisterControlPlaneServiceServer(srv, s.grpcCtrl)
+	return srv
 }
 
 // validateSecrets refuses to run with a missing or well-known signing secret
@@ -358,9 +406,9 @@ func (s *Server) eventScope(ctx context.Context) (controlevents.Scope, bool) {
 	return controlevents.Scope{}, false
 }
 
-// grpcStreamScope authenticates a gRPC event stream from its metadata using
-// the same credential rules as the REST stream endpoints.
-func (s *Server) grpcStreamScope(ctx context.Context) (controlevents.Scope, error) {
+// grpcAuthenticate resolves gRPC metadata credentials with the same rules as
+// the REST stream endpoints and returns a context carrying the principal.
+func (s *Server) grpcAuthenticate(ctx context.Context) (context.Context, error) {
 	header := http.Header{}
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
 		for k, vals := range md {
@@ -369,11 +417,21 @@ func (s *Server) grpcStreamScope(ctx context.Context) (controlevents.Scope, erro
 			}
 		}
 	}
-	authCtx, msg := s.authenticateStream((&http.Request{Header: header, URL: &url.URL{}}).WithContext(ctx))
-	if msg != "" {
-		return controlevents.Scope{}, status.Error(codes.Unauthenticated, msg)
+	req := (&http.Request{Header: header, URL: &url.URL{}}).WithContext(ctx)
+	// gRPC has no anonymous dev fallback (unlike the REST streams): no credentials, no access.
+	if controlauth.NodeToken(req) == "" && controlauth.TenantKey(req) == "" && controlauth.EdgeKey(req) == "" {
+		return ctx, status.Error(codes.Unauthenticated, "credentials required")
 	}
-	scope, ok := s.eventScope(authCtx)
+	authCtx, msg := s.authenticateStream(req)
+	if msg != "" {
+		return ctx, status.Error(codes.Unauthenticated, msg)
+	}
+	return authCtx, nil
+}
+
+// grpcStreamScope maps the authenticated principal of a gRPC stream to its event scope.
+func (s *Server) grpcStreamScope(ctx context.Context) (controlevents.Scope, error) {
+	scope, ok := s.eventScope(ctx)
 	if !ok {
 		return controlevents.Scope{}, status.Error(codes.PermissionDenied, "no event scope for principal")
 	}
@@ -791,31 +849,42 @@ func (s *Server) handleEdgeSync(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// EnrollRequest payload sent by a new node attempting to join a network.
-type EnrollRequest struct {
-	Token        string               `json:"token"`
-	PublicKey    string               `json:"public_key"`
-	Hostname     string               `json:"hostname"`
-	NodeType     core.NodeType        `json:"node_type"`
-	Tags         core.StringList      `json:"tags"`
-	Endpoints    core.StringList      `json:"endpoints"` // STUN reflexive endpoints
-	AllowedPorts core.StringList      `json:"allowed_ports,omitempty"`
-	DefaultDeny  *bool                `json:"default_deny,omitempty"`
-	Probes       []core.LatencySample `json:"probes,omitempty"` // Parallel pre-enrollment RTT probe telemetry to PoPs
+// Wire types shared with clients; defined in the service layer.
+type (
+	EnrollRequest         = service.EnrollRequest
+	EnrollResponse        = service.EnrollResponse
+	P2PDiscoverRequest    = service.P2PDiscoverRequest
+	P2PDiscoverResponse   = service.P2PDiscoverResponse
+	GatewayBackendItem    = service.GatewayBackendItem
+	GatewayRouteItem      = service.GatewayRouteItem
+	GatewayRoutesResponse = service.GatewayRoutesResponse
+)
+
+// writeServiceError maps a service error to an HTTP status.
+func writeServiceError(w http.ResponseWriter, err error) {
+	code := http.StatusInternalServerError
+	switch service.KindOf(err) {
+	case service.KindInvalid:
+		code = http.StatusBadRequest
+	case service.KindUnauthenticated:
+		code = http.StatusUnauthorized
+	case service.KindForbidden:
+		code = http.StatusForbidden
+	case service.KindNotFound:
+		code = http.StatusNotFound
+	case service.KindConflict, service.KindExhausted:
+		code = http.StatusConflict
+	}
+	if code == http.StatusInternalServerError {
+		slog.Error("control plane request failed", "error", err)
+	}
+	http.Error(w, service.Message(err), code)
 }
 
-// EnrollResponse payload returned to the newly enrolled node.
-type EnrollResponse struct {
-	NodeID       uuid.UUID     `json:"node_id"`
-	NetworkID    string        `json:"network_id"` // ZeroTier-style 16-hex ID
-	NodeToken    string        `json:"node_token"` // bearer token for node-facing APIs
-	OverlayIPv4  string        `json:"overlay_ipv4"`
-	OverlayIPv6  string        `json:"overlay_ipv6"`
-	DNSDomain    string        `json:"dns_domain"`
-	MTU          int           `json:"mtu"`
-	PrimaryPoP   core.EdgePoP  `json:"primary_pop"`
-	SecondaryPoP *core.EdgePoP `json:"secondary_pop,omitempty"`
-	Peers        []core.Node   `json:"peers"`
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
@@ -824,164 +893,12 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
-
-	grant, err := enroll.Authorize(r.Context(), s.cfg.SecretKey, s.db.Enrollments, enroll.Request{
-		Token: req.Token, PublicKey: req.PublicKey, Hostname: req.Hostname, NodeType: req.NodeType,
-	})
+	resp, err := s.svc.Enroll(r.Context(), req)
 	if err != nil {
-		code := http.StatusInternalServerError
-		switch {
-		case errors.Is(err, enroll.ErrUnauthenticated):
-			code = http.StatusUnauthorized
-		case errors.Is(err, enroll.ErrForbidden):
-			code = http.StatusForbidden
-		case errors.Is(err, enroll.ErrConflict):
-			code = http.StatusConflict
-		}
-		http.Error(w, err.Error(), code)
+		writeServiceError(w, err)
 		return
 	}
-
-	network, err := s.db.Networks.GetByID(r.Context(), grant.NetworkID)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("network %s not found", grant.NetworkID), http.StatusNotFound)
-		return
-	}
-	if !network.IsActive {
-		http.Error(w, "network is inactive", http.StatusForbidden)
-		return
-	}
-
-	// Fetch or create IPAM allocator for this network
-	ipAllocator, err := s.getOrCreateIPAM(r.Context(), network)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("IPAM initialization failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Allocate static overlay IPv4
-	v4, err := ipAllocator.AllocateNext()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("IP allocation failed: %v", err), http.StatusConflict)
-		return
-	}
-
-	// Derive static overlay IPv6
-	v6, err := ipam.DeriveIPv6(network.IPv6CIDR, v4)
-	if err != nil {
-		v6 = "::1"
-	}
-
-	nodeID := uuid.New()
-
-	// Record any initial parallel probe samples sent during enrollment for smart delegation
-	for _, p := range req.Probes {
-		p.NodeID = nodeID
-		if p.Timestamp.IsZero() {
-			p.Timestamp = time.Now()
-		}
-		s.delegator.RecordProbe(p)
-	}
-
-	defaultDeny := true
-	if req.DefaultDeny != nil {
-		defaultDeny = *req.DefaultDeny
-	}
-
-	nodeToken, tokenHash, err := controlauth.GenerateToken("zro_node_")
-	if err != nil {
-		http.Error(w, "failed to generate node credentials", http.StatusInternalServerError)
-		return
-	}
-
-	node := &core.Node{
-		ID:           nodeID,
-		NetworkID:    network.ID,
-		Hostname:     grant.Hostname,
-		PublicKey:    req.PublicKey,
-		TokenHash:    tokenHash,
-		OverlayIPv4:  v4,
-		OverlayIPv6:  v6,
-		NodeType:     grant.NodeType,
-		Tags:         req.Tags,
-		AllowedIPs:   core.StringList{v4 + "/32", v6 + "/128"},
-		AllowedPorts: req.AllowedPorts,
-		DefaultDeny:  defaultDeny,
-		Endpoints:    req.Endpoints,
-		IsActive:     true,
-		LastSeenAt:   time.Now(),
-		CreatedAt:    time.Now(),
-		UpdatedAt:    time.Now(),
-	}
-
-	// Delegate optimal Edge PoP
-	delegationRes, err := s.delegator.Delegate(r.Context(), nodeID)
-	if err == nil && delegationRes != nil {
-		node.AssignedPoPID = &delegationRes.PrimaryPoP.ID
-		node.AssignedPoP = &delegationRes.PrimaryPoP
-	}
-
-	if err := s.db.Nodes.Create(r.Context(), node); err != nil {
-		http.Error(w, fmt.Sprintf("failed to persist node: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Fetch other peers in this network
-	peers, _ := s.db.Nodes.ListByNetworkID(r.Context(), network.ID)
-
-	resp := EnrollResponse{
-		NodeID:      node.ID,
-		NetworkID:   network.ID,
-		NodeToken:   nodeToken,
-		OverlayIPv4: v4,
-		OverlayIPv6: v6,
-		DNSDomain:   network.DNSDomain,
-		MTU:         network.MTU,
-		Peers:       peers,
-	}
-
-	if delegationRes != nil {
-		resp.PrimaryPoP = delegationRes.PrimaryPoP
-		resp.SecondaryPoP = delegationRes.SecondaryPoP
-	}
-
-	// Notify all connected edge nodes and peers of new member
-	s.broadcastDelta(networkScope(network), map[string]any{
-		"event":         "node_joined",
-		"network_id":    network.ID,
-		"node_id":       node.ID,
-		"ipv4":          node.OverlayIPv4,
-		"pubkey":        node.PublicKey,
-		"allowed_ports": node.AllowedPorts,
-	})
-	s.broadcastDelta(networkScope(network), map[string]any{
-		"event":      "mesh_graph_updated",
-		"network_id": network.ID,
-	})
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
-}
-
-// P2PDiscoverRequest initiates peer-to-peer discovery and NAT reflexive signaling.
-type P2PDiscoverRequest struct {
-	InitiatorNodeID    uuid.UUID       `json:"initiator_node_id"`
-	TargetOverlayIP    string          `json:"target_overlay_ip,omitempty"`
-	TargetHostname     string          `json:"target_hostname,omitempty"`
-	TargetNodeID       *uuid.UUID      `json:"target_node_id,omitempty"`
-	InitiatorEndpoints core.StringList `json:"initiator_endpoints,omitempty"`
-}
-
-// P2PDiscoverResponse returns resolved target coordinates and fallback PoP relay info.
-type P2PDiscoverResponse struct {
-	TargetNodeID      uuid.UUID       `json:"target_node_id"`
-	TargetHostname    string          `json:"target_hostname"`
-	TargetPublicKey   string          `json:"target_public_key"`
-	TargetOverlayIPv4 string          `json:"target_overlay_ipv4"`
-	TargetOverlayIPv6 string          `json:"target_overlay_ipv6"`
-	TargetEndpoints   core.StringList `json:"target_endpoints"`
-	PrimaryPoP        *core.EdgePoP   `json:"primary_pop,omitempty"`
-	SecondaryPoP      *core.EdgePoP   `json:"secondary_pop,omitempty"`
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleP2PDiscover(w http.ResponseWriter, r *http.Request) {
@@ -990,65 +907,12 @@ func (s *Server) handleP2PDiscover(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
-
-	// 1. The authenticated node is the initiator; a node may only act as itself.
-	initiator := NodeFromContext(r.Context())
-	if req.InitiatorNodeID != uuid.Nil && req.InitiatorNodeID != initiator.ID {
-		http.Error(w, "forbidden: initiator node does not match authenticated node", http.StatusForbidden)
+	resp, err := s.svc.DiscoverP2P(r.Context(), NodeFromContext(r.Context()), req)
+	if err != nil {
+		writeServiceError(w, err)
 		return
 	}
-
-	// Update initiator's endpoints if newer endpoints were provided
-	if len(req.InitiatorEndpoints) > 0 {
-		initiator.Endpoints = req.InitiatorEndpoints
-		initiator.LastSeenAt = time.Now()
-		_ = s.db.Nodes.Update(r.Context(), initiator)
-	}
-
-	// 2. Resolve Target Node in the same network (by Overlay IP or NodeID)
-	var target *core.Node
-	var err error
-	if req.TargetOverlayIP != "" {
-		target, err = s.db.Nodes.GetByOverlayIP(r.Context(), initiator.NetworkID, req.TargetOverlayIP)
-	} else if req.TargetNodeID != nil {
-		target, err = s.db.Nodes.GetByID(r.Context(), *req.TargetNodeID)
-	}
-
-	if err != nil || target == nil {
-		http.Error(w, "target node not found in network", http.StatusNotFound)
-		return
-	}
-
-	// 3. Zero-trust boundary: a target in another network is indistinguishable from a missing one.
-	if initiator.NetworkID != target.NetworkID {
-		http.Error(w, "target node not found in network", http.StatusNotFound)
-		return
-	}
-
-	// 4. Signal target node via delta broadcast of P2P hole punch request
-	s.broadcastDelta(s.scopeForNetwork(r.Context(), target.NetworkID), map[string]any{
-		"event":               "p2p_punch_requested",
-		"network_id":          target.NetworkID,
-		"target_node_id":      target.ID,
-		"initiator_node_id":   initiator.ID,
-		"initiator_pubkey":    initiator.PublicKey,
-		"initiator_endpoints": initiator.Endpoints,
-		"initiator_overlay":   initiator.OverlayIPv4,
-	})
-
-	// 5. Construct Response
-	resp := P2PDiscoverResponse{
-		TargetNodeID:      target.ID,
-		TargetHostname:    target.Hostname,
-		TargetPublicKey:   target.PublicKey,
-		TargetOverlayIPv4: target.OverlayIPv4,
-		TargetOverlayIPv6: target.OverlayIPv6,
-		TargetEndpoints:   target.Endpoints,
-		PrimaryPoP:        target.AssignedPoP,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleReportProbes(w http.ResponseWriter, r *http.Request) {
@@ -1057,12 +921,7 @@ func (s *Server) handleReportProbes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid probe payload", http.StatusBadRequest)
 		return
 	}
-
-	// Never trust a body-supplied node ID.
-	sample.NodeID = NodeFromContext(r.Context()).ID
-	sample.Timestamp = time.Now()
-	s.delegator.RecordProbe(sample)
-
+	s.svc.ReportProbe(r.Context(), NodeFromContext(r.Context()), sample)
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -1088,112 +947,31 @@ func (s *Server) handleGetPeers(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(peers)
 }
 
-// hostnameRE matches an RFC 1123 DNS name (lower-case, dot-separated labels).
-var hostnameRE = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
-
-// validTunnel checks the client-supplied tunnel fields.
-func validTunnel(t *core.Tunnel) error {
-	t.PublicHostname = strings.ToLower(strings.TrimSpace(t.PublicHostname))
-	if len(t.PublicHostname) > 253 || !hostnameRE.MatchString(t.PublicHostname) {
-		return errors.New("public_hostname must be a valid DNS name")
-	}
-	host, port, err := net.SplitHostPort(t.LocalAddress)
-	if err != nil || host == "" {
-		return errors.New("local_address must be host:port")
-	}
-	if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
-		return errors.New("local_address has an invalid port")
-	}
-	switch t.Protocol {
-	case "":
-		t.Protocol = "http"
-	case "http", "tcp", "grpc":
-	default:
-		return errors.New("protocol must be http, tcp or grpc")
-	}
-	if t.Name == "" {
-		t.Name = t.PublicHostname
-	}
-	return nil
-}
-
 func (s *Server) handleRegisterTunnel(w http.ResponseWriter, r *http.Request) {
 	var req core.Tunnel
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid tunnel payload", http.StatusBadRequest)
 		return
 	}
-	if err := validTunnel(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Ownership comes from the authenticated node, never from the body.
-	node := NodeFromContext(r.Context())
-	network, err := s.db.Networks.GetByID(r.Context(), node.NetworkID)
-	if err != nil || network == nil {
-		http.Error(w, "network not found", http.StatusNotFound)
-		return
-	}
-
-	// A hostname belongs to a single network; nodes of that network may share it
-	// (load balancing), nodes of any other network may not take it over.
-	existing, err := s.db.Tunnels.ListByHostname(r.Context(), req.PublicHostname)
+	tunnel, err := s.svc.RegisterTunnel(r.Context(), NodeFromContext(r.Context()), req)
 	if err != nil {
-		http.Error(w, "failed to check hostname", http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	for _, t := range existing {
-		if t.NetworkID != network.ID {
-			http.Error(w, "hostname is already in use", http.StatusConflict)
-			return
-		}
-	}
-
-	now := time.Now()
-	tunnel := core.Tunnel{
-		ID:             uuid.New(),
-		NodeID:         node.ID,
-		TenantID:       network.TenantID,
-		NetworkID:      network.ID,
-		Name:           req.Name,
-		LocalAddress:   req.LocalAddress,
-		PublicHostname: req.PublicHostname,
-		Protocol:       req.Protocol,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	}
-	if err := s.db.Tunnels.Create(r.Context(), &tunnel); err != nil {
-		http.Error(w, "failed to create tunnel", http.StatusConflict)
-		return
-	}
-
 	if s.cfg.EnableGateway {
 		_ = s.syncInternalGateway(r.Context())
 	}
-
-	s.broadcastDelta(networkScope(network), map[string]any{
-		"event":         "gateway_routes_updated",
-		"network_id":    network.ID,
-		"hostname":      tunnel.PublicHostname,
-		"local_address": tunnel.LocalAddress,
-		"node_id":       tunnel.NodeID,
-	})
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(tunnel)
+	writeJSON(w, http.StatusCreated, tunnel)
 }
 
 // handleListTunnels returns the tunnels of the caller's network.
 func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request) {
-	tunnels, err := s.db.Tunnels.ListByNetworkID(r.Context(), NodeFromContext(r.Context()).NetworkID)
+	tunnels, err := s.svc.ListTunnels(r.Context(), NodeFromContext(r.Context()))
 	if err != nil {
-		http.Error(w, "failed to list tunnels", http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(tunnels)
+	writeJSON(w, http.StatusOK, tunnels)
 }
 
 // handleDeleteTunnel removes a tunnel owned by the calling node.
@@ -1203,25 +981,12 @@ func (s *Server) handleDeleteTunnel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid tunnel id", http.StatusBadRequest)
 		return
 	}
-	node := NodeFromContext(r.Context())
-	tunnel, err := s.db.Tunnels.GetByID(r.Context(), id)
-	if err != nil || tunnel == nil || tunnel.NodeID != node.ID {
-		http.Error(w, "tunnel not found", http.StatusNotFound)
-		return
-	}
-	if err := s.db.Tunnels.Delete(r.Context(), id); err != nil {
-		http.Error(w, "failed to delete tunnel", http.StatusInternalServerError)
+	if err := s.svc.DeleteTunnel(r.Context(), NodeFromContext(r.Context()), id); err != nil {
+		writeServiceError(w, err)
 		return
 	}
 	if s.cfg.EnableGateway {
 		_ = s.syncInternalGateway(r.Context())
-	}
-	if network, err := s.db.Networks.GetByID(r.Context(), node.NetworkID); err == nil && network != nil {
-		s.broadcastDelta(networkScope(network), map[string]any{
-			"event":      "gateway_routes_updated",
-			"network_id": network.ID,
-			"hostname":   tunnel.PublicHostname,
-		})
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1295,125 +1060,20 @@ func (s *Server) scopeForNetwork(ctx context.Context, networkID string) controle
 	return controlevents.Scope{NetworkID: networkID}
 }
 
-func (s *Server) getOrCreateIPAM(ctx context.Context, net *core.Network) (*ipam.IPAM, error) {
-	s.ipamMu.Lock()
-	defer s.ipamMu.Unlock()
-
-	if allocator, found := s.ipamCache[net.ID]; found {
-		return allocator, nil
-	}
-
-	allocated, err := s.db.Nodes.ListAllocatedIPs(ctx, net.ID)
-	if err != nil {
-		return nil, err
-	}
-
-	allocator, err := ipam.NewIPAM(net.IPv4CIDR, allocated)
-	if err != nil {
-		return nil, err
-	}
-
-	s.ipamCache[net.ID] = allocator
-	return allocator, nil
-}
-
-// GatewayBackendItem represents a single mesh node target for an exposed service.
-type GatewayBackendItem struct {
-	Address      string    `json:"address"` // e.g. "100.64.0.10:3000"
-	NodeID       uuid.UUID `json:"node_id"`
-	NodeHostname string    `json:"node_hostname"`
-	Weight       int       `json:"weight"`
-	Healthy      bool      `json:"healthy"`
-}
-
-// GatewayRouteItem represents a public hostname routed to a pool of mesh backends.
-type GatewayRouteItem struct {
-	Hostname string               `json:"hostname"`
-	Protocol string               `json:"protocol"`
-	Backends []GatewayBackendItem `json:"backends"`
-}
-
-// GatewayRoutesResponse returns all active routes for ingress gateways.
-type GatewayRoutesResponse struct {
-	Routes []GatewayRouteItem `json:"routes"`
-}
-
 func (s *Server) handleGetGatewayRoutes(w http.ResponseWriter, r *http.Request) {
-	routes, err := s.buildGatewayRoutes(r.Context(), NodeFromContext(r.Context()).NetworkID)
+	routes, err := s.svc.GatewayRoutes(r.Context(), NodeFromContext(r.Context()).NetworkID)
 	if err != nil {
-		http.Error(w, "failed to build gateway routes", http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(GatewayRoutesResponse{Routes: routes})
-}
-
-// buildGatewayRoutes groups tunnels into per-hostname routes. An empty
-// networkID covers every network and is reserved for the plane's embedded gateway.
-func (s *Server) buildGatewayRoutes(ctx context.Context, networkID string) ([]GatewayRouteItem, error) {
-	var tunnels []core.Tunnel
-	var err error
-	if networkID == "" {
-		tunnels, err = s.db.Tunnels.ListAll(ctx)
-	} else {
-		tunnels, err = s.db.Tunnels.ListByNetworkID(ctx, networkID)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	nodes := make(map[uuid.UUID]*core.Node)
-	routesMap := make(map[string]*GatewayRouteItem)
-
-	for _, t := range tunnels {
-		node, cached := nodes[t.NodeID]
-		if !cached {
-			node, _ = s.db.Nodes.GetByID(ctx, t.NodeID)
-			nodes[t.NodeID] = node
-		}
-		if node == nil || !node.IsActive || node.OverlayIPv4 == "" {
-			continue
-		}
-
-		port := extractPort(t.LocalAddress)
-		targetAddr := net.JoinHostPort(node.OverlayIPv4, port)
-
-		route, exists := routesMap[t.PublicHostname]
-		if !exists {
-			proto := t.Protocol
-			if proto == "" {
-				proto = "http"
-			}
-			route = &GatewayRouteItem{
-				Hostname: t.PublicHostname,
-				Protocol: proto,
-				Backends: make([]GatewayBackendItem, 0, 2),
-			}
-			routesMap[t.PublicHostname] = route
-		}
-
-		route.Backends = append(route.Backends, GatewayBackendItem{
-			Address:      targetAddr,
-			NodeID:       node.ID,
-			NodeHostname: node.Hostname,
-			Weight:       100,
-			Healthy:      true,
-		})
-	}
-
-	res := make([]GatewayRouteItem, 0, len(routesMap))
-	for _, r := range routesMap {
-		res = append(res, *r)
-	}
-	return res, nil
+	writeJSON(w, http.StatusOK, GatewayRoutesResponse{Routes: routes})
 }
 
 func (s *Server) syncInternalGateway(ctx context.Context) error {
 	if s.gatewayProxy == nil {
 		return nil
 	}
-	routes, err := s.buildGatewayRoutes(ctx, "")
+	routes, err := s.svc.GatewayRoutes(ctx, "")
 	if err != nil {
 		return err
 	}
@@ -1438,20 +1098,6 @@ func (s *Server) handleGatewayFallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.NotFound(w, r)
-}
-
-func extractPort(addr string) string {
-	if addr == "" {
-		return "80"
-	}
-	if _, err := strconv.Atoi(addr); err == nil {
-		return addr
-	}
-	_, port, err := net.SplitHostPort(addr)
-	if err == nil && port != "" {
-		return port
-	}
-	return "80"
 }
 
 // MeshGraphNode represents a vertex in the real-time mesh topology graph.

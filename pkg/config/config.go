@@ -29,12 +29,24 @@ type ControlPlaneConfig struct {
 	SyncIntervalMs int    `mapstructure:"sync_interval_ms"`
 	EnableGateway  bool   `mapstructure:"enable_gateway"`
 	GRPCListenAddr string `mapstructure:"grpc_listen_addr"`
-	RequireAuth    bool   `mapstructure:"require_auth"`
-	EdgeAPIKey     string `mapstructure:"edge_api_key"`
+	// gRPC transport security. Plaintext requires GRPCInsecure; GRPCTLSClientCA enables mTLS.
+	GRPCTLSCert     string `mapstructure:"grpc_tls_cert"`
+	GRPCTLSKey      string `mapstructure:"grpc_tls_key"`
+	GRPCTLSClientCA string `mapstructure:"grpc_tls_client_ca"`
+	GRPCInsecure    bool   `mapstructure:"grpc_insecure"`
+	RequireAuth     bool   `mapstructure:"require_auth"`
+	EdgeAPIKey      string `mapstructure:"edge_api_key"`
 	// AdminAPIKey guards tenant administration; the tenant API is disabled when empty.
 	AdminAPIKey string `mapstructure:"admin_api_key"`
 	// AllowedOrigins lists extra browser origins permitted to open event WebSockets (same-origin is always allowed).
 	AllowedOrigins []string `mapstructure:"allowed_origins"`
+}
+
+// PlaneGRPC holds the gRPC client settings shared by every agent.
+type PlaneGRPC struct {
+	GRPCEndpoint string `mapstructure:"plane_grpc_endpoint"` // host:port of the plane's gRPC listener (defaults to plane_endpoint)
+	GRPCInsecure bool   `mapstructure:"plane_grpc_insecure"` // plaintext gRPC; tokens then travel in clear text
+	CAFile       string `mapstructure:"plane_ca_file"`       // optional CA bundle for the plane's TLS certificate
 }
 
 // EdgeConfig configures a global Edge Data Plane PoP.
@@ -48,6 +60,7 @@ type EdgeConfig struct {
 	WireGuardPrivateKey string `mapstructure:"wireguard_private_key"`
 	PlaneEndpoint       string `mapstructure:"plane_endpoint"`
 	PlaneTransport      string `mapstructure:"plane_transport"` // "rest" or "grpc"
+	PlaneGRPC           `mapstructure:",squash"`
 	EdgeAPIKey          string `mapstructure:"edge_api_key"`
 	IsAnycast           bool   `mapstructure:"is_anycast"`
 	UsePrivateIP        bool   `mapstructure:"use_private_ip"`
@@ -63,14 +76,15 @@ type LocalTunnelConfig struct {
 
 // NodeConfig configures the zro-node client daemon.
 type NodeConfig struct {
-	Hostname            string              `mapstructure:"hostname"`
-	NetworkID           string              `mapstructure:"network_id"`
-	EnrollmentToken     string              `mapstructure:"enrollment_token"`
-	PlaneEndpoint       string              `mapstructure:"plane_endpoint"`
-	PlaneTransport      string              `mapstructure:"plane_transport"` // "rest" or "grpc"
-	InterfaceMode       string              `mapstructure:"interface_mode"`  // "tun" or "netstack"
-	InterfaceName       string              `mapstructure:"interface_name"`  // "zro0"
-	ListenPort          int                 `mapstructure:"listen_port"`     // shared UDP port; 0 = ephemeral
+	Hostname            string `mapstructure:"hostname"`
+	NetworkID           string `mapstructure:"network_id"`
+	EnrollmentToken     string `mapstructure:"enrollment_token"`
+	PlaneEndpoint       string `mapstructure:"plane_endpoint"`
+	PlaneTransport      string `mapstructure:"plane_transport"` // "rest" or "grpc"
+	PlaneGRPC           `mapstructure:",squash"`
+	InterfaceMode       string              `mapstructure:"interface_mode"` // "tun" or "netstack"
+	InterfaceName       string              `mapstructure:"interface_name"` // "zro0"
+	ListenPort          int                 `mapstructure:"listen_port"`    // shared UDP port; 0 = ephemeral
 	MTU                 int                 `mapstructure:"mtu"`
 	EnableP2P           bool                `mapstructure:"enable_p2p"`
 	Tags                []string            `mapstructure:"tags"`
@@ -88,9 +102,10 @@ type StaticRouteConfig struct {
 
 // GatewayConfig configures the reverse proxy and cloud-native load balancer.
 type GatewayConfig struct {
-	Hostname              string              `mapstructure:"hostname"`
-	PlaneEndpoint         string              `mapstructure:"plane_endpoint"`
-	PlaneTransport        string              `mapstructure:"plane_transport"` // "rest" or "grpc"
+	Hostname              string `mapstructure:"hostname"`
+	PlaneEndpoint         string `mapstructure:"plane_endpoint"`
+	PlaneTransport        string `mapstructure:"plane_transport"` // "rest" or "grpc"
+	PlaneGRPC             `mapstructure:",squash"`
 	EnrollmentToken       string              `mapstructure:"enrollment_token"`
 	NetworkID             string              `mapstructure:"network_id"`
 	InterfaceName         string              `mapstructure:"interface_name"`

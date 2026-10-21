@@ -3,7 +3,10 @@
 // network, or the whole control plane (edge infrastructure only).
 package events
 
-import "github.com/google/uuid"
+import (
+	"github.com/cubis/zro/pkg/core"
+	"github.com/google/uuid"
+)
 
 // Scope identifies which events a subscriber may receive.
 type Scope struct {
@@ -21,6 +24,11 @@ func Global() Scope {
 // ForNode returns the scope for a node principal.
 func ForNode(tenantID uuid.UUID, networkID string) Scope {
 	return Scope{TenantID: tenantID, NetworkID: networkID}
+}
+
+// OfNetwork returns the scope of events that belong to a network.
+func OfNetwork(n *core.Network) Scope {
+	return Scope{TenantID: n.TenantID, NetworkID: n.ID}
 }
 
 // ForTenant returns the scope for a tenant API principal.

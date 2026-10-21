@@ -2,20 +2,15 @@ package grpc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"net"
-	"strconv"
-	"sync"
 	"time"
 
 	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
-	"github.com/cubis/zro/pkg/control/delegation"
-	"github.com/cubis/zro/pkg/control/enroll"
+	controlauth "github.com/cubis/zro/pkg/control/auth"
 	"github.com/cubis/zro/pkg/control/events"
-	"github.com/cubis/zro/pkg/control/ipam"
+	"github.com/cubis/zro/pkg/control/service"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/store"
 	"github.com/google/uuid"
@@ -23,29 +18,31 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Server implements the ControlPlaneServiceServer for gRPC.
+// Server implements the ControlPlaneServiceServer for gRPC. It is a thin
+// adapter over service.Service, so REST and gRPC enforce identical rules.
 type Server struct {
 	v1.UnimplementedControlPlaneServiceServer
-	cfg       *config.ControlPlaneConfig
-	db        *store.DB
-	delegator *delegation.Engine
-	ipamCache map[string]*ipam.IPAM
-	ipamMu    sync.RWMutex
+	cfg *config.ControlPlaneConfig
+	db  *store.DB
+	svc *service.Service
 
 	bus         *events.Bus
 	streamScope func(context.Context) (events.Scope, error)
+	authn       Authenticator
 }
 
 // NewServer creates a new gRPC Control Plane Server.
-func NewServer(cfg *config.ControlPlaneConfig, db *store.DB) *Server {
+func NewServer(cfg *config.ControlPlaneConfig, db *store.DB, svc *service.Service) *Server {
 	return &Server{
-		cfg:       cfg,
-		db:        db,
-		delegator: delegation.NewEngine(db.EdgePoPs),
-		ipamCache: make(map[string]*ipam.IPAM),
-		bus:       events.NewBus(),
+		cfg: cfg,
+		db:  db,
+		svc: svc,
+		bus: events.NewBus(),
 		streamScope: func(context.Context) (events.Scope, error) {
 			return events.Scope{}, status.Error(codes.Unauthenticated, "event streams are not configured")
+		},
+		authn: func(ctx context.Context) (context.Context, error) {
+			return ctx, status.Error(codes.Unauthenticated, "authentication is not configured")
 		},
 	}
 }
@@ -56,309 +53,233 @@ func (s *Server) SetEventSource(bus *events.Bus, scope func(context.Context) (ev
 	s.bus, s.streamScope = bus, scope
 }
 
+// SetAuthenticator installs the credential check used by the interceptors.
+// RPCs other than Enroll fail closed until it is set.
+func (s *Server) SetAuthenticator(a Authenticator) { s.authn = a }
+
+// node returns the authenticated node of an RPC context.
+func node(ctx context.Context) *core.Node { return controlauth.NodeFromContext(ctx) }
+
+// toStatus maps a service error to a gRPC status.
+func toStatus(err error) error {
+	if err == nil {
+		return nil
+	}
+	code := codes.Internal
+	switch service.KindOf(err) {
+	case service.KindInvalid:
+		code = codes.InvalidArgument
+	case service.KindUnauthenticated:
+		code = codes.Unauthenticated
+	case service.KindForbidden:
+		code = codes.PermissionDenied
+	case service.KindNotFound:
+		code = codes.NotFound
+	case service.KindConflict:
+		code = codes.AlreadyExists
+	case service.KindExhausted:
+		code = codes.ResourceExhausted
+	}
+	if code == codes.Internal {
+		slog.Error("gRPC request failed", "error", err)
+	}
+	return status.Error(code, service.Message(err))
+}
+
+func toProtoPoP(p *core.EdgePoP) *v1.EdgePoP {
+	if p == nil || p.ID == uuid.Nil {
+		return nil
+	}
+	return &v1.EdgePoP{
+		Id:             p.ID.String(),
+		PopCode:        p.PoPCode,
+		Region:         p.Region,
+		PublicEndpoint: p.PublicEndpoint,
+		PublicKey:      p.PublicKey,
+		IsAnycast:      p.IsAnycast,
+		Weight:         int32(p.Weight),
+	}
+}
+
+func toProtoNode(n *core.Node) *v1.Node {
+	return &v1.Node{
+		Id:          n.ID.String(),
+		Hostname:    n.Hostname,
+		PublicKey:   n.PublicKey,
+		OverlayIpv4: n.OverlayIPv4,
+		OverlayIpv6: n.OverlayIPv6,
+		NodeType:    string(n.NodeType),
+		Tags:        []string(n.Tags),
+		AllowedIps:  []string(n.AllowedIPs),
+		Endpoints:   []string(n.Endpoints),
+	}
+}
+
+func toProtoTunnel(t *core.Tunnel) *v1.Tunnel {
+	return &v1.Tunnel{
+		Id:             t.ID.String(),
+		Name:           t.Name,
+		LocalAddress:   t.LocalAddress,
+		PublicHostname: t.PublicHostname,
+		Protocol:       t.Protocol,
+	}
+}
+
 // Enroll handles cryptographic node and gateway enrollment over gRPC.
 func (s *Server) Enroll(ctx context.Context, req *v1.EnrollRequest) (*v1.EnrollResponse, error) {
-	grant, err := enroll.Authorize(ctx, s.cfg.SecretKey, s.db.Enrollments, enroll.Request{
-		Token: req.Token, PublicKey: req.PublicKey, Hostname: req.Hostname, NodeType: core.NodeType(req.NodeType),
-	})
-	if err != nil {
-		switch {
-		case errors.Is(err, enroll.ErrUnauthenticated):
-			return nil, status.Error(codes.Unauthenticated, err.Error())
-		case errors.Is(err, enroll.ErrForbidden):
-			return nil, status.Error(codes.PermissionDenied, err.Error())
-		case errors.Is(err, enroll.ErrConflict):
-			return nil, status.Error(codes.AlreadyExists, err.Error())
-		}
-		return nil, status.Error(codes.Internal, "enrollment failed")
-	}
-
-	network, err := s.db.Networks.GetByID(ctx, grant.NetworkID)
-	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "network %s not found", grant.NetworkID)
-	}
-
-	allocator, err := s.getOrCreateIPAM(ctx, network)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "IPAM initialization failed: %v", err)
-	}
-
-	v4, err := allocator.AllocateNext()
-	if err != nil {
-		return nil, status.Errorf(codes.ResourceExhausted, "IP allocation failed: %v", err)
-	}
-
-	v6, err := ipam.DeriveIPv6(network.IPv6CIDR, v4)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "IPv6 derivation failed: %v", err)
-	}
-
-	nodeID := uuid.New()
+	probes := make([]core.LatencySample, 0, len(req.Probes))
 	for _, p := range req.Probes {
-		s.delegator.RecordProbe(core.LatencySample{
-			NodeID:     nodeID,
-			PoPCode:    p.PopCode,
-			RTT:        time.Duration(p.RttNs),
-			PacketLoss: p.PacketLoss,
-			Timestamp:  time.Now(),
-		})
+		probes = append(probes, core.LatencySample{PoPCode: p.PopCode, RTT: time.Duration(p.RttNs), PacketLoss: p.PacketLoss})
 	}
-
-	node := &core.Node{
-		ID:          nodeID,
-		NetworkID:   network.ID,
-		Hostname:    grant.Hostname,
-		PublicKey:   req.PublicKey,
-		OverlayIPv4: v4,
-		OverlayIPv6: v6,
-		NodeType:    grant.NodeType,
-		Tags:        core.StringList(req.Tags),
-		Endpoints:   core.StringList(req.Endpoints),
-		IsActive:    true,
-		LastSeenAt:  time.Now(),
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
-	}
-
-	delegationRes, err := s.delegator.Delegate(ctx, nodeID)
-	if err == nil && delegationRes != nil {
-		node.AssignedPoPID = &delegationRes.PrimaryPoP.ID
-		node.AssignedPoP = &delegationRes.PrimaryPoP
-	}
-
-	if err := s.db.Nodes.Create(ctx, node); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to save node: %v", err)
-	}
-
-	// Fetch peers
-	existingNodes, _ := s.db.Nodes.ListByNetworkID(ctx, network.ID)
-	var protoPeers []*v1.Node
-	for _, n := range existingNodes {
-		if n.PublicKey != req.PublicKey {
-			protoPeers = append(protoPeers, &v1.Node{
-				Id:          n.ID.String(),
-				Hostname:    n.Hostname,
-				PublicKey:   n.PublicKey,
-				OverlayIpv4: n.OverlayIPv4,
-				OverlayIpv6: n.OverlayIPv6,
-				NodeType:    string(n.NodeType),
-				Tags:        []string(n.Tags),
-				Endpoints:   []string(n.Endpoints),
-			})
-		}
-	}
-
-	var protoPrimary, protoSecondary *v1.EdgePoP
-	if delegationRes != nil {
-		protoPrimary = &v1.EdgePoP{
-			Id:             delegationRes.PrimaryPoP.ID.String(),
-			PopCode:        delegationRes.PrimaryPoP.PoPCode,
-			Region:         delegationRes.PrimaryPoP.Region,
-			PublicEndpoint: delegationRes.PrimaryPoP.PublicEndpoint,
-			PublicKey:      delegationRes.PrimaryPoP.PublicKey,
-			IsAnycast:      delegationRes.PrimaryPoP.IsAnycast,
-			Weight:         int32(delegationRes.PrimaryPoP.Weight),
-		}
-		if delegationRes.SecondaryPoP != nil {
-			protoSecondary = &v1.EdgePoP{
-				Id:             delegationRes.SecondaryPoP.ID.String(),
-				PopCode:        delegationRes.SecondaryPoP.PoPCode,
-				Region:         delegationRes.SecondaryPoP.Region,
-				PublicEndpoint: delegationRes.SecondaryPoP.PublicEndpoint,
-				PublicKey:      delegationRes.SecondaryPoP.PublicKey,
-				IsAnycast:      delegationRes.SecondaryPoP.IsAnycast,
-				Weight:         int32(delegationRes.SecondaryPoP.Weight),
-			}
-		}
-	}
-
-	s.bus.Publish(events.Scope{TenantID: network.TenantID, NetworkID: network.ID}, "node_enrolled", map[string]any{
-		"node_id":      node.ID.String(),
-		"hostname":     node.Hostname,
-		"overlay_ipv4": node.OverlayIPv4,
-		"node_type":    string(node.NodeType),
+	resp, err := s.svc.Enroll(ctx, service.EnrollRequest{
+		Token:        req.Token,
+		PublicKey:    req.PublicKey,
+		Hostname:     req.Hostname,
+		NodeType:     core.NodeType(req.NodeType),
+		Tags:         req.Tags,
+		Endpoints:    req.Endpoints,
+		AllowedPorts: req.AllowedPorts,
+		DefaultDeny:  req.DefaultDeny,
+		Probes:       probes,
 	})
+	if err != nil {
+		return nil, toStatus(err)
+	}
 
-	return &v1.EnrollResponse{
-		NodeId:       node.ID.String(),
-		NetworkId:    network.ID,
-		OverlayIpv4:  node.OverlayIPv4,
-		OverlayIpv6:  node.OverlayIPv6,
-		DnsDomain:    network.DNSDomain,
-		Mtu:          int32(network.MTU),
-		PrimaryPop:   protoPrimary,
-		SecondaryPop: protoSecondary,
-		Peers:        protoPeers,
-	}, nil
+	out := &v1.EnrollResponse{
+		NodeId:       resp.NodeID.String(),
+		NetworkId:    resp.NetworkID,
+		NodeToken:    resp.NodeToken,
+		OverlayIpv4:  resp.OverlayIPv4,
+		OverlayIpv6:  resp.OverlayIPv6,
+		DnsDomain:    resp.DNSDomain,
+		Mtu:          int32(resp.MTU),
+		AllowedIps:   resp.AllowedIPs,
+		AllowedPorts: resp.AllowedPorts,
+		DefaultDeny:  resp.DefaultDeny,
+		PrimaryPop:   toProtoPoP(&resp.PrimaryPoP),
+		SecondaryPop: toProtoPoP(resp.SecondaryPoP),
+	}
+	for i := range resp.Peers {
+		if resp.Peers[i].ID != resp.NodeID {
+			out.Peers = append(out.Peers, toProtoNode(&resp.Peers[i]))
+		}
+	}
+	return out, nil
 }
 
 // ReportProbes records smart routing telemetry over gRPC.
 func (s *Server) ReportProbes(ctx context.Context, req *v1.ProbeReportRequest) (*v1.ProbeReportResponse, error) {
-	nodeUUID, err := uuid.Parse(req.NodeId)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid node_id: %v", err)
-	}
-
-	sample := core.LatencySample{
-		NodeID:     nodeUUID,
+	primary := s.svc.ReportProbe(ctx, node(ctx), core.LatencySample{
 		PoPCode:    req.PopCode,
 		RTT:        time.Duration(req.RttNs),
 		PacketLoss: req.PacketLoss,
-		Timestamp:  time.Now(),
-	}
-
-	s.delegator.RecordProbe(sample)
-	delegationRes, _ := s.delegator.Delegate(ctx, nodeUUID)
-
-	code := ""
-	if delegationRes != nil {
-		code = delegationRes.PrimaryPoP.PoPCode
-	}
-
-	return &v1.ProbeReportResponse{
-		Accepted:       true,
-		PrimaryPopCode: code,
-	}, nil
+	})
+	return &v1.ProbeReportResponse{Accepted: true, PrimaryPopCode: primary}, nil
 }
 
 // DiscoverP2P returns coordinates for direct P2P WireGuard hole punching.
 func (s *Server) DiscoverP2P(ctx context.Context, req *v1.P2PDiscoverRequest) (*v1.P2PDiscoverResponse, error) {
-	initiatorUUID, err := uuid.Parse(req.InitiatorNodeId)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid initiator_node_id: %v", err)
-	}
-
-	initiator, err := s.db.Nodes.GetByID(ctx, initiatorUUID)
-	if err != nil || initiator == nil {
-		return nil, status.Errorf(codes.NotFound, "initiator node not found: %v", err)
-	}
-
-	target, err := s.db.Nodes.GetByOverlayIP(ctx, initiator.NetworkID, req.TargetOverlayIp)
-	if err != nil || target == nil {
-		return nil, status.Errorf(codes.NotFound, "target overlay IP %s not found", req.TargetOverlayIp)
-	}
-
-	var protoPrimary *v1.EdgePoP
-	if target.AssignedPoP != nil {
-		protoPrimary = &v1.EdgePoP{
-			Id:             target.AssignedPoP.ID.String(),
-			PopCode:        target.AssignedPoP.PoPCode,
-			Region:         target.AssignedPoP.Region,
-			PublicEndpoint: target.AssignedPoP.PublicEndpoint,
-			PublicKey:      target.AssignedPoP.PublicKey,
-			IsAnycast:      target.AssignedPoP.IsAnycast,
+	var initiator uuid.UUID
+	if req.InitiatorNodeId != "" {
+		var err error
+		if initiator, err = uuid.Parse(req.InitiatorNodeId); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid initiator_node_id: %v", err)
 		}
 	}
-
+	resp, err := s.svc.DiscoverP2P(ctx, node(ctx), service.P2PDiscoverRequest{
+		InitiatorNodeID:    initiator,
+		TargetOverlayIP:    req.TargetOverlayIp,
+		InitiatorEndpoints: req.InitiatorEndpoints,
+	})
+	if err != nil {
+		return nil, toStatus(err)
+	}
 	return &v1.P2PDiscoverResponse{
-		TargetNodeId:      target.ID.String(),
-		TargetHostname:    target.Hostname,
-		TargetPublicKey:   target.PublicKey,
-		TargetOverlayIpv4: target.OverlayIPv4,
-		TargetEndpoints:   []string(target.Endpoints),
-		PrimaryPop:        protoPrimary,
+		TargetNodeId:      resp.TargetNodeID.String(),
+		TargetHostname:    resp.TargetHostname,
+		TargetPublicKey:   resp.TargetPublicKey,
+		TargetOverlayIpv4: resp.TargetOverlayIPv4,
+		TargetOverlayIpv6: resp.TargetOverlayIPv6,
+		TargetEndpoints:   resp.TargetEndpoints,
+		PrimaryPop:        toProtoPoP(resp.PrimaryPoP),
+		SecondaryPop:      toProtoPoP(resp.SecondaryPoP),
 	}, nil
 }
 
 // SyncEdgeMesh synchronizes global PoPs and Nodes with Edge Data Plane PoPs.
-func (s *Server) SyncEdgeMesh(ctx context.Context, req *v1.EdgeSyncRequest) (*v1.EdgeSyncResponse, error) {
-	pops, err := s.db.EdgePoPs.ListHealthy(ctx)
+func (s *Server) SyncEdgeMesh(ctx context.Context, _ *v1.EdgeSyncRequest) (*v1.EdgeSyncResponse, error) {
+	pops, nodes, err := s.svc.EdgeSync(ctx)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to list pops: %v", err)
+		return nil, toStatus(err)
 	}
-
-	var allNodes []core.Node
-	tenants, _ := s.db.Tenants.List(ctx)
-	for _, t := range tenants {
-		nets, _ := s.db.Networks.ListByTenantID(ctx, t.ID)
-		for _, n := range nets {
-			nodes, _ := s.db.Nodes.ListByNetworkID(ctx, n.ID)
-			allNodes = append(allNodes, nodes...)
-		}
+	out := &v1.EdgeSyncResponse{}
+	for i := range pops {
+		out.Pops = append(out.Pops, toProtoPoP(&pops[i]))
 	}
-
-	var protoPoPs []*v1.EdgePoP
-	for _, p := range pops {
-		protoPoPs = append(protoPoPs, &v1.EdgePoP{
-			Id:             p.ID.String(),
-			PopCode:        p.PoPCode,
-			Region:         p.Region,
-			PublicEndpoint: p.PublicEndpoint,
-			PublicKey:      p.PublicKey,
-			IsAnycast:      p.IsAnycast,
-			Weight:         int32(p.Weight),
-		})
+	for i := range nodes {
+		out.Nodes = append(out.Nodes, toProtoNode(&nodes[i]))
 	}
-
-	var protoNodes []*v1.Node
-	for _, n := range allNodes {
-		protoNodes = append(protoNodes, &v1.Node{
-			Id:          n.ID.String(),
-			Hostname:    n.Hostname,
-			PublicKey:   n.PublicKey,
-			OverlayIpv4: n.OverlayIPv4,
-			OverlayIpv6: n.OverlayIPv6,
-			NodeType:    string(n.NodeType),
-			Tags:        []string(n.Tags),
-			Endpoints:   []string(n.Endpoints),
-		})
-	}
-
-	return &v1.EdgeSyncResponse{
-		Pops:  protoPoPs,
-		Nodes: protoNodes,
-	}, nil
+	return out, nil
 }
 
-// GetGatewayRoutes builds and returns dynamic backend pools for Ingress Gateways.
-func (s *Server) GetGatewayRoutes(ctx context.Context, req *v1.GatewayRoutesRequest) (*v1.GatewayRoutesResponse, error) {
-	tunnels, err := s.db.Tunnels.ListAll(ctx)
+// GetGatewayRoutes returns the dynamic backend pools of the caller's network.
+func (s *Server) GetGatewayRoutes(ctx context.Context, _ *v1.GatewayRoutesRequest) (*v1.GatewayRoutesResponse, error) {
+	routes, err := s.svc.GatewayRoutes(ctx, node(ctx).NetworkID)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to list tunnels: %v", err)
+		return nil, toStatus(err)
 	}
-
-	routesMap := make(map[string]*v1.GatewayRoute)
-
-	for _, t := range tunnels {
-		node, err := s.db.Nodes.GetByID(ctx, t.NodeID)
-		if err != nil || node == nil || !node.IsActive || node.OverlayIPv4 == "" {
-			continue
+	out := &v1.GatewayRoutesResponse{}
+	for _, r := range routes {
+		route := &v1.GatewayRoute{Hostname: r.Hostname, Protocol: r.Protocol}
+		for _, b := range r.Backends {
+			route.Backends = append(route.Backends, &v1.GatewayBackend{
+				Address:      b.Address,
+				NodeId:       b.NodeID.String(),
+				NodeHostname: b.NodeHostname,
+				Weight:       int32(b.Weight),
+				Healthy:      b.Healthy,
+			})
 		}
-
-		port := extractPort(t.LocalAddress)
-		targetAddr := net.JoinHostPort(node.OverlayIPv4, port)
-
-		route, exists := routesMap[t.PublicHostname]
-		if !exists {
-			proto := t.Protocol
-			if proto == "" {
-				proto = "http"
-			}
-			route = &v1.GatewayRoute{
-				Hostname: t.PublicHostname,
-				Protocol: proto,
-				Backends: make([]*v1.GatewayBackend, 0, 2),
-			}
-			routesMap[t.PublicHostname] = route
-		}
-
-		route.Backends = append(route.Backends, &v1.GatewayBackend{
-			Address:      targetAddr,
-			NodeId:       node.ID.String(),
-			NodeHostname: node.Hostname,
-			Weight:       100,
-			Healthy:      true,
-		})
+		out.Routes = append(out.Routes, route)
 	}
+	return out, nil
+}
 
-	var protoRoutes []*v1.GatewayRoute
-	for _, r := range routesMap {
-		protoRoutes = append(protoRoutes, r)
+// RegisterTunnel exposes a local service of the calling node.
+func (s *Server) RegisterTunnel(ctx context.Context, req *v1.RegisterTunnelRequest) (*v1.Tunnel, error) {
+	t, err := s.svc.RegisterTunnel(ctx, node(ctx), core.Tunnel{
+		Name: req.Name, LocalAddress: req.LocalAddress, PublicHostname: req.PublicHostname, Protocol: req.Protocol,
+	})
+	if err != nil {
+		return nil, toStatus(err)
 	}
+	return toProtoTunnel(t), nil
+}
 
-	return &v1.GatewayRoutesResponse{
-		Routes: protoRoutes,
-	}, nil
+// ListTunnels returns the tunnels of the caller's network.
+func (s *Server) ListTunnels(ctx context.Context, _ *v1.ListTunnelsRequest) (*v1.ListTunnelsResponse, error) {
+	tunnels, err := s.svc.ListTunnels(ctx, node(ctx))
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	out := &v1.ListTunnelsResponse{}
+	for i := range tunnels {
+		out.Tunnels = append(out.Tunnels, toProtoTunnel(&tunnels[i]))
+	}
+	return out, nil
+}
+
+// DeleteTunnel removes a tunnel owned by the calling node.
+func (s *Server) DeleteTunnel(ctx context.Context, req *v1.DeleteTunnelRequest) (*v1.DeleteTunnelResponse, error) {
+	id, err := uuid.Parse(req.Id)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid tunnel id: %v", err)
+	}
+	if err := s.svc.DeleteTunnel(ctx, node(ctx), id); err != nil {
+		return nil, toStatus(err)
+	}
+	return &v1.DeleteTunnelResponse{}, nil
 }
 
 // StreamMeshEvents provides a persistent real-time event bus over gRPC streaming.
@@ -402,40 +323,4 @@ func (s *Server) StreamMeshEvents(req *v1.StreamEventsRequest, stream v1.Control
 // BroadcastEvent publishes an unscoped (control-plane wide) event.
 func (s *Server) BroadcastEvent(eventType string, payload any) {
 	s.bus.Publish(events.Scope{}, eventType, payload)
-}
-
-func (s *Server) getOrCreateIPAM(ctx context.Context, net *core.Network) (*ipam.IPAM, error) {
-	s.ipamMu.Lock()
-	defer s.ipamMu.Unlock()
-
-	if allocator, found := s.ipamCache[net.ID]; found {
-		return allocator, nil
-	}
-
-	allocated, err := s.db.Nodes.ListAllocatedIPs(ctx, net.ID)
-	if err != nil {
-		return nil, err
-	}
-
-	allocator, err := ipam.NewIPAM(net.IPv4CIDR, allocated)
-	if err != nil {
-		return nil, err
-	}
-
-	s.ipamCache[net.ID] = allocator
-	return allocator, nil
-}
-
-func extractPort(addr string) string {
-	if addr == "" {
-		return "80"
-	}
-	if _, err := strconv.Atoi(addr); err == nil {
-		return addr
-	}
-	_, port, err := net.SplitHostPort(addr)
-	if err == nil && port != "" {
-		return port
-	}
-	return "80"
 }

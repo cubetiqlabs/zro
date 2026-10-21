@@ -180,9 +180,10 @@ func (e *PoPDaemon) Start(ctx context.Context) error {
 	// Connect gRPC client if plane transport is set to grpc
 	if strings.EqualFold(e.cfg.PlaneTransport, "grpc") {
 		grpcTarget := e.cfg.PlaneEndpoint
-		grpcTarget = strings.TrimPrefix(grpcTarget, "http://")
-		grpcTarget = strings.TrimPrefix(grpcTarget, "https://")
-		gc, err := controlgrpc.NewClient(grpcTarget)
+		if e.cfg.GRPCEndpoint != "" {
+			grpcTarget = e.cfg.GRPCEndpoint
+		}
+		gc, err := controlgrpc.DialPlane(e.cfg.PlaneEndpoint, e.cfg.PlaneGRPC, func() string { return e.cfg.EdgeAPIKey })
 		if err == nil {
 			e.grpcClient = gc
 			slog.Info("Edge PoP connected to Control Plane via gRPC", "target", grpcTarget)
