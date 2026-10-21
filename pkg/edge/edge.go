@@ -10,21 +10,21 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
+	controlauth "github.com/cubis/zro/pkg/control/auth"
 	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
-	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/dataplane/derp"
 	"github.com/cubis/zro/pkg/dataplane/netcfg"
-	"github.com/cubis/zro/pkg/dataplane/router"
 	"github.com/cubis/zro/pkg/dataplane/tun"
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
+	"github.com/cubis/zro/pkg/identity"
 	"github.com/cubis/zro/pkg/netutil"
 	"github.com/cubis/zro/pkg/p2p/stun"
-	"golang.org/x/net/websocket"
+	"github.com/cubis/zro/pkg/realtime"
 )
 
 // PoPDaemon is the edge data plane daemon running at public PoPs.
@@ -33,18 +33,25 @@ type PoPDaemon struct {
 	keyPair      *crypto.KeyPair
 	wgManager    *wireguard.Manager
 	tunDev       tun.Device
-	routingTable *router.Table
+	routed       map[string]bool // overlay prefixes already routed into the TUN (sync goroutine only)
 	udpListener  *net.UDPConn
 	derpServer   *derp.Server
 	derpListener net.Listener
 	httpClient   *http.Client
+	registered   chan struct{} // closed after the first successful registration
+	regOnce      sync.Once
+	popKey       controlauth.TokenHolder // per-PoP credential issued at first registration
 	grpcClient   *controlgrpc.Client
 	peerCount    int
+	knownKeys    atomic.Pointer[map[[32]byte]struct{}] // public keys allowed on the DERP relay
 	peersMu      sync.RWMutex
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
+
+// popKeyFile is the state-dir file holding the PoP's own credential.
+const popKeyFile = "edge.popkey"
 
 // NewPoPDaemon creates a new Edge Data Plane daemon.
 func NewPoPDaemon(cfg *config.EdgeConfig) (*PoPDaemon, error) {
@@ -61,9 +68,9 @@ func NewPoPDaemon(cfg *config.EdgeConfig) (*PoPDaemon, error) {
 			PublicKey:  pub,
 		}
 	} else {
-		kp, err = crypto.GenerateKeyPair()
+		kp, err = identity.LoadOrCreateKey(cfg.StateDir, "edge.key")
 		if err != nil {
-			return nil, fmt.Errorf("failed to generate keypair: %w", err)
+			return nil, fmt.Errorf("failed to load WireGuard identity: %w", err)
 		}
 	}
 
@@ -93,12 +100,28 @@ func NewPoPDaemon(cfg *config.EdgeConfig) (*PoPDaemon, error) {
 	}
 
 	e := &PoPDaemon{
-		cfg:          cfg,
-		keyPair:      kp,
-		tunDev:       tunDev,
-		udpListener:  udpConn,
-		routingTable: router.NewTable(),
-		httpClient:   &http.Client{Timeout: 10 * time.Second},
+		cfg:         cfg,
+		keyPair:     kp,
+		tunDev:      tunDev,
+		udpListener: udpConn,
+		routed:      make(map[string]bool),
+		registered:  make(chan struct{}),
+	}
+	if cfg.StateDir != "" {
+		if key, err := identity.ReadSecret(cfg.StateDir, popKeyFile); err == nil {
+			e.popKey.Set(key)
+		}
+	}
+	e.httpClient = &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: controlauth.NewBearerTransport(nil, cfg.PlaneEndpoint, e.credential),
+	}
+
+	// Without a kernel TUN (no privileges) nothing would route between peers, so
+	// forward in userspace instead of silently dropping relayed traffic.
+	if md, ok := tunDev.(*tun.MemoryDevice); ok {
+		slog.Warn("No kernel TUN available: forwarding between peers in userspace (lower throughput)", "interface", iface)
+		go md.Hairpin()
 	}
 
 	wgMgr, err := wireguard.NewManager(iface,
@@ -120,12 +143,6 @@ func NewPoPDaemon(cfg *config.EdgeConfig) (*PoPDaemon, error) {
 	if err := netcfg.EnableForwarding(); err != nil {
 		slog.Warn("Could not enable IP forwarding on edge (relay may fail)", "error", err)
 	}
-	for _, cidr := range []string{"100.64.0.0/10", "fd00:cafe::/64"} {
-		if err := netcfg.AddSubnetRoute(iface, cidr); err != nil {
-			slog.Warn("Could not add edge overlay route", "cidr", cidr, "error", err)
-		}
-	}
-
 	// Resolve public or private endpoint dynamically (auto discovery, env override, or internal mode)
 	resolvedEndpoint := netutil.ResolveEndpoint(cfg.PublicEndpoint, cfg.ListenPort, cfg.UsePrivateIP)
 	slog.Info("Edge endpoint configuration resolved",
@@ -164,6 +181,13 @@ func (e *PoPDaemon) Start(ctx context.Context) error {
 	// Launch DERP Encrypted Packet Relay server over TCP
 	derpSrv, err := derp.NewServer(e.keyPair)
 	if err == nil {
+		// Only keys the mesh knows (nodes and PoPs) may use the relay.
+		derpSrv.Authorize = e.isKnownKey
+		// The PoP's own WireGuard device is reachable through the relay too, so
+		// nodes behind UDP-hostile networks can still handshake with it.
+		if err := e.wgManager.AttachRelay(derpSrv.Local()); err != nil {
+			slog.Warn("DERP relay could not be attached to the edge WireGuard device", "error", err)
+		}
 		e.derpServer = derpSrv
 		tcpListener, err := net.Listen("tcp", listenAddr)
 		if err == nil {
@@ -180,9 +204,10 @@ func (e *PoPDaemon) Start(ctx context.Context) error {
 	// Connect gRPC client if plane transport is set to grpc
 	if strings.EqualFold(e.cfg.PlaneTransport, "grpc") {
 		grpcTarget := e.cfg.PlaneEndpoint
-		grpcTarget = strings.TrimPrefix(grpcTarget, "http://")
-		grpcTarget = strings.TrimPrefix(grpcTarget, "https://")
-		gc, err := controlgrpc.NewClient(grpcTarget)
+		if e.cfg.GRPCEndpoint != "" {
+			grpcTarget = e.cfg.GRPCEndpoint
+		}
+		gc, err := controlgrpc.DialPlane(e.cfg.PlaneEndpoint, e.cfg.PlaneGRPC, e.credential)
 		if err == nil {
 			e.grpcClient = gc
 			slog.Info("Edge PoP connected to Control Plane via gRPC", "target", grpcTarget)
@@ -204,6 +229,7 @@ func (e *PoPDaemon) Start(ctx context.Context) error {
 
 // Stop shuts down the Edge PoP daemon.
 func (e *PoPDaemon) Stop() error {
+	e.announceShutdown()
 	if e.cancel != nil {
 		e.cancel()
 	}
@@ -249,19 +275,62 @@ func (e *PoPDaemon) registerWithControlPlane(ctx context.Context) bool {
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if e.cfg.EdgeAPIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+e.cfg.EdgeAPIKey)
-		req.Header.Set("X-Edge-Key", e.cfg.EdgeAPIKey)
-	}
 
 	resp, err := e.httpClient.Do(req)
-	if err == nil {
-		_ = resp.Body.Close()
-		slog.Info("Registered Edge PoP with Control Plane", "pop_code", e.cfg.PoPCode, "plane", e.cfg.PlaneEndpoint)
-		return true
+	if err != nil {
+		slog.Warn("Failed registration with Control Plane (will retry in background)", "pop_code", e.cfg.PoPCode, "error", err)
+		return false
 	}
-	slog.Warn("Failed registration with Control Plane (will retry in background)", "pop_code", e.cfg.PoPCode, "error", err)
-	return false
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		slog.Warn("Control Plane rejected Edge PoP registration (will retry in background)", "pop_code", e.cfg.PoPCode, "status", resp.StatusCode)
+		return false
+	}
+
+	// The first registration claims the PoP and returns its own credential, which
+	// replaces the shared registration key from then on.
+	var reg struct {
+		PopKey string `json:"pop_key"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&reg); err == nil && reg.PopKey != "" {
+		e.popKey.Set(reg.PopKey)
+		if e.cfg.StateDir != "" {
+			if err := identity.WriteSecret(e.cfg.StateDir, popKeyFile, reg.PopKey); err != nil {
+				slog.Error("Could not persist the PoP credential; the PoP will need an admin reset after a restart", "error", err)
+			}
+		} else {
+			slog.Warn("No state_dir configured: the PoP credential is kept in memory only and a restart needs an admin reset")
+		}
+	}
+	slog.Info("Registered Edge PoP with Control Plane", "pop_code", e.cfg.PoPCode, "plane", e.cfg.PlaneEndpoint)
+	e.regOnce.Do(func() { close(e.registered) })
+	return true
+}
+
+// announceShutdown tells the plane this PoP is going away so it is marked
+// offline immediately instead of after the heartbeat timeout (best effort).
+func (e *PoPDaemon) announceShutdown() {
+	if e.popKey.Get() == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.cfg.PlaneEndpoint+"/api/v1/edge/deregister", nil)
+	if err != nil {
+		return
+	}
+	if resp, err := e.httpClient.Do(req); err == nil {
+		_ = resp.Body.Close()
+	}
+}
+
+// credential is the secret sent to the plane: the PoP's own credential once it
+// has one, otherwise the shared registration key.
+func (e *PoPDaemon) credential() string {
+	if k := e.popKey.Get(); k != "" {
+		return k
+	}
+	return e.cfg.EdgeAPIKey
 }
 
 func (e *PoPDaemon) sendHeartbeat(ctx context.Context) {
@@ -287,10 +356,6 @@ func (e *PoPDaemon) sendHeartbeat(ctx context.Context) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if e.cfg.EdgeAPIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+e.cfg.EdgeAPIKey)
-		req.Header.Set("X-Edge-Key", e.cfg.EdgeAPIKey)
-	}
 
 	resp, err := e.httpClient.Do(req)
 	if err == nil {
@@ -326,116 +391,6 @@ func (e *PoPDaemon) syncWorker(ctx context.Context) {
 	}
 }
 
-func (e *PoPDaemon) syncMeshTopology(ctx context.Context) {
-	if e.grpcClient != nil {
-		gResp, err := e.grpcClient.SyncEdgeMesh(ctx, &v1.EdgeSyncRequest{
-			PopCode: e.cfg.PoPCode,
-		})
-		if err == nil && gResp != nil {
-			e.peersMu.Lock()
-			e.peerCount = len(gResp.Nodes)
-			e.peersMu.Unlock()
-
-			for _, p := range gResp.Pops {
-				if p.PopCode != e.cfg.PoPCode && p.PublicKey != "" {
-					_ = e.wgManager.ApplyPeer(wireguard.PeerConfig{
-						PublicKey:           p.PublicKey,
-						Endpoint:            p.PublicEndpoint,
-						AllowedIPs:          []string{"100.64.0.0/10", "fd00:cafe::/64"},
-						PersistentKeepalive: 20 * time.Second,
-					})
-				}
-			}
-
-			for _, n := range gResp.Nodes {
-				if n.PublicKey != "" && n.OverlayIpv4 != "" {
-					var ep string
-					if len(n.Endpoints) > 0 {
-						ep = n.Endpoints[0]
-					}
-					_ = e.wgManager.ApplyPeer(wireguard.PeerConfig{
-						PublicKey:           n.PublicKey,
-						Endpoint:            ep,
-						AllowedIPs:          []string{n.OverlayIpv4 + "/32"},
-						PersistentKeepalive: 25 * time.Second,
-					})
-					e.routingTable.SetRoute(n.OverlayIpv4, router.RouteTarget{
-						PublicKey: n.PublicKey,
-						Endpoint:  ep,
-					})
-					if err := netcfg.AddHostRoute(e.cfg.InterfaceName, n.OverlayIpv4); err != nil {
-						slog.Debug("Could not add edge route for node", "node", n.OverlayIpv4, "error", err)
-					}
-				}
-			}
-			return
-		}
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", e.cfg.PlaneEndpoint+"/api/v1/edge/sync", nil)
-	if err != nil {
-		return
-	}
-	if e.cfg.EdgeAPIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+e.cfg.EdgeAPIKey)
-		req.Header.Set("X-Edge-Key", e.cfg.EdgeAPIKey)
-	}
-
-	resp, err := e.httpClient.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
-	var syncData struct {
-		PoPs  []core.EdgePoP `json:"pops"`
-		Nodes []core.Node    `json:"nodes"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&syncData); err != nil {
-		return
-	}
-
-	e.peersMu.Lock()
-	e.peerCount = len(syncData.Nodes)
-	e.peersMu.Unlock()
-
-	// 1. Establish backbone mesh with other PoPs
-	for _, p := range syncData.PoPs {
-		if p.PoPCode != e.cfg.PoPCode && p.PublicKey != "" {
-			_ = e.wgManager.ApplyPeer(wireguard.PeerConfig{
-				PublicKey:           p.PublicKey,
-				Endpoint:            p.PublicEndpoint,
-				AllowedIPs:          []string{"100.64.0.0/10", "fd00:cafe::/64"},
-				PersistentKeepalive: 20 * time.Second,
-			})
-		}
-	}
-
-	// 2. Configure routing for active nodes
-	for _, n := range syncData.Nodes {
-		if n.PublicKey != "" && n.OverlayIPv4 != "" {
-			var ep string
-			if len(n.Endpoints) > 0 {
-				ep = n.Endpoints[0]
-			}
-			_ = e.wgManager.ApplyPeer(wireguard.PeerConfig{
-				PublicKey:           n.PublicKey,
-				Endpoint:            ep,
-				AllowedIPs:          []string{n.OverlayIPv4 + "/32"},
-				PersistentKeepalive: 25 * time.Second,
-			})
-			e.routingTable.SetRoute(n.OverlayIPv4, router.RouteTarget{
-				PublicKey: n.PublicKey,
-				Endpoint:  ep,
-			})
-			if err := netcfg.AddHostRoute(e.cfg.InterfaceName, n.OverlayIPv4); err != nil {
-				slog.Debug("Could not add edge route for node", "node", n.OverlayIPv4, "error", err)
-			}
-		}
-	}
-}
-
 // PublicKey returns the Edge PoP WireGuard public key.
 func (e *PoPDaemon) PublicKey() string {
 	return e.keyPair.PublicKey
@@ -443,61 +398,22 @@ func (e *PoPDaemon) PublicKey() string {
 
 func (e *PoPDaemon) realtimeListener(ctx context.Context) {
 	defer e.wg.Done()
-
-	if e.grpcClient != nil {
-		_ = e.grpcClient.StreamEvents(ctx, "edge", e.cfg.PoPCode, func(evt *v1.MeshEvent) {
-			if evt != nil {
-				slog.Info("Real-time topology update event received at Edge PoP via gRPC", "pop_code", e.cfg.PoPCode, "event", evt.EventType)
-				e.syncMeshTopology(ctx)
-			}
-		})
+	// The event stream needs the PoP's own credential, which registration issues.
+	select {
+	case <-e.registered:
+	case <-ctx.Done():
 		return
 	}
-
-	wsURL := e.cfg.PlaneEndpoint + "/api/v1/ws"
-	if strings.HasPrefix(wsURL, "https://") {
-		wsURL = "wss://" + strings.TrimPrefix(wsURL, "https://")
-	} else if strings.HasPrefix(wsURL, "http://") {
-		wsURL = "ws://" + strings.TrimPrefix(wsURL, "http://")
-	}
-
-	origin := e.cfg.PlaneEndpoint
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			conn, err := websocket.Dial(wsURL, "", origin)
-			if err != nil {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(2 * time.Second):
-					continue
-				}
-			}
-
-			slog.Info("Edge PoP connected to Control Plane real-time WebSocket stream", "pop_code", e.cfg.PoPCode, "url", wsURL)
-
-			for {
-				var raw string
-				err := websocket.Message.Receive(conn, &raw)
-				if err != nil {
-					_ = conn.Close()
-					break
-				}
-
-				var evt struct {
-					Event string `json:"event"`
-				}
-				if err := json.Unmarshal([]byte(raw), &evt); err == nil {
-					if evt.Event == "node_enrolled" || evt.Event == "pop_registered" || evt.Event == "edge_sync" || evt.Event == "delta" {
-						slog.Info("Real-time topology update event received at Edge PoP", "pop_code", e.cfg.PoPCode, "event", evt.Event)
-						e.syncMeshTopology(ctx)
-					}
-				}
-			}
-		}
-	}
+	realtime.Run(ctx, realtime.Config{
+		Endpoint:   e.cfg.PlaneEndpoint,
+		GRPC:       e.grpcClient,
+		Role:       "edge",
+		ID:         e.cfg.PoPCode,
+		Credential: e.credential,
+		Events:     []string{"node_joined", "node_left", "mesh_graph_updated", "pop_status_changed", "edge_registered"},
+		Debounce:   30 * time.Millisecond,
+	}, func(ctx context.Context, evs []string) {
+		slog.Debug("Mesh change received", "pop_code", e.cfg.PoPCode, "events", evs)
+		e.syncMeshTopology(ctx)
+	})
 }

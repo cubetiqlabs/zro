@@ -85,8 +85,11 @@ func (c *Client) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
-// PipeTCP bridges a raw TCP connection to a local service address.
+// PipeTCP bridges a raw TCP connection to a local service address and closes
+// both ends when it returns. Each direction is copied until EOF and then
+// half-closed, so a client that finishes sending can still receive the reply.
 func (c *Client) PipeTCP(ctx context.Context, incoming net.Conn, localAddress string) error {
+	defer incoming.Close()
 	var d net.Dialer
 	upstream, err := d.DialContext(ctx, "tcp", localAddress)
 	if err != nil {
@@ -94,22 +97,33 @@ func (c *Client) PipeTCP(ctx context.Context, incoming net.Conn, localAddress st
 	}
 	defer upstream.Close()
 
-	errCh := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(upstream, incoming)
-		errCh <- err
-	}()
-	go func() {
-		_, err := io.Copy(incoming, upstream)
-		errCh <- err
-	}()
+	// Unblock both copies if the caller gives up.
+	stop := context.AfterFunc(ctx, func() {
+		_ = incoming.Close()
+		_ = upstream.Close()
+	})
+	defer stop()
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-errCh:
-		return err
+	errCh := make(chan error, 2)
+	pipe := func(dst, src net.Conn) {
+		_, err := io.Copy(dst, src)
+		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite() // propagate EOF without cutting the other direction
+		}
+		errCh <- err
 	}
+	go pipe(upstream, incoming)
+	go pipe(incoming, upstream)
+
+	var first error
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil && first == nil && ctx.Err() == nil {
+			first = err
+			_ = incoming.Close() // a real error: stop the other direction too
+			_ = upstream.Close()
+		}
+	}
+	return first
 }
 
 // IngressRouter routes requests at the Gateway level to active node tunnels.

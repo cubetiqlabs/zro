@@ -17,11 +17,11 @@ var (
 
 // IPAM manages overlay IP allocation for virtual networks.
 type IPAM struct {
-	mu           sync.Mutex
-	subnet       *net.IPNet
-	baseIP       uint32
-	netmask      uint32
-	broadcastIP  uint32
+	mu            sync.Mutex
+	subnet        *net.IPNet
+	baseIP        uint32
+	netmask       uint32
+	broadcastIP   uint32
 	allocatedIPv4 map[uint32]bool
 }
 

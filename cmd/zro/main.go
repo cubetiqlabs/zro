@@ -22,6 +22,7 @@ import (
 	"github.com/cubis/zro/pkg/node"
 	"github.com/cubis/zro/pkg/store"
 	"github.com/cubis/zro/pkg/tunnel"
+	"github.com/cubis/zro/pkg/version"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 )
@@ -62,6 +63,7 @@ smart routing, IPless nodes, zero-trust ACLs, and cloud-native load balancing.`,
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "Path to configuration file (default: ./zro.yaml)")
 
+	rootCmd.AddCommand(newVersionCmd())
 	rootCmd.AddCommand(newPlaneCmd())
 	rootCmd.AddCommand(newEdgeCmd())
 	rootCmd.AddCommand(newNodeCmd())
@@ -81,6 +83,7 @@ func main() {
 }
 
 func runPlane(cfg *config.AppConfig) error {
+	slog.Info("ZRO control plane", "build", version.Get())
 	slog.Info("Initializing Control Plane database", "driver", cfg.ControlPlane.DatabaseDriver)
 	db, err := store.NewDB(cfg.ControlPlane.DatabaseDriver, cfg.ControlPlane.DatabaseDSN)
 	if err != nil {
@@ -157,6 +160,14 @@ func runGateway(cfg *config.AppConfig) error {
 	<-ctx.Done()
 	slog.Info("Stopping Ingress Gateway...")
 	return gwDaemon.Stop()
+}
+
+func newVersionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print the build version",
+		Run:   func(cmd *cobra.Command, args []string) { fmt.Println(version.Get()) },
+	}
 }
 
 func newPlaneCmd() *cobra.Command {
@@ -301,7 +312,7 @@ func newTokenCmd() *cobra.Command {
 	var secret string
 	var networkID string
 	var hostname string
-	var pubKey string
+	var pubKey, nodeType string
 	var durationHours int
 
 	cmd := &cobra.Command{
@@ -311,13 +322,23 @@ func newTokenCmd() *cobra.Command {
 			if secret == "" || networkID == "" || hostname == "" {
 				return fmt.Errorf("--secret, --network-id, and --hostname flags are required")
 			}
-			tok := crypto.GenerateEnrollmentToken(secret, networkID, hostname, time.Duration(durationHours)*time.Hour, pubKey)
+			tok, err := crypto.SignEnrollmentToken(secret, crypto.EnrollmentTokenPayload{
+				NetworkID:      networkID,
+				Hostname:       hostname,
+				NodeType:       nodeType,
+				BoundPublicKey: pubKey,
+				Expiry:         time.Now().Add(time.Duration(durationHours) * time.Hour).Unix(),
+			})
+			if err != nil {
+				return err
+			}
 			fmt.Printf("Enrollment Token:\n%s\n", tok)
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVar(&secret, "secret", "change-me-in-production-cluster-secret", "Cluster secret key")
+	cmd.Flags().StringVar(&secret, "secret", crypto.DefaultSecretKey, "Cluster secret key")
+	cmd.Flags().StringVar(&nodeType, "type", "peer", "Node role the token may enroll as: peer or gateway")
 	cmd.Flags().StringVar(&networkID, "network-id", "8056c2e21c000001", "Target 16-hex Network ID")
 	cmd.Flags().StringVar(&hostname, "hostname", "my-node", "Node hostname")
 	cmd.Flags().StringVar(&pubKey, "pubkey", "", "Optional WireGuard public key to bind cryptographically")
@@ -331,7 +352,7 @@ func newNetworkCmd() *cobra.Command {
 		Short: "Manage ZRO overlay networks (ZeroTier-styled 16-hex IDs)",
 	}
 
-	var name, cidrv4, cidrv6, planeURL string
+	var name, cidrv4, cidrv6, planeURL, apiKey string
 	createCmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create a new overlay network",
@@ -342,7 +363,7 @@ func newNetworkCmd() *cobra.Command {
 				"ipv6_cidr": cidrv6,
 			}
 			body, _ := json.Marshal(netReq)
-			resp, err := http.Post(planeURL+"/api/v1/networks", "application/json", bytes.NewReader(body))
+			resp, err := postJSON(planeURL+"/api/v1/networks", apiKey, body)
 			if err != nil {
 				return err
 			}
@@ -364,6 +385,7 @@ func newNetworkCmd() *cobra.Command {
 	createCmd.Flags().StringVar(&cidrv4, "cidr", "100.64.0.0/10", "IPv4 CIDR overlay space")
 	createCmd.Flags().StringVar(&cidrv6, "cidr-v6", "fd00:cafe::/64", "IPv6 CIDR overlay space")
 	createCmd.Flags().StringVar(&planeURL, "plane", "http://localhost:8443", "Control Plane URL")
+	createCmd.Flags().StringVar(&apiKey, "api-key", os.Getenv("ZRO_API_KEY"), "Tenant API key (default $ZRO_API_KEY)")
 
 	cmd.AddCommand(createCmd)
 	return cmd
@@ -400,16 +422,22 @@ func newP2PCmd() *cobra.Command {
 		Short: "P2P discovery, NAT traversal, and smart routing coordination",
 	}
 
-	var planeURL, nodeIDStr string
+	var planeURL, nodeIDStr, nodeToken string
 	discoverCmd := &cobra.Command{
 		Use:   "discover <target_overlay_ip>",
 		Short: "Perform P2P discovery & coordinate direct hole punch to target",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			targetIP := args[0]
-			nodeID, err := uuid.Parse(nodeIDStr)
-			if err != nil {
-				return fmt.Errorf("invalid --node-id: %w", err)
+			var nodeID uuid.UUID
+			if nodeIDStr != "" {
+				var err error
+				if nodeID, err = uuid.Parse(nodeIDStr); err != nil {
+					return fmt.Errorf("invalid --node-id: %w", err)
+				}
+			}
+			if nodeToken == "" {
+				return fmt.Errorf("--node-token or $ZRO_NODE_TOKEN is required")
 			}
 
 			discReq := server.P2PDiscoverRequest{
@@ -417,7 +445,7 @@ func newP2PCmd() *cobra.Command {
 				TargetOverlayIP: targetIP,
 			}
 			body, _ := json.Marshal(discReq)
-			resp, err := http.Post(planeURL+"/api/v1/p2p/discover", "application/json", bytes.NewReader(body))
+			resp, err := postJSON(planeURL+"/api/v1/p2p/discover", nodeToken, body)
 			if err != nil {
 				return err
 			}
@@ -443,9 +471,23 @@ func newP2PCmd() *cobra.Command {
 		},
 	}
 	discoverCmd.Flags().StringVar(&planeURL, "plane", "http://localhost:8443", "Control Plane URL")
-	discoverCmd.Flags().StringVar(&nodeIDStr, "node-id", "", "Initiator Node UUID")
+	discoverCmd.Flags().StringVar(&nodeIDStr, "node-id", "", "Initiator Node UUID (optional; the token identifies the node)")
+	discoverCmd.Flags().StringVar(&nodeToken, "node-token", os.Getenv("ZRO_NODE_TOKEN"), "Node token issued at enrollment (default $ZRO_NODE_TOKEN)")
 	_ = discoverCmd.MarkFlagRequired("node-id")
 
 	cmd.AddCommand(discoverCmd)
 	return cmd
+}
+
+// postJSON sends an authenticated JSON POST to the control plane.
+func postJSON(url, bearer string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	return http.DefaultClient.Do(req)
 }

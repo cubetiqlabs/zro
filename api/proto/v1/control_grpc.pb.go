@@ -24,6 +24,12 @@ const (
 	ControlPlaneService_DiscoverP2P_FullMethodName      = "/zro.control.v1.ControlPlaneService/DiscoverP2P"
 	ControlPlaneService_SyncEdgeMesh_FullMethodName     = "/zro.control.v1.ControlPlaneService/SyncEdgeMesh"
 	ControlPlaneService_GetGatewayRoutes_FullMethodName = "/zro.control.v1.ControlPlaneService/GetGatewayRoutes"
+	ControlPlaneService_GetACLPolicy_FullMethodName     = "/zro.control.v1.ControlPlaneService/GetACLPolicy"
+	ControlPlaneService_ListPeers_FullMethodName        = "/zro.control.v1.ControlPlaneService/ListPeers"
+	ControlPlaneService_Deregister_FullMethodName       = "/zro.control.v1.ControlPlaneService/Deregister"
+	ControlPlaneService_RegisterTunnel_FullMethodName   = "/zro.control.v1.ControlPlaneService/RegisterTunnel"
+	ControlPlaneService_ListTunnels_FullMethodName      = "/zro.control.v1.ControlPlaneService/ListTunnels"
+	ControlPlaneService_DeleteTunnel_FullMethodName     = "/zro.control.v1.ControlPlaneService/DeleteTunnel"
 	ControlPlaneService_StreamMeshEvents_FullMethodName = "/zro.control.v1.ControlPlaneService/StreamMeshEvents"
 )
 
@@ -43,6 +49,16 @@ type ControlPlaneServiceClient interface {
 	SyncEdgeMesh(ctx context.Context, in *EdgeSyncRequest, opts ...grpc.CallOption) (*EdgeSyncResponse, error)
 	// Dynamic route discovery for Ingress Gateways
 	GetGatewayRoutes(ctx context.Context, in *GatewayRoutesRequest, opts ...grpc.CallOption) (*GatewayRoutesResponse, error)
+	// Network-wide access rules the calling node enforces on inbound traffic
+	GetACLPolicy(ctx context.Context, in *GetACLPolicyRequest, opts ...grpc.CallOption) (*GetACLPolicyResponse, error)
+	// Current members of the caller's network
+	ListPeers(ctx context.Context, in *ListPeersRequest, opts ...grpc.CallOption) (*ListPeersResponse, error)
+	// Leave the mesh: removes the calling node, its tunnels and its overlay address
+	Deregister(ctx context.Context, in *DeregisterRequest, opts ...grpc.CallOption) (*DeregisterResponse, error)
+	// Ingress tunnels owned by the calling node (node token required)
+	RegisterTunnel(ctx context.Context, in *RegisterTunnelRequest, opts ...grpc.CallOption) (*Tunnel, error)
+	ListTunnels(ctx context.Context, in *ListTunnelsRequest, opts ...grpc.CallOption) (*ListTunnelsResponse, error)
+	DeleteTunnel(ctx context.Context, in *DeleteTunnelRequest, opts ...grpc.CallOption) (*DeleteTunnelResponse, error)
 	// Real-time bidirectional/streaming event bus for instant updates (zero polling)
 	StreamMeshEvents(ctx context.Context, in *StreamEventsRequest, opts ...grpc.CallOption) (ControlPlaneService_StreamMeshEventsClient, error)
 }
@@ -105,6 +121,66 @@ func (c *controlPlaneServiceClient) GetGatewayRoutes(ctx context.Context, in *Ga
 	return out, nil
 }
 
+func (c *controlPlaneServiceClient) GetACLPolicy(ctx context.Context, in *GetACLPolicyRequest, opts ...grpc.CallOption) (*GetACLPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetACLPolicyResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_GetACLPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) ListPeers(ctx context.Context, in *ListPeersRequest, opts ...grpc.CallOption) (*ListPeersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListPeersResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_ListPeers_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) Deregister(ctx context.Context, in *DeregisterRequest, opts ...grpc.CallOption) (*DeregisterResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeregisterResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_Deregister_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) RegisterTunnel(ctx context.Context, in *RegisterTunnelRequest, opts ...grpc.CallOption) (*Tunnel, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Tunnel)
+	err := c.cc.Invoke(ctx, ControlPlaneService_RegisterTunnel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) ListTunnels(ctx context.Context, in *ListTunnelsRequest, opts ...grpc.CallOption) (*ListTunnelsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListTunnelsResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_ListTunnels_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) DeleteTunnel(ctx context.Context, in *DeleteTunnelRequest, opts ...grpc.CallOption) (*DeleteTunnelResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteTunnelResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_DeleteTunnel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *controlPlaneServiceClient) StreamMeshEvents(ctx context.Context, in *StreamEventsRequest, opts ...grpc.CallOption) (ControlPlaneService_StreamMeshEventsClient, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &ControlPlaneService_ServiceDesc.Streams[0], ControlPlaneService_StreamMeshEvents_FullMethodName, cOpts...)
@@ -154,6 +230,16 @@ type ControlPlaneServiceServer interface {
 	SyncEdgeMesh(context.Context, *EdgeSyncRequest) (*EdgeSyncResponse, error)
 	// Dynamic route discovery for Ingress Gateways
 	GetGatewayRoutes(context.Context, *GatewayRoutesRequest) (*GatewayRoutesResponse, error)
+	// Network-wide access rules the calling node enforces on inbound traffic
+	GetACLPolicy(context.Context, *GetACLPolicyRequest) (*GetACLPolicyResponse, error)
+	// Current members of the caller's network
+	ListPeers(context.Context, *ListPeersRequest) (*ListPeersResponse, error)
+	// Leave the mesh: removes the calling node, its tunnels and its overlay address
+	Deregister(context.Context, *DeregisterRequest) (*DeregisterResponse, error)
+	// Ingress tunnels owned by the calling node (node token required)
+	RegisterTunnel(context.Context, *RegisterTunnelRequest) (*Tunnel, error)
+	ListTunnels(context.Context, *ListTunnelsRequest) (*ListTunnelsResponse, error)
+	DeleteTunnel(context.Context, *DeleteTunnelRequest) (*DeleteTunnelResponse, error)
 	// Real-time bidirectional/streaming event bus for instant updates (zero polling)
 	StreamMeshEvents(*StreamEventsRequest, ControlPlaneService_StreamMeshEventsServer) error
 	mustEmbedUnimplementedControlPlaneServiceServer()
@@ -177,6 +263,24 @@ func (UnimplementedControlPlaneServiceServer) SyncEdgeMesh(context.Context, *Edg
 }
 func (UnimplementedControlPlaneServiceServer) GetGatewayRoutes(context.Context, *GatewayRoutesRequest) (*GatewayRoutesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetGatewayRoutes not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) GetACLPolicy(context.Context, *GetACLPolicyRequest) (*GetACLPolicyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetACLPolicy not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) ListPeers(context.Context, *ListPeersRequest) (*ListPeersResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListPeers not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) Deregister(context.Context, *DeregisterRequest) (*DeregisterResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Deregister not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) RegisterTunnel(context.Context, *RegisterTunnelRequest) (*Tunnel, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RegisterTunnel not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) ListTunnels(context.Context, *ListTunnelsRequest) (*ListTunnelsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListTunnels not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) DeleteTunnel(context.Context, *DeleteTunnelRequest) (*DeleteTunnelResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeleteTunnel not implemented")
 }
 func (UnimplementedControlPlaneServiceServer) StreamMeshEvents(*StreamEventsRequest, ControlPlaneService_StreamMeshEventsServer) error {
 	return status.Errorf(codes.Unimplemented, "method StreamMeshEvents not implemented")
@@ -284,6 +388,114 @@ func _ControlPlaneService_GetGatewayRoutes_Handler(srv interface{}, ctx context.
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlPlaneService_GetACLPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetACLPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).GetACLPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_GetACLPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).GetACLPolicy(ctx, req.(*GetACLPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_ListPeers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListPeersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).ListPeers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_ListPeers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).ListPeers(ctx, req.(*ListPeersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_Deregister_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeregisterRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).Deregister(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_Deregister_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).Deregister(ctx, req.(*DeregisterRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_RegisterTunnel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterTunnelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).RegisterTunnel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_RegisterTunnel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).RegisterTunnel(ctx, req.(*RegisterTunnelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_ListTunnels_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListTunnelsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).ListTunnels(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_ListTunnels_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).ListTunnels(ctx, req.(*ListTunnelsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_DeleteTunnel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteTunnelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).DeleteTunnel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_DeleteTunnel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).DeleteTunnel(ctx, req.(*DeleteTunnelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _ControlPlaneService_StreamMeshEvents_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(StreamEventsRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -331,6 +543,30 @@ var ControlPlaneService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetGatewayRoutes",
 			Handler:    _ControlPlaneService_GetGatewayRoutes_Handler,
+		},
+		{
+			MethodName: "GetACLPolicy",
+			Handler:    _ControlPlaneService_GetACLPolicy_Handler,
+		},
+		{
+			MethodName: "ListPeers",
+			Handler:    _ControlPlaneService_ListPeers_Handler,
+		},
+		{
+			MethodName: "Deregister",
+			Handler:    _ControlPlaneService_Deregister_Handler,
+		},
+		{
+			MethodName: "RegisterTunnel",
+			Handler:    _ControlPlaneService_RegisterTunnel_Handler,
+		},
+		{
+			MethodName: "ListTunnels",
+			Handler:    _ControlPlaneService_ListTunnels_Handler,
+		},
+		{
+			MethodName: "DeleteTunnel",
+			Handler:    _ControlPlaneService_DeleteTunnel_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

@@ -141,6 +141,14 @@ func netSplitHost(hostport string) (string, string, error) {
 // HealthChecker periodically probes backends and marks their health.
 type HealthChecker struct {
 	client *http.Client
+	dial   func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// SetDialer routes health probes through dial (for example the overlay stack
+// of a userspace gateway) instead of the host network.
+func (h *HealthChecker) SetDialer(dial func(ctx context.Context, network, addr string) (net.Conn, error)) {
+	h.dial = dial
+	h.client.Transport = &http.Transport{DialContext: dial}
 }
 
 // NewHealthChecker creates a health check worker.
@@ -166,8 +174,11 @@ func (h *HealthChecker) Check(ctx context.Context, b *balancer.Backend, healthPa
 	resp, err := h.client.Do(req)
 	if err != nil {
 		// Fallback to TCP dial probe
-		var d net.Dialer
-		conn, dialErr := d.DialContext(ctx, "tcp", b.Address)
+		dial := h.dial
+		if dial == nil {
+			dial = (&net.Dialer{}).DialContext
+		}
+		conn, dialErr := dial(ctx, "tcp", b.Address)
 		if dialErr != nil {
 			b.Healthy = false
 			return false

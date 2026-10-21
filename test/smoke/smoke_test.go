@@ -28,8 +28,6 @@ import (
 	"github.com/cubis/zro/pkg/store"
 	"github.com/cubis/zro/pkg/tunnel"
 	"golang.org/x/net/websocket"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 func TestFullMeshSmoke(t *testing.T) {
@@ -247,7 +245,7 @@ func TestFullMeshSmoke(t *testing.T) {
 		InitiatorEndpoints: core.StringList{"192.168.1.100:51820"},
 	}
 	discBody, _ := json.Marshal(p2pDiscReq)
-	resp, err = http.Post(ts.URL+"/api/v1/p2p/discover", "application/json", bytes.NewReader(discBody))
+	resp, err = authedDo(http.MethodPost, ts.URL+"/api/v1/p2p/discover", enroll1Resp.NodeToken, discBody)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("smoke: P2P discovery failed: status %d", resp.StatusCode)
 	}
@@ -272,7 +270,7 @@ func TestFullMeshSmoke(t *testing.T) {
 		PacketLoss: 0.0,
 	}
 	probeBody, _ := json.Marshal(probeSample)
-	resp, err = http.Post(ts.URL+"/api/v1/probes", "application/json", bytes.NewReader(probeBody))
+	resp, err = authedDo(http.MethodPost, ts.URL+"/api/v1/probes", enroll1Resp.NodeToken, probeBody)
 	if err != nil || resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("smoke: probe submission failed, status: %d", resp.StatusCode)
 	}
@@ -341,7 +339,7 @@ func TestFullMeshSmoke(t *testing.T) {
 		Protocol:       "http",
 	}
 	tun1Body, _ := json.Marshal(tun1Req)
-	rTun1, err := http.Post(ts.URL+"/api/v1/tunnels", "application/json", bytes.NewReader(tun1Body))
+	rTun1, err := authedDo(http.MethodPost, ts.URL+"/api/v1/tunnels", enroll1Resp.NodeToken, tun1Body)
 	if err != nil || rTun1.StatusCode != http.StatusCreated {
 		t.Fatalf("smoke: failed to register tunnel for node 1, status: %d", rTun1.StatusCode)
 	}
@@ -355,7 +353,7 @@ func TestFullMeshSmoke(t *testing.T) {
 		Protocol:       "http",
 	}
 	tun2Body, _ := json.Marshal(tun2Req)
-	rTun2, err := http.Post(ts.URL+"/api/v1/tunnels", "application/json", bytes.NewReader(tun2Body))
+	rTun2, err := authedDo(http.MethodPost, ts.URL+"/api/v1/tunnels", enroll2Resp.NodeToken, tun2Body)
 	if err != nil || rTun2.StatusCode != http.StatusCreated {
 		t.Fatalf("smoke: failed to register clustered tunnel for node 2, status: %d", rTun2.StatusCode)
 	}
@@ -363,7 +361,7 @@ func TestFullMeshSmoke(t *testing.T) {
 	t.Log("✅ Smoke Step 10a Passed: Multi-node cluster tunnels registered for myapp-api.example.com")
 
 	// 10b. Control Plane Gateway Dynamic Routes API (aggregates node overlay IPs)
-	resp, err = http.Get(ts.URL + "/api/v1/gateway/routes")
+	resp, err = authedDo(http.MethodGet, ts.URL+"/api/v1/gateway/routes", enroll1Resp.NodeToken, nil)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("smoke: failed to get gateway routes, status: %d", resp.StatusCode)
 	}
@@ -397,7 +395,13 @@ func TestFullMeshSmoke(t *testing.T) {
 
 	// 10c. Gateway Node Enrollment (NodeTypeGateway) with overlay IP & PoP delegation
 	kpGW1, _ := crypto.GenerateKeyPair()
-	tokenGW1 := crypto.GenerateEnrollmentToken(secretKey, createdNet.ID, "gw1", 1*time.Hour, kpGW1.PublicKey)
+	tokenGW1, err := crypto.SignEnrollmentToken(secretKey, crypto.EnrollmentTokenPayload{
+		NetworkID: createdNet.ID, Hostname: "gw1", NodeType: "gateway", BoundPublicKey: kpGW1.PublicKey,
+		Expiry: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("smoke: gateway token: %v", err)
+	}
 	enrollGW1Req := server.EnrollRequest{
 		Token:     tokenGW1,
 		PublicKey: kpGW1.PublicKey,
@@ -568,7 +572,7 @@ func TestFullMeshSmoke(t *testing.T) {
 		Protocol:       "http",
 	}
 	tunWSBytes, _ := json.Marshal(tunWS)
-	resp, _ = http.Post(ts.URL+"/api/v1/tunnels", "application/json", bytes.NewReader(tunWSBytes))
+	resp, _ = authedDo(http.MethodPost, ts.URL+"/api/v1/tunnels", enroll1Resp.NodeToken, tunWSBytes)
 	_ = resp.Body.Close()
 
 	var wsPushMsg string
@@ -585,15 +589,19 @@ func TestFullMeshSmoke(t *testing.T) {
 	}
 	defer grpcLis.Close()
 
-	grpcSrv := grpc.NewServer()
-	ctrlGRPC := controlgrpc.NewServer(cfg, db)
-	v1.RegisterControlPlaneServiceServer(grpcSrv, ctrlGRPC)
+	grpcSrv := srv.NewGRPCServer()
 	go func() {
 		_ = grpcSrv.Serve(grpcLis)
 	}()
 	defer grpcSrv.GracefulStop()
 
-	grpcClient, err := controlgrpc.NewClient(grpcLis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	var grpcToken atomic.Value
+	grpcToken.Store("")
+	grpcClient, err := controlgrpc.Dial(controlgrpc.DialOptions{
+		Endpoint: grpcLis.Addr().String(),
+		Insecure: true,
+		Token:    func() string { return grpcToken.Load().(string) },
+	})
 	if err != nil {
 		t.Fatalf("smoke: failed to connect gRPC client: %v", err)
 	}
@@ -612,8 +620,17 @@ func TestFullMeshSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("smoke: gRPC Enroll failed: %v", err)
 	}
-	if grpcEnrollResp.OverlayIpv4 == "" {
-		t.Fatalf("smoke: expected overlay IP from gRPC enroll")
+	if grpcEnrollResp.OverlayIpv4 == "" || grpcEnrollResp.NodeToken == "" {
+		t.Fatalf("smoke: expected overlay IP and node token from gRPC enroll")
+	}
+	grpcToken.Store(grpcEnrollResp.NodeToken)
+	if _, err := grpcClient.RegisterTunnel(ctx, &v1.RegisterTunnelRequest{
+		Name: "grpc-tun", LocalAddress: "127.0.0.1:7000", PublicHostname: "grpc-tun.example.com",
+	}); err != nil {
+		t.Fatalf("smoke: gRPC RegisterTunnel failed: %v", err)
+	}
+	if lt, err := grpcClient.ListTunnels(ctx); err != nil || len(lt.Tunnels) == 0 {
+		t.Fatalf("smoke: gRPC ListTunnels failed: %v", err)
 	}
 	t.Logf("✅ Smoke Step 13 Passed: High-Performance gRPC API & Real-Time Event Bus verified (Node Overlay: %s)",
 		grpcEnrollResp.OverlayIpv4)
@@ -674,6 +691,7 @@ func TestFullMeshSmoke(t *testing.T) {
 	node1, err := node.NewDaemon(&config.NodeConfig{
 		Hostname:      "app-node-kh",
 		InterfaceName: "zro-smoke1",
+		InterfaceMode: "netstack",
 		MTU:           1420,
 		DefaultDeny:   true,
 	})
@@ -681,11 +699,10 @@ func TestFullMeshSmoke(t *testing.T) {
 		t.Fatalf("smoke: create node 1 failed: %v", err)
 	}
 	defer node1.Stop()
-	node1.SetOverlayIP("100.64.0.2")
-
 	node2, err := node.NewDaemon(&config.NodeConfig{
 		Hostname:      "db-node-sg",
 		InterfaceName: "zro-smoke2",
+		InterfaceMode: "netstack",
 		MTU:           1420,
 		DefaultDeny:   true,
 	})
@@ -693,7 +710,17 @@ func TestFullMeshSmoke(t *testing.T) {
 		t.Fatalf("smoke: create node 2 failed: %v", err)
 	}
 	defer node2.Stop()
-	node2.SetOverlayIP("100.64.0.3")
+	_ = node1.AssignOverlay("100.64.0.2", "")
+	_ = node2.AssignOverlay("100.64.0.3", "")
+	// A real WireGuard session between the two userspace stacks over loopback UDP.
+	_ = node2.AddDirectPeer(core.Node{PublicKey: node1.PublicKey(), OverlayIPv4: "100.64.0.2"}, fmt.Sprintf("127.0.0.1:%d", node1.UDPPort()), false)
+	_ = node1.AddDirectPeer(core.Node{PublicKey: node2.PublicKey(), OverlayIPv4: "100.64.0.3"}, fmt.Sprintf("127.0.0.1:%d", node2.UDPPort()), true)
+	for i := 0; !node1.PeerHandshaken(node2.PublicKey()); i++ {
+		if i > 300 {
+			t.Fatalf("smoke: WireGuard handshake between userspace nodes never completed")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	// Node 1 (100.64.0.2) hosting PostgreSQL server on port 5432, default deny all
 	// Node 2 (100.64.0.3) connecting over the mesh
@@ -727,6 +754,7 @@ func TestFullMeshSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("smoke: node2 failed to connect to node1 on allowed port 5432: %v", err)
 	}
+	_ = pgConn.SetDeadline(time.Now().Add(5 * time.Second))
 	_, _ = pgConn.Write([]byte("SELECT 1;"))
 	respBuf := make([]byte, 16)
 	nBytes, _ := pgConn.Read(respBuf)
@@ -734,28 +762,56 @@ func TestFullMeshSmoke(t *testing.T) {
 	if string(respBuf[:nBytes]) != "1\n" {
 		t.Fatalf("smoke: expected '1\\n' from postgres service, got %q", string(respBuf[:nBytes]))
 	}
-	t.Log("✅ Smoke Step 16a Passed: Inter-node secure communication verified: Node 2 accessed Node 1 (100.64.0.2:5432) Postgres over mesh")
+	t.Log("✅ Smoke Step 16a Passed: Real TCP over WireGuard between userspace stacks: Node 2 accessed Node 1 (100.64.0.2:5432)")
 
-	// 16b. Node 2 attempts connection to unallowed port 22 (SSH) on Node 1 -> MUST BE REJECTED
+	// 16b. Port 22 is listening on Node 1 but not allowed -> the connection is cut off
 	sshLn, err := node1.ListenMesh(ctx, "tcp", 22)
 	if err != nil {
 		t.Fatalf("smoke: node1 failed to listen on port 22: %v", err)
 	}
 	defer sshLn.Close()
+	go func() {
+		for {
+			c, err := sshLn.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = c.Write([]byte("SSH\n"))
+			_ = c.Close()
+		}
+	}()
 
-	blockedConn, err := node2.DialMesh(ctx, "tcp", "100.64.0.2:22")
-	if err == nil {
-		_ = blockedConn.Close()
-		t.Fatalf("smoke: expected connection to port 22 to be BLOCKED under default-deny all")
+	probe := func() bool {
+		c, err := node2.DialMesh(ctx, "tcp", "100.64.0.2:22")
+		if err != nil {
+			return false
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+		b := make([]byte, 8)
+		n, _ := c.Read(b)
+		return string(b[:n]) == "SSH\n"
 	}
-	t.Logf("✅ Smoke Step 16b Passed: Zero-Trust Inbound Firewall enforced (port 22 blocked: %v)", err)
+	if probe() {
+		t.Fatalf("smoke: expected port 22 to be BLOCKED under default-deny all")
+	}
+	t.Log("✅ Smoke Step 16b Passed: Zero-Trust Inbound Firewall enforced (port 22 blocked)")
 
 	// 16c. Dynamically allow port 22 on Node 1 -> Connection now succeeds
 	node1.AllowPort("22/tcp")
-	allowedConn, err := node2.DialMesh(ctx, "tcp", "100.64.0.2:22")
-	if err != nil {
-		t.Fatalf("smoke: expected connection to port 22 to succeed after dynamic allow, got: %v", err)
+	if !probe() {
+		t.Fatalf("smoke: expected connection to port 22 to succeed after dynamic allow")
 	}
-	_ = allowedConn.Close()
 	t.Log("✅ Smoke Step 16c Passed: Dynamic zero-trust firewall policy update verified (port 22 allowed)")
+}
+
+// authedDo sends a JSON request authenticated with a node token.
+func authedDo(method, url, token string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequest(method, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	return http.DefaultClient.Do(req)
 }

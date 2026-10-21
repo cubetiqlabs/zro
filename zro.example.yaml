@@ -2,20 +2,45 @@
 mode: plane # Options: plane, edge, node, gw
 log_level: info
 
-# Control Plane Configuration (HA Ready, GORM + PostgreSQL)
+# Control Plane Configuration (HA ready: replicas share one PostgreSQL database)
 control_plane:
   listen_addr: ":8443"
-  grpc_listen_addr: ":9443"
   public_url: "https://zro-plane.cubis.tech:443"
   database_driver: "postgres" # Options: postgres, sqlite
   database_dsn: "postgres://postgres:postgres@localhost:5432/zro?sslmode=disable"
+  # Signs enrollment tokens. Generate with `openssl rand -hex 32`. With require_auth the
+  # plane refuses to start if this is empty or the shipped default.
   secret_key: "change-me-to-a-super-secure-cluster-secret"
   default_cidr_v4: "100.64.0.0/10"
   default_cidr_v6: "fd00:cafe::/64"
   sync_interval_ms: 1000
-  # Set true to require an API key / edge key on control-plane endpoints.
+
+  # --- Authentication ---------------------------------------------------------------
+  # Production: true. Tenant endpoints then require a tenant API key. (Node-facing endpoints
+  # always require the node token issued at enrollment; this flag only controls the
+  # development fallback to a default tenant for tenant and edge endpoints.)
   require_auth: false
+  # Shared key edges use for their FIRST registration of a PoP. Registration issues the PoP its
+  # own credential, which replaces this key. Required when require_auth is true.
   edge_api_key: ""
+  # Bootstrap key for tenant administration (POST /api/v1/tenants ...) and /metrics.
+  # Leave empty to disable both.
+  admin_api_key: ""
+  # Extra browser origins allowed to open the event WebSocket (same-origin always works).
+  allowed_origins: []
+
+  # --- Node lifecycle ----------------------------------------------------------------
+  # A node silent for this long is removed and its overlay address freed. 0 disables.
+  node_ttl: "168h"
+
+  # --- gRPC (opt in) -----------------------------------------------------------------
+  # Empty disables gRPC. Node tokens travel in metadata, so TLS is required unless
+  # grpc_insecure is set explicitly (for example behind a TLS-terminating proxy).
+  grpc_listen_addr: ""
+  grpc_tls_cert: ""
+  grpc_tls_key: ""
+  grpc_tls_client_ca: "" # also require and verify client certificates (mTLS)
+  grpc_insecure: false
 
 # Edge Data Plane PoP Configuration (Public IP Mesh)
 edge:
@@ -25,20 +50,33 @@ edge:
   listen_port: 51820
   interface_name: "zro-edge" # Linux TUN used for overlay relay
   mtu: 1420
-  wireguard_private_key: "" # Leave empty for auto-generation or specify base64 key
+  wireguard_private_key: "" # Optional base64 key; otherwise generated once and kept in state_dir
+  # Keeps the WireGuard key and the PoP's own credential across restarts. Without it the
+  # credential is memory-only and a restart needs `POST /api/v1/pops/{code}/reset-key`.
+  state_dir: "/var/lib/zro"
   plane_endpoint: "https://zro-plane.cubis.tech:443"
   plane_transport: "rest" # rest or grpc
-  edge_api_key: "" # Required when control_plane.require_auth is true
+  plane_grpc_endpoint: "" # host:port of the plane's gRPC listener (default: plane_endpoint)
+  plane_grpc_insecure: false # plaintext gRPC; tokens then travel in clear text
+  plane_ca_file: "" # CA bundle to trust for the plane's TLS certificate
+  edge_api_key: "" # the shared key above; used only until the PoP is claimed
   is_anycast: false
 
 # Client / Peer Node Configuration (IPless, P2P Mesh & Ingress Tunnels)
 node:
   hostname: "app-node-01"
-  network_id: "8056c2e21c000001" # ZeroTier-style 16-hex Network ID
-  enrollment_token: "zro_tok_..."
+  network_id: "8056c2e21c000001" # must match the enrollment token's network (checked at enrollment)
+  enrollment_token: "zro_tok_..." # from `zro token --type peer`; single use per key
+  # Persists the WireGuard identity so a restart keeps the same node ID and overlay address.
+  state_dir: "/var/lib/zro"
   plane_endpoint: "https://zro-plane.cubis.tech:443"
   plane_transport: "rest" # rest or grpc
-  interface_mode: "tun" # Options: tun, netstack
+  plane_grpc_endpoint: ""
+  plane_grpc_insecure: false
+  plane_ca_file: ""
+  # tun: kernel interface (needs NET_ADMIN and /dev/net/tun).
+  # netstack: unprivileged userspace TCP/IP stack; no host interface, no routes.
+  interface_mode: "tun"
   interface_name: "zro0"
   listen_port: 0 # Shared WireGuard/STUN UDP port; 0 = ephemeral
   mtu: 1420
@@ -59,10 +97,15 @@ node:
 # Cloud-Native Ingress Gateway & Load Balancer
 gateway:
   hostname: "gw1"
+  state_dir: "/var/lib/zro"
   plane_endpoint: "https://zro-plane.cubis.tech:443"
   plane_transport: "rest" # rest or grpc
-  enrollment_token: "zro_tok_..."
+  plane_grpc_endpoint: ""
+  plane_grpc_insecure: false
+  plane_ca_file: ""
+  enrollment_token: "zro_tok_..." # from `zro token --type gateway`; a peer token is refused
   network_id: "8056c2e21c000001"
+  interface_mode: "tun" # tun or netstack
   interface_name: "zro-gw"
   listen_port: 0 # Shared WireGuard/STUN UDP port; 0 = ephemeral
   mtu: 1420

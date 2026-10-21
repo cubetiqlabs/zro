@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/cubis/zro/pkg/core"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // --- Tenant Repository ---
@@ -20,7 +22,24 @@ func newTenantRepo(db *gorm.DB) core.TenantRepository {
 }
 
 func (r *tenantRepo) Create(ctx context.Context, tenant *core.Tenant) error {
-	return r.db.WithContext(ctx).Create(tenant).Error
+	plain := tenant.APIKey
+	tenant.APIKey = core.HashAPIKey(plain)
+	err := r.db.WithContext(ctx).Create(tenant).Error
+	tenant.APIKey = plain
+	return err
+}
+
+func (r *tenantRepo) RotateAPIKey(ctx context.Context, id uuid.UUID, newKey string) error {
+	res := r.db.WithContext(ctx).Model(&core.Tenant{}).Where("id = ?", id).Updates(map[string]any{
+		"api_key": core.HashAPIKey(newKey), "updated_at": time.Now(),
+	})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
 }
 
 func (r *tenantRepo) GetByID(ctx context.Context, id uuid.UUID) (*core.Tenant, error) {
@@ -33,7 +52,7 @@ func (r *tenantRepo) GetByID(ctx context.Context, id uuid.UUID) (*core.Tenant, e
 
 func (r *tenantRepo) GetByAPIKey(ctx context.Context, apiKey string) (*core.Tenant, error) {
 	var t core.Tenant
-	if err := r.db.WithContext(ctx).First(&t, "api_key = ?", apiKey).Error; err != nil {
+	if err := r.db.WithContext(ctx).First(&t, "api_key = ?", core.HashAPIKey(apiKey)).Error; err != nil {
 		return nil, err
 	}
 	return &t, nil
@@ -119,6 +138,17 @@ func (r *edgePoPRepo) GetByPoPCode(ctx context.Context, code string) (*core.Edge
 	return &pop, nil
 }
 
+func (r *edgePoPRepo) GetByKeyHash(ctx context.Context, keyHash string) (*core.EdgePoP, error) {
+	if keyHash == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var pop core.EdgePoP
+	if err := r.db.WithContext(ctx).First(&pop, "key_hash = ?", keyHash).Error; err != nil {
+		return nil, err
+	}
+	return &pop, nil
+}
+
 func (r *edgePoPRepo) ListHealthy(ctx context.Context) ([]core.EdgePoP, error) {
 	var pops []core.EdgePoP
 	err := r.db.WithContext(ctx).Where("is_healthy = ?", true).Order("weight desc").Find(&pops).Error
@@ -150,7 +180,11 @@ func newNodeRepo(db *gorm.DB) core.NodeRepository {
 }
 
 func (r *nodeRepo) Create(ctx context.Context, node *core.Node) error {
-	return r.db.WithContext(ctx).Create(node).Error
+	err := r.db.WithContext(ctx).Create(node).Error
+	if errors.Is(err, gorm.ErrDuplicatedKey) {
+		return core.ErrDuplicate
+	}
+	return err
 }
 
 func (r *nodeRepo) GetByID(ctx context.Context, id uuid.UUID) (*core.Node, error) {
@@ -164,6 +198,39 @@ func (r *nodeRepo) GetByID(ctx context.Context, id uuid.UUID) (*core.Node, error
 func (r *nodeRepo) GetByPublicKey(ctx context.Context, pubKey string) (*core.Node, error) {
 	var node core.Node
 	if err := r.db.WithContext(ctx).Preload("AssignedPoP").First(&node, "public_key = ?", pubKey).Error; err != nil {
+		return nil, err
+	}
+	return &node, nil
+}
+
+func (r *nodeRepo) GetByNetworkAndPublicKey(ctx context.Context, networkID, pubKey string) (*core.Node, error) {
+	var node core.Node
+	err := r.db.WithContext(ctx).Preload("AssignedPoP").First(&node, "network_id = ? AND public_key = ?", networkID, pubKey).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &node, nil
+}
+
+func (r *nodeRepo) TouchLastSeen(ctx context.Context, id uuid.UUID, at time.Time) error {
+	return r.db.WithContext(ctx).Model(&core.Node{}).Where("id = ?", id).Update("last_seen_at", at).Error
+}
+
+func (r *nodeRepo) ListStale(ctx context.Context, before time.Time, limit int) ([]core.Node, error) {
+	var nodes []core.Node
+	err := r.db.WithContext(ctx).Where("last_seen_at < ?", before).Order("last_seen_at").Limit(limit).Find(&nodes).Error
+	return nodes, err
+}
+
+func (r *nodeRepo) GetByTokenHash(ctx context.Context, tokenHash string) (*core.Node, error) {
+	if tokenHash == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var node core.Node
+	if err := r.db.WithContext(ctx).Preload("AssignedPoP").First(&node, "token_hash = ?", tokenHash).Error; err != nil {
 		return nil, err
 	}
 	return &node, nil
@@ -312,6 +379,12 @@ func (r *tunnelRepo) ListByNodeID(ctx context.Context, nodeID uuid.UUID) ([]core
 	return tunnels, err
 }
 
+func (r *tunnelRepo) ListByNetworkID(ctx context.Context, networkID string) ([]core.Tunnel, error) {
+	var tunnels []core.Tunnel
+	err := r.db.WithContext(ctx).Where("network_id = ?", networkID).Find(&tunnels).Error
+	return tunnels, err
+}
+
 func (r *tunnelRepo) ListAll(ctx context.Context) ([]core.Tunnel, error) {
 	var tunnels []core.Tunnel
 	err := r.db.WithContext(ctx).Find(&tunnels).Error
@@ -320,4 +393,38 @@ func (r *tunnelRepo) ListAll(ctx context.Context) ([]core.Tunnel, error) {
 
 func (r *tunnelRepo) Delete(ctx context.Context, id uuid.UUID) error {
 	return r.db.WithContext(ctx).Delete(&core.Tunnel{}, "id = ?", id).Error
+}
+
+// --- Enrollment Repository ---
+
+type enrollmentRepo struct {
+	db *gorm.DB
+}
+
+func newEnrollmentRepo(db *gorm.DB) core.EnrollmentRepository {
+	return &enrollmentRepo{db: db}
+}
+
+func (r *enrollmentRepo) Redeem(ctx context.Context, nonce, pubKey string, expires time.Time) error {
+	res := r.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&core.EnrollmentRedemption{
+		Nonce: nonce, PublicKey: pubKey, ExpiresAt: expires,
+	})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 1 {
+		return nil
+	}
+	var existing core.EnrollmentRedemption
+	if err := r.db.WithContext(ctx).First(&existing, "nonce = ?", nonce).Error; err != nil {
+		return err
+	}
+	if existing.PublicKey != pubKey {
+		return core.ErrTokenReused
+	}
+	return nil
+}
+
+func (r *enrollmentRepo) PurgeExpired(ctx context.Context) error {
+	return r.db.WithContext(ctx).Delete(&core.EnrollmentRedemption{}, "expires_at < ?", time.Now()).Error
 }

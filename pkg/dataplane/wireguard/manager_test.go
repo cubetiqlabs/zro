@@ -106,3 +106,47 @@ func TestWireGuardManagerFallback(t *testing.T) {
 		t.Fatalf("expected 0 peers, got %d", len(peers))
 	}
 }
+
+func TestReconcileAppliesChangesAndRemovesStalePeers(t *testing.T) {
+	kp, _ := crypto.GenerateKeyPair()
+	dev := tun.NewMemoryDevice("wg-rec0", 1420)
+	defer dev.Close()
+	mgr, err := NewManager("wg-rec0", WithTunDevice(dev), WithPrivateKey(kp.PrivateKey), WithListenPort(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	a, _ := crypto.GenerateKeyPair()
+	b, _ := crypto.GenerateKeyPair()
+	peerA := PeerConfig{PublicKey: a.PublicKey, Endpoint: "127.0.0.1:1111", AllowedIPs: []string{"100.64.0.2/32"}}
+	peerB := PeerConfig{PublicKey: b.PublicKey, AllowedIPs: []string{"100.64.0.3/32"}}
+
+	if err := mgr.Reconcile([]PeerConfig{peerA, peerB}); err != nil {
+		t.Fatal(err)
+	}
+	if peers, _ := mgr.ListPeers(); len(peers) != 2 {
+		t.Fatalf("expected 2 peers, got %d", len(peers))
+	}
+
+	// B left the mesh: it must be removed, A (unchanged) must be left alone.
+	if err := mgr.Reconcile([]PeerConfig{peerA}); err != nil {
+		t.Fatal(err)
+	}
+	peers, _ := mgr.ListPeers()
+	if len(peers) != 1 || peers[0].PublicKey != a.PublicKey {
+		t.Fatalf("expected only peer A to remain, got %+v", peers)
+	}
+}
+
+func TestSamePeerIgnoresAllowedIPOrder(t *testing.T) {
+	a := PeerConfig{PublicKey: "k", AllowedIPs: []string{"1.1.1.1/32", "2.2.2.2/32"}}
+	b := PeerConfig{PublicKey: "k", AllowedIPs: []string{"2.2.2.2/32", "1.1.1.1/32"}}
+	if !samePeer(a, b) {
+		t.Fatal("order of allowed IPs must not count as a change")
+	}
+	b.AllowedIPs = []string{"2.2.2.2/32", "3.3.3.3/32"}
+	if samePeer(a, b) {
+		t.Fatal("different allowed IPs must count as a change")
+	}
+}

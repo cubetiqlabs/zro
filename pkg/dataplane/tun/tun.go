@@ -32,6 +32,8 @@ func (d *osDevice) IsSimulated() bool {
 	return false
 }
 
+var errDeviceClosed = errors.New("device closed")
+
 // MemoryDevice is a userspace memory-backed TUN device used in unprivileged containers or unit tests.
 type MemoryDevice struct {
 	mu      sync.Mutex
@@ -123,7 +125,7 @@ func (m *MemoryDevice) InjectPacket(pkt []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
-		return errors.New("device closed")
+		return errDeviceClosed
 	}
 	select {
 	case m.outCh <- pkt:
@@ -140,6 +142,25 @@ func (m *MemoryDevice) EjectPacket() ([]byte, error) {
 		return nil, os.ErrClosed
 	}
 	return pkt, nil
+}
+
+// Hairpin forwards every packet WireGuard delivers to the device straight back
+// into it, until the device closes. A kernel TUN does this through IP routing;
+// a memory device has no kernel, so a relay (edge PoP) running on one needs this
+// to forward between its peers in userspace.
+func (m *MemoryDevice) Hairpin() {
+	for {
+		pkt, err := m.EjectPacket()
+		if err != nil {
+			return
+		}
+		if err := m.InjectPacket(pkt); err != nil {
+			if errors.Is(err, errDeviceClosed) {
+				return
+			}
+			// buffer full: drop, like an overloaded router; transports retransmit
+		}
+	}
 }
 
 var ensureDevNetTun func()

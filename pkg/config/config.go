@@ -2,7 +2,10 @@ package config
 
 import (
 	"fmt"
+	"github.com/cubis/zro/pkg/identity"
+	"reflect"
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 )
@@ -29,8 +32,26 @@ type ControlPlaneConfig struct {
 	SyncIntervalMs int    `mapstructure:"sync_interval_ms"`
 	EnableGateway  bool   `mapstructure:"enable_gateway"`
 	GRPCListenAddr string `mapstructure:"grpc_listen_addr"`
-	RequireAuth    bool   `mapstructure:"require_auth"`
-	EdgeAPIKey     string `mapstructure:"edge_api_key"`
+	// gRPC transport security. Plaintext requires GRPCInsecure; GRPCTLSClientCA enables mTLS.
+	GRPCTLSCert     string `mapstructure:"grpc_tls_cert"`
+	GRPCTLSKey      string `mapstructure:"grpc_tls_key"`
+	GRPCTLSClientCA string `mapstructure:"grpc_tls_client_ca"`
+	GRPCInsecure    bool   `mapstructure:"grpc_insecure"`
+	RequireAuth     bool   `mapstructure:"require_auth"`
+	EdgeAPIKey      string `mapstructure:"edge_api_key"`
+	// AdminAPIKey guards tenant administration; the tenant API is disabled when empty.
+	AdminAPIKey string `mapstructure:"admin_api_key"`
+	// NodeTTL is how long a node may stay silent before it is removed and its address freed; 0 disables reaping.
+	NodeTTL time.Duration `mapstructure:"node_ttl"`
+	// AllowedOrigins lists extra browser origins permitted to open event WebSockets (same-origin is always allowed).
+	AllowedOrigins []string `mapstructure:"allowed_origins"`
+}
+
+// PlaneGRPC holds the gRPC client settings shared by every agent.
+type PlaneGRPC struct {
+	GRPCEndpoint string `mapstructure:"plane_grpc_endpoint"` // host:port of the plane's gRPC listener (defaults to plane_endpoint)
+	GRPCInsecure bool   `mapstructure:"plane_grpc_insecure"` // plaintext gRPC; tokens then travel in clear text
+	CAFile       string `mapstructure:"plane_ca_file"`       // optional CA bundle for the plane's TLS certificate
 }
 
 // EdgeConfig configures a global Edge Data Plane PoP.
@@ -42,8 +63,10 @@ type EdgeConfig struct {
 	InterfaceName       string `mapstructure:"interface_name"`
 	MTU                 int    `mapstructure:"mtu"`
 	WireGuardPrivateKey string `mapstructure:"wireguard_private_key"`
+	StateDir            string `mapstructure:"state_dir"` // persists the edge identity; empty = ephemeral
 	PlaneEndpoint       string `mapstructure:"plane_endpoint"`
 	PlaneTransport      string `mapstructure:"plane_transport"` // "rest" or "grpc"
+	PlaneGRPC           `mapstructure:",squash"`
 	EdgeAPIKey          string `mapstructure:"edge_api_key"`
 	IsAnycast           bool   `mapstructure:"is_anycast"`
 	UsePrivateIP        bool   `mapstructure:"use_private_ip"`
@@ -59,14 +82,16 @@ type LocalTunnelConfig struct {
 
 // NodeConfig configures the zro-node client daemon.
 type NodeConfig struct {
-	Hostname            string              `mapstructure:"hostname"`
-	NetworkID           string              `mapstructure:"network_id"`
-	EnrollmentToken     string              `mapstructure:"enrollment_token"`
-	PlaneEndpoint       string              `mapstructure:"plane_endpoint"`
-	PlaneTransport      string              `mapstructure:"plane_transport"` // "rest" or "grpc"
-	InterfaceMode       string              `mapstructure:"interface_mode"`  // "tun" or "netstack"
-	InterfaceName       string              `mapstructure:"interface_name"`  // "zro0"
-	ListenPort          int                 `mapstructure:"listen_port"`     // shared UDP port; 0 = ephemeral
+	Hostname            string `mapstructure:"hostname"`
+	StateDir            string `mapstructure:"state_dir"` // persists the WireGuard identity; empty = ephemeral
+	NetworkID           string `mapstructure:"network_id"`
+	EnrollmentToken     string `mapstructure:"enrollment_token"`
+	PlaneEndpoint       string `mapstructure:"plane_endpoint"`
+	PlaneTransport      string `mapstructure:"plane_transport"` // "rest" or "grpc"
+	PlaneGRPC           `mapstructure:",squash"`
+	InterfaceMode       string              `mapstructure:"interface_mode"` // "tun" or "netstack"
+	InterfaceName       string              `mapstructure:"interface_name"` // "zro0"
+	ListenPort          int                 `mapstructure:"listen_port"`    // shared UDP port; 0 = ephemeral
 	MTU                 int                 `mapstructure:"mtu"`
 	EnableP2P           bool                `mapstructure:"enable_p2p"`
 	Tags                []string            `mapstructure:"tags"`
@@ -84,13 +109,16 @@ type StaticRouteConfig struct {
 
 // GatewayConfig configures the reverse proxy and cloud-native load balancer.
 type GatewayConfig struct {
-	Hostname              string              `mapstructure:"hostname"`
-	PlaneEndpoint         string              `mapstructure:"plane_endpoint"`
-	PlaneTransport        string              `mapstructure:"plane_transport"` // "rest" or "grpc"
+	Hostname              string `mapstructure:"hostname"`
+	StateDir              string `mapstructure:"state_dir"` // persists the WireGuard identity; empty = ephemeral
+	PlaneEndpoint         string `mapstructure:"plane_endpoint"`
+	PlaneTransport        string `mapstructure:"plane_transport"` // "rest" or "grpc"
+	PlaneGRPC             `mapstructure:",squash"`
 	EnrollmentToken       string              `mapstructure:"enrollment_token"`
 	NetworkID             string              `mapstructure:"network_id"`
 	InterfaceName         string              `mapstructure:"interface_name"`
-	ListenPort            int                 `mapstructure:"listen_port"` // shared UDP port; 0 = ephemeral
+	InterfaceMode         string              `mapstructure:"interface_mode"` // "tun" (kernel) or "netstack" (unprivileged userspace)
+	ListenPort            int                 `mapstructure:"listen_port"`    // shared UDP port; 0 = ephemeral
 	MTU                   int                 `mapstructure:"mtu"`
 	Strategy              string              `mapstructure:"strategy"` // "round_robin", "least_conn", "latency"
 	HealthCheckPath       string              `mapstructure:"health_check_path"`
@@ -123,9 +151,13 @@ func Load(cfgFile string) (*AppConfig, error) {
 	v.SetDefault("control_plane.default_cidr_v6", "fd00:cafe::/64")
 	v.SetDefault("control_plane.sync_interval_ms", 1000)
 	v.SetDefault("control_plane.enable_gateway", false)
-	v.SetDefault("control_plane.grpc_listen_addr", ":9443")
+	v.SetDefault("control_plane.node_ttl", "168h")
+	v.SetDefault("control_plane.grpc_listen_addr", "") // opt in; requires TLS or grpc_insecure
 
 	// Edge defaults
+	v.SetDefault("edge.state_dir", identity.DefaultDir())
+	v.SetDefault("node.state_dir", identity.DefaultDir())
+	v.SetDefault("gateway.state_dir", identity.DefaultDir())
 	v.SetDefault("edge.pop_code", "KH")
 	v.SetDefault("edge.region", "Asia/Phnom_Penh")
 	v.SetDefault("edge.listen_port", 51820)
@@ -162,6 +194,12 @@ func Load(cfgFile string) (*AppConfig, error) {
 	v.SetEnvPrefix("ZRO")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
+	// AutomaticEnv alone only reaches keys that already have a default or a file
+	// entry, so bind every key explicitly or ZRO_EDGE_EDGE_API_KEY and friends
+	// would be silently ignored when no config file is present.
+	if err := bindEnv(v, reflect.TypeOf(AppConfig{}), ""); err != nil {
+		return nil, err
+	}
 
 	if cfgFile != "" {
 		v.SetConfigFile(cfgFile)
@@ -183,4 +221,37 @@ func Load(cfgFile string) (*AppConfig, error) {
 	}
 
 	return &cfg, nil
+}
+
+// bindEnv binds every leaf field of t to its environment variable, following
+// the mapstructure tags (nested structs become dotted keys; ",squash" embeds).
+func bindEnv(v *viper.Viper, t reflect.Type, prefix string) error {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		name, opts, _ := strings.Cut(f.Tag.Get("mapstructure"), ",")
+		if name == "-" || !f.IsExported() {
+			continue
+		}
+		key := name
+		if prefix != "" && name != "" {
+			key = prefix + "." + name
+		}
+		if opts == "squash" {
+			key = prefix
+		}
+		if key == "" && opts != "squash" {
+			continue
+		}
+
+		if f.Type.Kind() == reflect.Struct && f.Type != reflect.TypeOf(time.Duration(0)) {
+			if err := bindEnv(v, f.Type, key); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := v.BindEnv(key); err != nil {
+			return fmt.Errorf("binding %s: %w", key, err)
+		}
+	}
+	return nil
 }

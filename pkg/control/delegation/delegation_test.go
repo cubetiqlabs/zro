@@ -137,3 +137,18 @@ func TestDelegationEngine(t *testing.T) {
 		t.Fatalf("expected PrimaryPoP KH to win over expired SG, got %s", resExpired.PrimaryPoP.PoPCode)
 	}
 }
+
+func TestPruneAndForgetBoundProbeHistory(t *testing.T) {
+	e := NewEngine(nil)
+	fresh, stale, gone := uuid.New(), uuid.New(), uuid.New()
+	e.RecordProbe(core.LatencySample{NodeID: fresh, PoPCode: "KH", Timestamp: time.Now()})
+	e.RecordProbe(core.LatencySample{NodeID: stale, PoPCode: "KH", Timestamp: time.Now().Add(-time.Hour)})
+	e.RecordProbe(core.LatencySample{NodeID: gone, PoPCode: "KH", Timestamp: time.Now()})
+
+	e.Prune(10 * time.Minute)
+	e.Forget(gone)
+
+	if len(e.recentProbes) != 1 || e.recentProbes[fresh] == nil {
+		t.Fatalf("expected only the fresh node to remain, got %d entries", len(e.recentProbes))
+	}
+}

@@ -15,16 +15,17 @@ import (
 	"time"
 
 	v1 "github.com/cubis/zro/api/proto/v1"
+	"github.com/cubis/zro/pkg/agent"
 	"github.com/cubis/zro/pkg/config"
+	controlauth "github.com/cubis/zro/pkg/control/auth"
 	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
 	"github.com/cubis/zro/pkg/control/server"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
-	"github.com/cubis/zro/pkg/dataplane/derp"
-	"github.com/cubis/zro/pkg/dataplane/netcfg"
 	"github.com/cubis/zro/pkg/dataplane/router"
 	"github.com/cubis/zro/pkg/dataplane/tun"
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
+	"github.com/cubis/zro/pkg/identity"
 	"github.com/cubis/zro/pkg/p2p/disco"
 	"github.com/cubis/zro/pkg/p2p/puncher"
 	"github.com/cubis/zro/pkg/p2p/stun"
@@ -46,23 +47,26 @@ type Daemon struct {
 	peers        map[string]core.Node // pubKey -> node
 	peersMu      sync.RWMutex
 
-	tunDev       tun.Device
-	wgManager    *wireguard.Manager
-	routingTable *router.Table
-	udpConn      *net.UDPConn
-	discoEngine  *disco.Engine
-	derpClient   *derp.Client
-	tunnelClient *tunnel.Client
-	httpClient   *http.Client
-	grpcClient   *controlgrpc.Client
+	tunDev          tun.Device
+	dev             *agent.Device
+	wgManager       *wireguard.Manager
+	routingTable    *router.Table
+	udpConn         *net.UDPConn
+	discoEngine     *disco.Engine
+	relay           *relayState
+	tunnelClient    *tunnel.Client
+	httpClient      *http.Client
+	token           controlauth.TokenHolder // bearer token issued at enrollment
+	popLink         *agent.PoPLink
+	overlayPrefixes []string // routed into the interface; reported by the plane at enrollment
+	grpcClient      *controlgrpc.Client
 
 	// Zero-Trust Inbound Firewall & Mesh Listeners
-	policyMu      sync.RWMutex
-	allowedPorts  []string // e.g. ["5432/tcp"]
-	defaultDeny   bool     // default true for zero-trust
-	allowedPeers  []string
-	meshListeners map[int]*guardedListener
-	listenersMu   sync.Mutex
+	policy       networkPolicy // network-wide rules from the plane
+	policyMu     sync.RWMutex
+	allowedPorts []string // e.g. ["5432/tcp"]
+	defaultDeny  bool     // default true for zero-trust
+	allowedPeers []string
 
 	// Control-plane datagram correlation on the shared WireGuard socket.
 	stunMu       sync.Mutex
@@ -76,25 +80,16 @@ type Daemon struct {
 
 // NewDaemon initializes a new node daemon.
 func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
-	kp, err := crypto.GenerateKeyPair()
+	kp, err := identity.LoadOrCreateKey(cfg.StateDir, "node.key")
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate WireGuard keypair: %w", err)
+		return nil, fmt.Errorf("failed to load WireGuard identity: %w", err)
 	}
 
-	var tunDev tun.Device
-	if cfg.InterfaceMode == "netstack" {
-		tunDev = tun.NewMemoryDevice(cfg.InterfaceName, cfg.MTU)
-	} else {
-		tunDev, err = tun.CreateTUN(cfg.InterfaceName, cfg.MTU)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize TUN device: %w", err)
-		}
-		// Bring the link up before creating the WireGuard device. Otherwise the
-		// kernel reports the TUN as down and wireguard-go closes its bind.
-		if err := netcfg.EnsureLinkUp(cfg.InterfaceName, cfg.MTU); err != nil {
-			slog.Warn("Could not bring overlay interface up (data plane may be limited)", "interface", cfg.InterfaceName, "error", err)
-		}
+	dev, err := agent.OpenDevice(cfg.InterfaceMode, cfg.InterfaceName, cfg.MTU)
+	if err != nil {
+		return nil, err
 	}
+	tunDev := dev.TUN
 
 	// One UDP socket is shared by WireGuard, STUN, disco, and hole punching so
 	// that the reflexive port peers learn is the port WireGuard receives on.
@@ -105,19 +100,24 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 	}
 
 	d := &Daemon{
-		cfg:           cfg,
-		keyPair:       kp,
-		peers:         make(map[string]core.Node),
-		tunDev:        tunDev,
-		udpConn:       udpConn,
-		routingTable:  router.NewTable(),
-		tunnelClient:  tunnel.NewClient(),
-		httpClient:    &http.Client{Timeout: 10 * time.Second},
-		allowedPorts:  cfg.AllowedInboundPorts,
-		defaultDeny:   cfg.DefaultDeny,
-		meshListeners: make(map[int]*guardedListener),
-		stunWaiters:   make(map[[12]byte]chan *stun.ReflexiveAddress),
-		punchWaiters:  make(map[string]chan struct{}),
+		cfg:          cfg,
+		keyPair:      kp,
+		peers:        make(map[string]core.Node),
+		tunDev:       tunDev,
+		dev:          dev,
+		udpConn:      udpConn,
+		routingTable: router.NewTable(),
+		tunnelClient: tunnel.NewClient(),
+		allowedPorts: cfg.AllowedInboundPorts,
+		defaultDeny:  cfg.DefaultDeny,
+		stunWaiters:  make(map[[12]byte]chan *stun.ReflexiveAddress),
+		relay:        newRelayState(),
+		punchWaiters: make(map[string]chan struct{}),
+	}
+
+	d.httpClient = &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: controlauth.NewBearerTransport(nil, cfg.PlaneEndpoint, d.token.Get),
 	}
 
 	wgMgr, err := wireguard.NewManager(cfg.InterfaceName,
@@ -132,6 +132,8 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 	}
 
 	d.wgManager = wgMgr
+	d.overlayPrefixes = core.OverlayPrefixes("", "") // refined from the enrollment response
+	d.popLink = &agent.PoPLink{WG: wgMgr, Interface: cfg.InterfaceName, OSRoutes: !dev.Userspace()}
 	d.discoEngine = disco.NewEngine(kp, udpConn)
 	return d, nil
 }
@@ -149,9 +151,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// Connect gRPC client if plane transport is set to grpc
 	if strings.EqualFold(d.cfg.PlaneTransport, "grpc") {
 		grpcTarget := d.cfg.PlaneEndpoint
-		grpcTarget = strings.TrimPrefix(grpcTarget, "http://")
-		grpcTarget = strings.TrimPrefix(grpcTarget, "https://")
-		gc, err := controlgrpc.NewClient(grpcTarget)
+		if d.cfg.GRPCEndpoint != "" {
+			grpcTarget = d.cfg.GRPCEndpoint
+		}
+		gc, err := controlgrpc.DialPlane(d.cfg.PlaneEndpoint, d.cfg.PlaneGRPC, d.token.Get)
 		if err == nil {
 			d.grpcClient = gc
 			slog.Info("ZRO Node connected to Control Plane via gRPC", "target", grpcTarget)
@@ -190,13 +193,15 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 
 		gResp, err := d.grpcClient.Enroll(ctx, &v1.EnrollRequest{
-			Token:     d.cfg.EnrollmentToken,
-			PublicKey: d.keyPair.PublicKey,
-			Hostname:  d.cfg.Hostname,
-			NodeType:  "peer",
-			Tags:      d.cfg.Tags,
-			Endpoints: endpoints,
-			Probes:    protoProbes,
+			Token:        d.cfg.EnrollmentToken,
+			PublicKey:    d.keyPair.PublicKey,
+			Hostname:     d.cfg.Hostname,
+			NodeType:     "peer",
+			Tags:         d.cfg.Tags,
+			Endpoints:    endpoints,
+			Probes:       protoProbes,
+			AllowedPorts: d.allowedPorts,
+			DefaultDeny:  &d.defaultDeny,
 		})
 		if err != nil {
 			return fmt.Errorf("gRPC enrollment failed: %w", err)
@@ -206,6 +211,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 		enrollResp = server.EnrollResponse{
 			NodeID:      nodeUUID,
 			NetworkID:   gResp.NetworkId,
+			NodeToken:   gResp.NodeToken,
+			ACLRules:    rulesFromProto(gResp.AclRules),
+			IPv4CIDR:    gResp.Ipv4Cidr,
+			IPv6CIDR:    gResp.Ipv6Cidr,
 			OverlayIPv4: gResp.OverlayIpv4,
 			OverlayIPv6: gResp.OverlayIpv6,
 		}
@@ -233,6 +242,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 				OverlayIPv4: p.OverlayIpv4,
 				OverlayIPv6: p.OverlayIpv6,
 				Endpoints:   core.StringList(p.Endpoints),
+				Tags:        core.StringList(p.Tags),
 			})
 		}
 	} else {
@@ -274,18 +284,21 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}
 
+	if d.cfg.NetworkID != "" && !strings.EqualFold(d.cfg.NetworkID, enrollResp.NetworkID) {
+		return fmt.Errorf("enrolled into network %s but network_id is configured as %s; check the enrollment token", enrollResp.NetworkID, d.cfg.NetworkID)
+	}
+	d.token.Set(enrollResp.NodeToken)
+	d.policy.setRules(enrollResp.ACLRules)
+	d.overlayPrefixes = core.OverlayPrefixes(enrollResp.IPv4CIDR, enrollResp.IPv6CIDR)
 	d.nodeID = enrollResp.NodeID
 	d.networkID = enrollResp.NetworkID
 	d.overlayIPv4 = enrollResp.OverlayIPv4
 	d.overlayIPv6 = enrollResp.OverlayIPv6
 
-	// Program the host so overlay traffic enters the WireGuard interface.
-	// netstack mode has no OS interface, so it is skipped there.
-	if d.cfg.InterfaceMode != "netstack" {
-		if err := netcfg.ConfigureOverlay(d.cfg.InterfaceName, d.overlayIPv4, d.overlayIPv6, d.cfg.MTU); err != nil {
-			slog.Warn("Failed to configure overlay interface addresses (data plane may be limited)",
-				"interface", d.cfg.InterfaceName, "error", err)
-		}
+	// Give the overlay interface its addresses: the kernel TUN gets OS addresses,
+	// netstack mode adds them to the userspace stack.
+	if err := d.dev.Configure(d.overlayIPv4, d.overlayIPv6); err != nil {
+		slog.Warn("Failed to configure overlay addresses (data plane may be limited)", "error", err)
 	}
 
 	d.popMu.Lock()
@@ -312,9 +325,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}
 
 	// 6. Launch background workers (latency probes & local tunnels)
-	d.wg.Add(2)
+	d.wg.Add(4)
+	go d.relayWorker(ctx)
 	go d.probeWorker(ctx)
 	go d.tunnelWorker(ctx)
+	go d.realtimeListener(ctx)
 
 	return nil
 }
@@ -568,13 +583,32 @@ func (d *Daemon) Stop() error {
 	if d.tunDev != nil {
 		_ = d.tunDev.Close()
 	}
-	if d.derpClient != nil {
-		_ = d.derpClient.Close()
-	}
 	if d.grpcClient != nil {
 		_ = d.grpcClient.Close()
 	}
 	d.wg.Wait()
+	return nil
+}
+
+// Leave permanently removes this node from the mesh, freeing its overlay
+// address and tunnels. It is deliberately not part of Stop: a restart must keep
+// the node's identity.
+func (d *Daemon) Leave(ctx context.Context) error {
+	if d.grpcClient != nil {
+		return d.grpcClient.Deregister(ctx)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, d.cfg.PlaneEndpoint+"/api/v1/node", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("deregister rejected: status %d", resp.StatusCode)
+	}
 	return nil
 }
 
@@ -583,26 +617,11 @@ func (d *Daemon) connectToEdgePoP(pop core.EdgePoP) error {
 		return nil
 	}
 
-	// Establish DERP encrypted packet relay client connection if endpoint is reachable
-	if pop.PublicEndpoint != "" && d.derpClient == nil {
-		go func() {
-			dialCtx, dialCancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer dialCancel()
-			dc, err := derp.ConnectDERP(dialCtx, pop.PublicEndpoint, d.keyPair)
-			if err == nil {
-				d.derpClient = dc
-				slog.Info("Connected to Edge DERP relay fallback", "pop", pop.PoPCode, "endpoint", pop.PublicEndpoint)
-			}
-		}()
-	}
+	d.relay.target(pop)
 
-	// Route all private overlay traffic through primary PoP as default relay
-	return d.wgManager.ApplyPeer(wireguard.PeerConfig{
-		PublicKey:           pop.PublicKey,
-		Endpoint:            pop.PublicEndpoint,
-		AllowedIPs:          []string{"100.64.0.0/10", "fd00:cafe::/64"},
-		PersistentKeepalive: 25 * time.Second,
-	})
+	// Route overlay traffic through the PoP by default; direct peers override
+	// it with their longer prefixes.
+	return d.applyPath(pop, pathUDP)
 }
 
 // DiscoverAndConnectPeer implements Section 5 Packet Flow & Smart Routing:
@@ -617,35 +636,12 @@ func (d *Daemon) DiscoverAndConnectPeer(ctx context.Context, targetOverlayIP str
 		endpoints = append(endpoints, d.udpConn.LocalAddr().String())
 	}
 
-	discReq := server.P2PDiscoverRequest{
+	discResp, err := d.discoverPeer(ctx, server.P2PDiscoverRequest{
 		InitiatorNodeID:    d.nodeID,
 		TargetOverlayIP:    targetOverlayIP,
 		InitiatorEndpoints: core.StringList(endpoints),
-	}
-
-	body, err := json.Marshal(discReq)
+	})
 	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", d.cfg.PlaneEndpoint+"/api/v1/p2p/discover", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := d.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("p2p discovery request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("p2p discovery rejected: status %d", resp.StatusCode)
-	}
-
-	var discResp server.P2PDiscoverResponse
-	if err := json.NewDecoder(resp.Body).Decode(&discResp); err != nil {
 		return nil, err
 	}
 
@@ -675,6 +671,7 @@ func (d *Daemon) DiscoverAndConnectPeer(ctx context.Context, targetOverlayIP str
 			AllowedIPs:          []string{discResp.TargetOverlayIPv4 + "/32"},
 			PersistentKeepalive: 20 * time.Second,
 		})
+		agent.NudgeUntilHandshake(d.wgManager, discResp.TargetPublicKey, func() bool { return true })
 
 		routeTarget = router.RouteTarget{
 			PublicKey:   discResp.TargetPublicKey,
@@ -697,12 +694,10 @@ func (d *Daemon) DiscoverAndConnectPeer(ctx context.Context, targetOverlayIP str
 			"target", discResp.TargetHostname,
 			"primary_pop", primaryPoP.PoPCode)
 
-		_ = d.wgManager.ApplyPeer(wireguard.PeerConfig{
-			PublicKey:           discResp.TargetPublicKey,
-			Endpoint:            relayEndpoint,
-			AllowedIPs:          []string{discResp.TargetOverlayIPv4 + "/32"},
-			PersistentKeepalive: 25 * time.Second,
-		})
+		// The PoP peer already carries the overlay prefix, so traffic to the target
+		// relays through it. A direct peer with the PoP as endpoint would only
+		// attempt a handshake the PoP cannot complete on the target's behalf.
+		_ = d.wgManager.RemovePeer(discResp.TargetPublicKey)
 
 		routeTarget = router.RouteTarget{
 			PublicKey:   discResp.TargetPublicKey,
@@ -721,19 +716,6 @@ func (d *Daemon) connectPeer(ctx context.Context, peer core.Node) {
 	d.peersMu.Lock()
 	d.peers[peer.PublicKey] = peer
 	d.peersMu.Unlock()
-
-	if d.cfg.InterfaceMode != "netstack" {
-		if peer.OverlayIPv4 != "" {
-			if err := netcfg.AddHostRoute(d.cfg.InterfaceName, peer.OverlayIPv4); err != nil {
-				slog.Debug("Failed to add overlay route", "peer", peer.OverlayIPv4, "error", err)
-			}
-		}
-		if peer.OverlayIPv6 != "" {
-			if err := netcfg.AddHostRoute(d.cfg.InterfaceName, peer.OverlayIPv6); err != nil {
-				slog.Debug("Failed to add overlay route", "peer", peer.OverlayIPv6, "error", err)
-			}
-		}
-	}
 
 	_, _ = d.DiscoverAndConnectPeer(ctx, peer.OverlayIPv4)
 }
@@ -770,6 +752,15 @@ func (d *Daemon) probeWorker(ctx context.Context) {
 				consecutiveFails = 0
 			}
 
+			// UDP blocked but the TCP relay works: tunnel WireGuard through it.
+			d.relay.mu.Lock()
+			cur := d.relay.mode
+			d.relay.mu.Unlock()
+			if want := nextPath(cur, err == nil, consecutiveFails, d.relay.isUp()); want != cur {
+				slog.Warn("Edge PoP path changed", "pop", primary.PoPCode, "relay", want == pathRelay)
+				_ = d.applyPath(primary, want)
+			}
+
 			// Report probe telemetry to Control Plane
 			sample := core.LatencySample{
 				NodeID:     d.nodeID,
@@ -779,18 +770,10 @@ func (d *Daemon) probeWorker(ctx context.Context) {
 				Timestamp:  time.Now(),
 			}
 
-			body, _ := json.Marshal(sample)
-			req, err := http.NewRequestWithContext(ctx, "POST", d.cfg.PlaneEndpoint+"/api/v1/probes", bytes.NewReader(body))
-			if err == nil {
-				req.Header.Set("Content-Type", "application/json")
-				res, err := d.httpClient.Do(req)
-				if err == nil {
-					_ = res.Body.Close()
-				}
-			}
+			d.reportProbe(ctx, sample)
 
 			// Failover to secondary Edge PoP if primary is unreachable (consecutive failures >= 2)
-			if consecutiveFails >= 2 && secondary != nil && secondary.PublicEndpoint != "" {
+			if consecutiveFails >= 2 && !d.relay.isUp() && secondary != nil && secondary.PublicEndpoint != "" {
 				slog.Warn("Primary Edge PoP degraded/unreachable, failing over to secondary Edge PoP",
 					"old_primary", primary.PoPCode,
 					"new_primary", secondary.PoPCode)
@@ -828,17 +811,98 @@ func (d *Daemon) tunnelWorker(ctx context.Context) {
 			Protocol:       tunCfg.Protocol,
 		}
 
-		body, _ := json.Marshal(t)
-		req, err := http.NewRequestWithContext(ctx, "POST", d.cfg.PlaneEndpoint+"/api/v1/tunnels", bytes.NewReader(body))
-		if err == nil {
-			req.Header.Set("Content-Type", "application/json")
-			res, err := d.httpClient.Do(req)
-			if err == nil {
-				_ = res.Body.Close()
-				slog.Info("Exposed local service tunnel", "name", tunCfg.Name, "hostname", tunCfg.PublicHostname, "local", tunCfg.LocalAddress)
-			}
+		if err := d.ExposeTunnel(ctx, tunCfg.LocalAddress); err != nil {
+			slog.Warn("Could not expose tunnel on the overlay", "name", tunCfg.Name, "error", err)
+			continue
 		}
+		if err := d.registerTunnel(ctx, t); err != nil {
+			slog.Warn("Failed to register tunnel with the control plane", "name", tunCfg.Name, "error", err)
+			continue
+		}
+		slog.Info("Exposed local service tunnel", "name", tunCfg.Name, "hostname", tunCfg.PublicHostname, "local", tunCfg.LocalAddress)
 	}
+}
+
+// discoverPeer asks the plane for a peer's coordinates over gRPC when it is
+// configured, otherwise over REST.
+func (d *Daemon) discoverPeer(ctx context.Context, req server.P2PDiscoverRequest) (*server.P2PDiscoverResponse, error) {
+	if d.grpcClient != nil {
+		g, err := d.grpcClient.DiscoverP2P(ctx, &v1.P2PDiscoverRequest{
+			InitiatorNodeId:    req.InitiatorNodeID.String(),
+			TargetOverlayIp:    req.TargetOverlayIP,
+			InitiatorEndpoints: req.InitiatorEndpoints,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("p2p discovery rejected: %w", err)
+		}
+		targetID, _ := uuid.Parse(g.TargetNodeId)
+		out := &server.P2PDiscoverResponse{
+			TargetNodeID:      targetID,
+			TargetHostname:    g.TargetHostname,
+			TargetPublicKey:   g.TargetPublicKey,
+			TargetOverlayIPv4: g.TargetOverlayIpv4,
+			TargetOverlayIPv6: g.TargetOverlayIpv6,
+			TargetEndpoints:   core.StringList(g.TargetEndpoints),
+		}
+		if g.PrimaryPop != nil {
+			out.PrimaryPoP = &core.EdgePoP{PoPCode: g.PrimaryPop.PopCode, PublicEndpoint: g.PrimaryPop.PublicEndpoint, PublicKey: g.PrimaryPop.PublicKey, Region: g.PrimaryPop.Region}
+		}
+		return out, nil
+	}
+
+	var out server.P2PDiscoverResponse
+	if err := d.postPlane(ctx, "/api/v1/p2p/discover", req, http.StatusOK, &out); err != nil {
+		return nil, fmt.Errorf("p2p discovery failed: %w", err)
+	}
+	return &out, nil
+}
+
+// reportProbe sends a latency sample to the plane (best effort).
+func (d *Daemon) reportProbe(ctx context.Context, sample core.LatencySample) {
+	if d.grpcClient != nil {
+		_, _ = d.grpcClient.ReportProbes(ctx, &v1.ProbeReportRequest{
+			NodeId: d.nodeID.String(), PopCode: sample.PoPCode, RttNs: sample.RTT.Nanoseconds(), PacketLoss: sample.PacketLoss,
+		})
+		return
+	}
+	_ = d.postPlane(ctx, "/api/v1/probes", sample, http.StatusAccepted, nil)
+}
+
+// registerTunnel registers an exposed service with the plane.
+func (d *Daemon) registerTunnel(ctx context.Context, t core.Tunnel) error {
+	if d.grpcClient != nil {
+		_, err := d.grpcClient.RegisterTunnel(ctx, &v1.RegisterTunnelRequest{
+			Name: t.Name, LocalAddress: t.LocalAddress, PublicHostname: t.PublicHostname, Protocol: t.Protocol,
+		})
+		return err
+	}
+	return d.postPlane(ctx, "/api/v1/tunnels", t, http.StatusCreated, nil)
+}
+
+// postPlane POSTs JSON to the plane over REST, expecting wantStatus, and
+// decodes the response into out when it is non-nil.
+func (d *Daemon) postPlane(ctx context.Context, path string, body any, wantStatus int, out any) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.cfg.PlaneEndpoint+path, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != wantStatus {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	if out != nil {
+		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	return nil
 }
 
 // OverlayIPv4 returns the assigned static overlay IPv4.
@@ -855,9 +919,6 @@ func (d *Daemon) SetOverlayIP(ip string) {
 func (d *Daemon) PublicKey() string {
 	return d.keyPair.PublicKey
 }
-
-// globalMeshRegistry tracks registered overlay listeners across the node network.
-var globalMeshRegistry = sync.Map{} // "overlayIP:port" -> *guardedListener
 
 // SetInboundPolicy updates the node's zero-trust inbound firewall policy.
 func (d *Daemon) SetInboundPolicy(allowedPorts []string, defaultDeny bool, allowedPeers []string) {
@@ -899,6 +960,12 @@ func (d *Daemon) DenyPort(portProto string) {
 // IsTrafficAllowed evaluates if incoming traffic from srcIP to localPort on protocol is permitted.
 // If defaultDeny is enabled, all ports are denied unless explicitly allowed.
 func (d *Daemon) IsTrafficAllowed(srcIP string, protocol string, destPort int) bool {
+	// Network rules first: a matching DENY closes a port the node itself opens,
+	// and a matching ALLOW opens one the node's default-deny would close.
+	if allow, matched := d.centralDecision(srcIP, protocol, destPort); matched {
+		return allow
+	}
+
 	d.policyMu.RLock()
 	allowedPorts := d.allowedPorts
 	defaultDeny := d.defaultDeny
@@ -947,168 +1014,4 @@ func (d *Daemon) IsTrafficAllowed(srcIP string, protocol string, destPort int) b
 	}
 
 	return true
-}
-
-// MeshAddr represents a network address in the private overlay space.
-type MeshAddr struct {
-	IP   string
-	Port int
-	Net  string
-}
-
-func (a *MeshAddr) Network() string {
-	if a.Net != "" {
-		return a.Net
-	}
-	return "mesh"
-}
-
-func (a *MeshAddr) String() string {
-	return net.JoinHostPort(a.IP, strconv.Itoa(a.Port))
-}
-
-type meshPipeConn struct {
-	net.Conn
-	localAddr  net.Addr
-	remoteAddr net.Addr
-}
-
-func (c *meshPipeConn) LocalAddr() net.Addr  { return c.localAddr }
-func (c *meshPipeConn) RemoteAddr() net.Addr { return c.remoteAddr }
-
-type guardedListener struct {
-	daemon     *Daemon
-	targetPort int
-	protocol   string
-	overlayIP  string
-	connCh     chan net.Conn
-	closed     chan struct{}
-	closeOnce  sync.Once
-}
-
-func (g *guardedListener) Accept() (net.Conn, error) {
-	select {
-	case <-g.closed:
-		return nil, net.ErrClosed
-	case conn, ok := <-g.connCh:
-		if !ok {
-			return nil, net.ErrClosed
-		}
-		return conn, nil
-	}
-}
-
-func (g *guardedListener) Close() error {
-	g.closeOnce.Do(func() {
-		close(g.closed)
-		key := fmt.Sprintf("%s:%d", g.overlayIP, g.targetPort)
-		globalMeshRegistry.Delete(key)
-	})
-	return nil
-}
-
-func (g *guardedListener) Addr() net.Addr {
-	return &MeshAddr{
-		IP:   g.overlayIP,
-		Port: g.targetPort,
-		Net:  g.protocol,
-	}
-}
-
-// ListenMesh opens a network listener guarded by the node's Zero-Trust Inbound Firewall.
-// Unauthorized connections from nodes to unallowed ports are dropped/rejected.
-func (d *Daemon) ListenMesh(ctx context.Context, network string, port int) (net.Listener, error) {
-	overlayIP := d.overlayIPv4
-	if overlayIP == "" {
-		overlayIP = "127.0.0.1"
-	}
-
-	gl := &guardedListener{
-		daemon:     d,
-		targetPort: port,
-		protocol:   network,
-		overlayIP:  overlayIP,
-		connCh:     make(chan net.Conn, 128),
-		closed:     make(chan struct{}),
-	}
-
-	d.listenersMu.Lock()
-	d.meshListeners[port] = gl
-	d.listenersMu.Unlock()
-
-	regKey := fmt.Sprintf("%s:%d", overlayIP, port)
-	globalMeshRegistry.Store(regKey, gl)
-	slog.Info("Bound Zero-Trust Mesh Listener", "overlay_ip", overlayIP, "port", port, "protocol", network)
-
-	return gl, nil
-}
-
-// DialMesh establishes a connection to a remote node's overlay IP across the mesh.
-// Example: d.DialMesh(ctx, "tcp", "100.64.0.10:5432")
-func (d *Daemon) DialMesh(ctx context.Context, network, address string) (net.Conn, error) {
-	host, portStr, err := net.SplitHostPort(address)
-	if err != nil {
-		return nil, fmt.Errorf("invalid mesh address: %w", err)
-	}
-
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid port: %w", err)
-	}
-
-	// 1. Resolve and connect peer if not already connected
-	if host != d.overlayIPv4 && host != "127.0.0.1" {
-		_, _ = d.DiscoverAndConnectPeer(ctx, host)
-	}
-
-	srcIP := d.overlayIPv4
-	if srcIP == "" {
-		srcIP = "127.0.0.1"
-	}
-
-	// 2. Check virtual mesh registry for target listener
-	regKey := fmt.Sprintf("%s:%d", host, port)
-	if val, ok := globalMeshRegistry.Load(regKey); ok {
-		targetLn := val.(*guardedListener)
-
-		// Evaluate target node's Zero-Trust Inbound Firewall!
-		if !targetLn.daemon.IsTrafficAllowed(srcIP, network, port) {
-			slog.Warn("Zero-Trust Inbound Firewall rejected connection",
-				"src", srcIP,
-				"dst", address,
-				"reason", "default_deny_all_or_unauthorized_port")
-			return nil, fmt.Errorf("connection to %s rejected: access denied by destination node zero-trust policy", address)
-		}
-
-		clientEnd, serverEnd := net.Pipe()
-
-		clientConn := &meshPipeConn{
-			Conn:       clientEnd,
-			localAddr:  &MeshAddr{IP: srcIP, Port: 51820, Net: network},
-			remoteAddr: &MeshAddr{IP: host, Port: port, Net: network},
-		}
-
-		serverConn := &meshPipeConn{
-			Conn:       serverEnd,
-			localAddr:  &MeshAddr{IP: host, Port: port, Net: network},
-			remoteAddr: &MeshAddr{IP: srcIP, Port: 51820, Net: network},
-		}
-
-		select {
-		case targetLn.connCh <- serverConn:
-			return clientConn, nil
-		case <-ctx.Done():
-			_ = clientConn.Close()
-			_ = serverConn.Close()
-			return nil, ctx.Err()
-		case <-targetLn.closed:
-			_ = clientConn.Close()
-			_ = serverConn.Close()
-			return nil, fmt.Errorf("target service %s is closed", address)
-		}
-	}
-
-	// 3. Fallback to direct network socket dialer
-	var dialer net.Dialer
-	return dialer.DialContext(ctx, network, address)
 }

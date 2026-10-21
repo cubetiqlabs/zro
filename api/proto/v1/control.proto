@@ -21,6 +21,20 @@ service ControlPlaneService {
   // Dynamic route discovery for Ingress Gateways
   rpc GetGatewayRoutes(GatewayRoutesRequest) returns (GatewayRoutesResponse);
 
+  // Network-wide access rules the calling node enforces on inbound traffic
+  rpc GetACLPolicy(GetACLPolicyRequest) returns (GetACLPolicyResponse);
+
+  // Current members of the caller's network
+  rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
+
+  // Leave the mesh: removes the calling node, its tunnels and its overlay address
+  rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
+
+  // Ingress tunnels owned by the calling node (node token required)
+  rpc RegisterTunnel(RegisterTunnelRequest) returns (Tunnel);
+  rpc ListTunnels(ListTunnelsRequest) returns (ListTunnelsResponse);
+  rpc DeleteTunnel(DeleteTunnelRequest) returns (DeleteTunnelResponse);
+
   // Real-time bidirectional/streaming event bus for instant updates (zero polling)
   rpc StreamMeshEvents(StreamEventsRequest) returns (stream MeshEvent);
 }
@@ -39,6 +53,8 @@ message EnrollRequest {
   repeated string tags = 5;
   repeated string endpoints = 6;
   repeated LatencyProbe probes = 7;
+  repeated string allowed_ports = 8;
+  optional bool default_deny = 9;
 }
 
 message EdgePoP {
@@ -61,6 +77,7 @@ message Node {
   repeated string tags = 7;
   repeated string allowed_ips = 8;
   repeated string endpoints = 9;
+  string assigned_pop_code = 10; // the PoP that homes this node
 }
 
 message EnrollResponse {
@@ -73,6 +90,13 @@ message EnrollResponse {
   EdgePoP primary_pop = 7;
   EdgePoP secondary_pop = 8;
   repeated Node peers = 9;
+  string node_token = 10; // bearer token for node-facing RPCs; shown once
+  repeated string allowed_ips = 11;
+  repeated string allowed_ports = 12;
+  bool default_deny = 13;
+  string ipv4_cidr = 14; // overlay prefixes of the network, used for routes/AllowedIPs
+  string ipv6_cidr = 15;
+  repeated ACLRule acl_rules = 16; // access policy of the network at enrollment
 }
 
 message ProbeReportRequest {
@@ -100,6 +124,8 @@ message P2PDiscoverResponse {
   string target_overlay_ipv4 = 4;
   repeated string target_endpoints = 5;
   EdgePoP primary_pop = 6;
+  string target_overlay_ipv6 = 7;
+  EdgePoP secondary_pop = 8;
 }
 
 message EdgeSyncRequest {
@@ -109,6 +135,7 @@ message EdgeSyncRequest {
 message EdgeSyncResponse {
   repeated EdgePoP pops = 1;
   repeated Node nodes = 2;
+  repeated string prefixes = 3; // overlay CIDRs in use across all networks
 }
 
 message GatewayRoutesRequest {
@@ -142,4 +169,59 @@ message MeshEvent {
   string event_type = 1;
   int64 timestamp = 2;
   string payload_json = 3;
+}
+
+message Tunnel {
+  string id = 1;
+  string name = 2;
+  string local_address = 3;
+  string public_hostname = 4;
+  string protocol = 5;
+}
+
+message RegisterTunnelRequest {
+  string name = 1;
+  string local_address = 2;
+  string public_hostname = 3;
+  string protocol = 4;
+}
+
+message ListTunnelsRequest {}
+
+message ListTunnelsResponse {
+  repeated Tunnel tunnels = 1;
+}
+
+message DeleteTunnelRequest {
+  string id = 1;
+}
+
+message DeleteTunnelResponse {}
+
+message DeregisterRequest {}
+
+message DeregisterResponse {}
+
+message ListPeersRequest {}
+
+message ListPeersResponse {
+  repeated Node peers = 1;
+}
+
+message ACLRule {
+  string id = 1;
+  int32 priority = 2; // lower number is evaluated first
+  string source_ip = 3;
+  string dest_ip = 4;
+  string source_tag = 5;
+  string dest_tag = 6;
+  string protocol = 7;
+  string ports = 8;
+  string action = 9; // ALLOW or DENY
+}
+
+message GetACLPolicyRequest {}
+
+message GetACLPolicyResponse {
+  repeated ACLRule rules = 1;
 }

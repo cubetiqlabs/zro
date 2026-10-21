@@ -37,15 +37,22 @@ services:
       ZRO_CONTROL_PLANE_PUBLIC_URL: "http://zro-plane:8443"
       ZRO_CONTROL_PLANE_DATABASE_DRIVER: postgres
       ZRO_CONTROL_PLANE_DATABASE_DSN: "postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-zro}?sslmode=disable"
-      ZRO_CONTROL_PLANE_SECRET_KEY: "${CLUSTER_SECRET:-change-me-cluster-super-secret}"
+      ZRO_CONTROL_PLANE_SECRET_KEY: "${CLUSTER_SECRET:?set CLUSTER_SECRET (openssl rand -hex 32)}"
       ZRO_CONTROL_PLANE_DEFAULT_CIDR_V4: "100.64.0.0/10"
       ZRO_CONTROL_PLANE_DEFAULT_CIDR_V6: "fd00:cafe::/64"
-      ZRO_CONTROL_PLANE_GRPC_LISTEN_ADDR: ":9443"
+      ZRO_CONTROL_PLANE_REQUIRE_AUTH: "${CONTROL_PLANE_REQUIRE_AUTH:-true}"
+      ZRO_CONTROL_PLANE_EDGE_API_KEY: "${EDGE_API_KEY:?set EDGE_API_KEY (openssl rand -hex 32)}"
+      ZRO_CONTROL_PLANE_ADMIN_API_KEY: "${ADMIN_API_KEY:-}"
+      ZRO_CONTROL_PLANE_NODE_TTL: "${NODE_TTL:-168h}"
+      # gRPC is opt in and needs TLS (or GRPC_INSECURE=true behind a TLS proxy); see docs/deployment.md.
+      ZRO_CONTROL_PLANE_GRPC_LISTEN_ADDR: "${GRPC_LISTEN_ADDR:-}"
+      ZRO_CONTROL_PLANE_GRPC_TLS_CERT: "${GRPC_TLS_CERT:-}"
+      ZRO_CONTROL_PLANE_GRPC_TLS_KEY: "${GRPC_TLS_KEY:-}"
+      ZRO_CONTROL_PLANE_GRPC_INSECURE: "${GRPC_INSECURE:-false}"
     ports:
       - "8443:8443"
-      - "9443:9443"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8443/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8443/readyz"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -80,6 +87,12 @@ services:
       ZRO_EDGE_INTERFACE_NAME: "zro-edge"
       ZRO_EDGE_MTU: 1420
       ZRO_EDGE_PLANE_ENDPOINT: "http://zro-plane:8443"
+      # Shared key for the first registration only; the PoP is then issued its own credential,
+      # kept (with its WireGuard key) in the state volume.
+      ZRO_EDGE_EDGE_API_KEY: "${EDGE_API_KEY:?set EDGE_API_KEY}"
+      ZRO_EDGE_STATE_DIR: /var/lib/zro
+    volumes:
+      - edge-kh-state:/var/lib/zro
     ports:
       - "51820:51820/udp"
     networks:
@@ -113,6 +126,12 @@ services:
       ZRO_EDGE_INTERFACE_NAME: "zro-edge"
       ZRO_EDGE_MTU: 1420
       ZRO_EDGE_PLANE_ENDPOINT: "http://zro-plane:8443"
+      # Shared key for the first registration only; the PoP is then issued its own credential,
+      # kept (with its WireGuard key) in the state volume.
+      ZRO_EDGE_EDGE_API_KEY: "${EDGE_API_KEY:?set EDGE_API_KEY}"
+      ZRO_EDGE_STATE_DIR: /var/lib/zro
+    volumes:
+      - edge-sg-state:/var/lib/zro
     ports:
       - "51821:51821/udp"
     networks:
@@ -145,6 +164,11 @@ services:
       ZRO_GATEWAY_LISTEN_PORT: 0
       ZRO_GATEWAY_LISTEN_HTTP: ":80"
       ZRO_GATEWAY_DOMAIN: "app.cubis.internal"
+      # Mint once the plane is up (see docs/deployment.md); without it the gateway serves static routes only.
+      ZRO_GATEWAY_ENROLLMENT_TOKEN: "${GATEWAY1_ENROLLMENT_TOKEN:-}"
+      ZRO_GATEWAY_STATE_DIR: /var/lib/zro
+    volumes:
+      - gw1-state:/var/lib/zro
     ports:
       - "${GATEWAY_PORT:-8080}:80"
     networks:
@@ -177,6 +201,10 @@ services:
       ZRO_GATEWAY_LISTEN_PORT: 0
       ZRO_GATEWAY_LISTEN_HTTP: ":80"
       ZRO_GATEWAY_DOMAIN: "app.cubis.internal"
+      ZRO_GATEWAY_ENROLLMENT_TOKEN: "${GATEWAY2_ENROLLMENT_TOKEN:-}"
+      ZRO_GATEWAY_STATE_DIR: /var/lib/zro
+    volumes:
+      - gw2-state:/var/lib/zro
     ports:
       - "${GATEWAY_PORT_2:-8081}:80"
     networks:
@@ -190,3 +218,7 @@ networks:
 volumes:
   pgdata:
     name: zro-postgres-data
+  edge-kh-state:
+  edge-sg-state:
+  gw1-state:
+  gw2-state:

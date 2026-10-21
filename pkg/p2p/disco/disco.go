@@ -42,10 +42,10 @@ type Message struct {
 
 // Engine coordinates peer discovery and endpoint probing over UDP.
 type Engine struct {
-	mu          sync.Mutex
-	keyPair     *crypto.KeyPair
+	mu           sync.Mutex
+	keyPair      *crypto.KeyPair
 	pendingPings map[[TxIDLen]byte]*pendingPing
-	udpConn     *net.UDPConn
+	udpConn      *net.UDPConn
 }
 
 type pendingPing struct {

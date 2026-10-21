@@ -3,6 +3,7 @@ package acl
 import (
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -23,12 +24,35 @@ func NewEvaluator(rules []core.ACLRule) *Evaluator {
 	if len(rules) > 0 {
 		defaultAction = core.ACLActionDeny
 	}
-	return &Evaluator{rules: rules, defaultAction: defaultAction}
+	return NewEvaluatorWithDefault(rules, defaultAction)
 }
 
 // NewEvaluatorWithDefault creates an evaluator with explicit default action.
+// Rules are evaluated by ascending Priority (a lower number wins); on a tie a
+// DENY beats an ALLOW, so equal-priority rules can never open what another
+// closes. The caller's slice is not modified.
 func NewEvaluatorWithDefault(rules []core.ACLRule, defaultAction core.ACLAction) *Evaluator {
-	return &Evaluator{rules: rules, defaultAction: defaultAction}
+	sorted := append([]core.ACLRule(nil), rules...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].Priority != sorted[j].Priority {
+			return sorted[i].Priority < sorted[j].Priority
+		}
+		return sorted[i].Action == core.ACLActionDeny && sorted[j].Action != core.ACLActionDeny
+	})
+	return &Evaluator{rules: sorted, defaultAction: defaultAction}
+}
+
+// Decide reports the outcome of the first matching rule. matched is false when
+// no rule applies, so the caller can fall back to its own policy.
+func (e *Evaluator) Decide(srcIP string, srcTags []string, dstIP string, dstTags []string, protocol string, port int) (allow, matched bool) {
+	for _, rule := range e.rules {
+		if matchIP(rule.SourceIP, srcIP) && matchIP(rule.DestIP, dstIP) &&
+			matchTag(rule.SourceTag, srcTags) && matchTag(rule.DestTag, dstTags) &&
+			matchProtocol(rule.Protocol, protocol) && matchPort(rule.Ports, port) {
+			return rule.Action == core.ACLActionAllow, true
+		}
+	}
+	return false, false
 }
 
 // CanAccess evaluates if a source node with srcTags can access a destination node with dstTags
@@ -119,8 +143,11 @@ func isPortAllowed(allowedPorts []string, protocol string, port int) bool {
 }
 
 func matchIP(pattern, ip string) bool {
-	if pattern == "*" || pattern == "" || ip == "" {
+	if pattern == "*" || pattern == "" {
 		return true
+	}
+	if ip == "" {
+		return false // an unknown address must not satisfy a rule that names one
 	}
 	// Exact match
 	if pattern == ip {
@@ -183,4 +210,59 @@ func matchPort(portPattern string, port int) bool {
 	}
 
 	return false
+}
+
+// ValidateRule rejects rules the evaluator would silently misread (a typo in a
+// CIDR or port list would otherwise turn into a rule that never matches, or one
+// that matches too much).
+func ValidateRule(r *core.ACLRule) error {
+	if r.Action != core.ACLActionAllow && r.Action != core.ACLActionDeny {
+		return fmt.Errorf("action must be ALLOW or DENY")
+	}
+	for _, ip := range []string{r.SourceIP, r.DestIP} {
+		if err := validateIPPattern(ip); err != nil {
+			return err
+		}
+	}
+	switch strings.ToLower(r.Protocol) {
+	case "", "*", "tcp", "udp", "icmp":
+	default:
+		return fmt.Errorf("protocol must be tcp, udp, icmp or *")
+	}
+	return validatePorts(r.Ports)
+}
+
+func validateIPPattern(p string) error {
+	if p == "" || p == "*" {
+		return nil
+	}
+	if strings.Contains(p, "/") {
+		if _, _, err := net.ParseCIDR(p); err != nil {
+			return fmt.Errorf("invalid CIDR %q", p)
+		}
+		return nil
+	}
+	if net.ParseIP(p) == nil {
+		return fmt.Errorf("invalid IP %q", p)
+	}
+	return nil
+}
+
+func validatePorts(p string) error {
+	if p == "" || p == "*" {
+		return nil
+	}
+	for _, part := range strings.Split(p, ",") {
+		part = strings.TrimSpace(part)
+		lo, hi := part, part
+		if a, b, ok := strings.Cut(part, "-"); ok {
+			lo, hi = a, b
+		}
+		l, err1 := strconv.Atoi(lo)
+		h, err2 := strconv.Atoi(hi)
+		if err1 != nil || err2 != nil || l < 1 || h > 65535 || l > h {
+			return fmt.Errorf("invalid port specification %q", part)
+		}
+	}
+	return nil
 }
