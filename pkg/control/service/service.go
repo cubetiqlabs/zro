@@ -381,14 +381,24 @@ func (s *Service) ReportProbe(ctx context.Context, node *core.Node, sample core.
 	if err != nil || res == nil {
 		return ""
 	}
-	s.rehome(ctx, node, res.PrimaryPoP)
+	home := ""
+	if node.AssignedPoP != nil {
+		home = node.AssignedPoP.PoPCode
+	}
+	if home == "" || res.ShouldSwitch(home) {
+		s.rehome(ctx, node, res.PrimaryPoP)
+	}
+	// The node follows this answer, so it must name the PoP the edges peer it at.
+	if node.AssignedPoP != nil {
+		return node.AssignedPoP.PoPCode
+	}
 	return res.PrimaryPoP.PoPCode
 }
 
 // rehome moves node's home to pop when delegation prefers another PoP (its
-// home went unhealthy or its probes degraded), so edges stop routing to the
-// old home. ponytail: no explicit hysteresis; the node only probes its home
-// and unprobed PoPs score 500ms, so a healthy home is never displaced.
+// home went unhealthy or a clearly better one appeared; see
+// delegation.DelegationResult.ShouldSwitch for the hysteresis), so edges stop routing to
+// the old home.
 func (s *Service) rehome(ctx context.Context, node *core.Node, pop core.EdgePoP) {
 	if node.AssignedPoPID != nil && *node.AssignedPoPID == pop.ID {
 		return

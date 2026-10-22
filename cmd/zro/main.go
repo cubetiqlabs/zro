@@ -237,18 +237,42 @@ func newEdgeCmd() *cobra.Command {
 }
 
 func newNodeCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "node",
-		Short: "Run the ZRO Client / Peer Agent Daemon",
+	var planeFlag, tokenFlag, hostnameFlag string
+	var netstack bool
+
+	cmd := &cobra.Command{
+		Use:     "node",
+		Aliases: []string{"join"},
+		Short:   "Join the mesh: zro join --plane URL --token TOKEN",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(cfgFile)
 			if err != nil {
 				return err
 			}
+			if planeFlag != "" {
+				cfg.Node.PlaneEndpoint = planeFlag
+			}
+			if tokenFlag != "" {
+				cfg.Node.EnrollmentToken = tokenFlag
+			}
+			if hostnameFlag != "" {
+				cfg.Node.Hostname = hostnameFlag
+			}
+			if netstack {
+				cfg.Node.InterfaceMode = "netstack"
+			}
+			if cfg.Node.Hostname == "" {
+				cfg.Node.Hostname, _ = os.Hostname()
+			}
 
 			return runNode(cfg)
 		},
 	}
+	cmd.Flags().StringVar(&planeFlag, "plane", "", "Control Plane API URL")
+	cmd.Flags().StringVar(&tokenFlag, "token", "", "Enrollment token (from the operator)")
+	cmd.Flags().StringVar(&hostnameFlag, "hostname", "", "Node name (default: this machine's hostname)")
+	cmd.Flags().BoolVar(&netstack, "netstack", false, "Run unprivileged: no TUN device or root needed")
+	return cmd
 }
 
 func newGatewayCmd() *cobra.Command {
@@ -314,13 +338,20 @@ func newTokenCmd() *cobra.Command {
 	var hostname string
 	var pubKey, nodeType string
 	var durationHours int
+	var planeURL, apiKey string
 
 	cmd := &cobra.Command{
 		Use:   "token",
 		Short: "Generate a signed node enrollment token with public key binding",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if secret == "" || networkID == "" || hostname == "" {
-				return fmt.Errorf("--secret, --network-id, and --hostname flags are required")
+			if apiKey != "" {
+				return mintViaPlane(planeURL, apiKey, networkID, hostname, nodeType, pubKey, durationHours)
+			}
+			if secret == "" {
+				secret = secretDefault()
+			}
+			if networkID == "" {
+				return fmt.Errorf("--secret and --network-id flags are required")
 			}
 			tok, err := crypto.SignEnrollmentToken(secret, crypto.EnrollmentTokenPayload{
 				NetworkID:      networkID,
@@ -337,13 +368,53 @@ func newTokenCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&secret, "secret", crypto.DefaultSecretKey, "Cluster secret key")
+	cmd.Flags().StringVar(&secret, "secret", "", "Cluster secret key (default $ZRO_CONTROL_PLANE_SECRET_KEY)")
 	cmd.Flags().StringVar(&nodeType, "type", "peer", "Node role the token may enroll as: peer or gateway")
 	cmd.Flags().StringVar(&networkID, "network-id", "8056c2e21c000001", "Target 16-hex Network ID")
-	cmd.Flags().StringVar(&hostname, "hostname", "my-node", "Node hostname")
+	cmd.Flags().StringVar(&hostname, "hostname", "", "Lock the token to this node name (default: any)")
 	cmd.Flags().StringVar(&pubKey, "pubkey", "", "Optional WireGuard public key to bind cryptographically")
 	cmd.Flags().IntVar(&durationHours, "hours", 24, "Validity duration in hours")
+	cmd.Flags().StringVar(&planeURL, "plane", "", "Mint through this control plane instead of signing locally")
+	cmd.Flags().StringVar(&apiKey, "api-key", os.Getenv("ZRO_API_KEY"), "Tenant API key (default $ZRO_API_KEY); no cluster secret needed")
 	return cmd
+}
+
+// mintViaPlane asks the control plane for a token, so operators need only
+// their tenant API key.
+func mintViaPlane(plane, apiKey, networkID, hostname, nodeType, pubKey string, hours int) error {
+	if plane == "" {
+		return fmt.Errorf("--plane is required with --api-key")
+	}
+	body, _ := json.Marshal(map[string]any{"hostname": hostname, "node_type": nodeType, "pubkey": pubKey, "hours": hours})
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(plane, "/")+"/api/v1/networks/"+networkID+"/tokens", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		JoinCommand string `json:"join_command"`
+		Token       string `json:"token"`
+		Error       string `json:"error"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("control plane refused (%d): %s", resp.StatusCode, out.Error)
+	}
+	fmt.Printf("Enrollment Token:\n%s\n\nRun on the new machine:\n  %s\n", out.Token, out.JoinCommand)
+	return nil
+}
+
+func secretDefault() string {
+	if v := os.Getenv("ZRO_CONTROL_PLANE_SECRET_KEY"); v != "" {
+		return v
+	}
+	return crypto.DefaultSecretKey
 }
 
 func newNetworkCmd() *cobra.Command {

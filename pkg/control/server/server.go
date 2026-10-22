@@ -570,6 +570,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/v1/pops/{code}", s.adminAuthMiddleware(s.handleDeletePoP))
 	s.mux.HandleFunc("POST /api/v1/networks", s.tenantAuthMiddleware(s.handleCreateNetwork))
 	s.mux.HandleFunc("GET /api/v1/networks", s.tenantAuthMiddleware(s.handleListNetworks))
+	s.mux.HandleFunc("POST /api/v1/networks/{id}/tokens", s.tenantAuthMiddleware(s.handleCreateEnrollmentToken))
 
 	// Tenant administration (bootstrap admin key; disabled when admin_api_key is empty)
 	s.mux.HandleFunc("POST /api/v1/tenants", s.adminAuthMiddleware(s.handleCreateTenant))
@@ -1055,8 +1056,8 @@ func (s *Server) handleReportProbes(w http.ResponseWriter, r *http.Request) {
 		apiError(w, "invalid probe payload", http.StatusBadRequest)
 		return
 	}
-	s.svc.ReportProbe(r.Context(), NodeFromContext(r.Context()), sample)
-	w.WriteHeader(http.StatusAccepted)
+	primary := s.svc.ReportProbe(r.Context(), NodeFromContext(r.Context()), sample)
+	writeJSON(w, http.StatusAccepted, map[string]string{"primary_pop_code": primary})
 }
 
 func (s *Server) handleGetPeers(w http.ResponseWriter, r *http.Request) {

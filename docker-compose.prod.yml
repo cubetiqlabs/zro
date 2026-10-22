@@ -1,0 +1,66 @@
+# Production control plane only: ZRO plane + PostgreSQL 18 on one host.
+# Edges and gateways run elsewhere (see docker-compose.cluster.yml).
+# Usage:
+#   cp .env.example .env   # fill CLUSTER_SECRET, EDGE_API_KEY, ADMIN_API_KEY, POSTGRES_PASSWORD, PUBLIC_URL
+#   docker compose -f docker-compose.prod.yml up -d
+# The plane speaks plain HTTP: put a TLS-terminating proxy in front of PLANE_BIND:8443.
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-zro}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (openssl rand -hex 24)}
+      POSTGRES_DB: ${POSTGRES_DB:-zro}
+    volumes:
+      - pgdata:/var/lib/postgresql # PG18 images keep versioned data under this path
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal]
+
+  plane:
+    image: ghcr.io/cubetiqlabs/zro:${ZRO_VERSION:-latest}
+    restart: always
+    command: ["plane"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ZRO_MODE: plane
+      ZRO_LOG_LEVEL: ${LOG_LEVEL:-info}
+      ZRO_CONTROL_PLANE_LISTEN_ADDR: ":8443"
+      ZRO_CONTROL_PLANE_PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL (https URL edges and nodes reach)}
+      ZRO_CONTROL_PLANE_DATABASE_DRIVER: postgres
+      ZRO_CONTROL_PLANE_DATABASE_DSN: postgres://${POSTGRES_USER:-zro}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-zro}?sslmode=disable
+      ZRO_CONTROL_PLANE_SECRET_KEY: ${CLUSTER_SECRET:?set CLUSTER_SECRET (openssl rand -hex 32)}
+      ZRO_CONTROL_PLANE_REQUIRE_AUTH: "true"
+      ZRO_CONTROL_PLANE_EDGE_API_KEY: ${EDGE_API_KEY:?set EDGE_API_KEY (openssl rand -hex 32)}
+      ZRO_CONTROL_PLANE_ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY (openssl rand -hex 32)}
+      ZRO_CONTROL_PLANE_NODE_TTL: ${NODE_TTL:-168h}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8443/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal, traefik-net]
+
+networks:
+  traefik-net:
+    external: true
+  internal:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${INTERNAL_SUBNET:-10.10.227.0/24}
+
+volumes:
+  pgdata:

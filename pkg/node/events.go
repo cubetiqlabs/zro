@@ -32,7 +32,7 @@ func (d *Daemon) realtimeListener(ctx context.Context) {
 		Role:       "node",
 		ID:         d.cfg.Hostname,
 		Credential: d.token.Get,
-		Events:     []string{"node_joined", "node_left", "acl_rules_updated", "p2p_punch_requested"},
+		Events:     []string{"node_joined", "node_left", "acl_rules_updated", "p2p_punch_requested", "pop_status_changed", "edge_registered", "node_rehomed"},
 		Raw: func(name string, data json.RawMessage) {
 			if name == "p2p_punch_requested" {
 				go d.answerPunchRequest(ctx, data)
@@ -45,6 +45,8 @@ func (d *Daemon) realtimeListener(ctx context.Context) {
 				d.syncPeers(ctx)
 			case "acl_rules_updated":
 				d.syncPolicy(ctx)
+			case "pop_status_changed", "edge_registered", "node_rehomed":
+				d.kickPoPs()
 			}
 		}
 	})

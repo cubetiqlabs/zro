@@ -152,3 +152,23 @@ func TestPruneAndForgetBoundProbeHistory(t *testing.T) {
 		t.Fatalf("expected only the fresh node to remain, got %d entries", len(e.recentProbes))
 	}
 }
+
+func TestShouldSwitchHysteresis(t *testing.T) {
+	score := func(code string, v float64) PoPScore { return PoPScore{PoP: core.EdgePoP{PoPCode: code}, Score: v} }
+	cases := []struct {
+		name   string
+		scores []PoPScore
+		want   bool
+	}{
+		{"home is best", []PoPScore{score("KH", 20), score("SG", 80)}, false},
+		{"marginally better", []PoPScore{score("SG", 45), score("KH", 50)}, false},
+		{"clearly better", []PoPScore{score("SG", 20), score("KH", 80)}, true},
+		{"home unhealthy", []PoPScore{score("SG", 300)}, true},
+	}
+	for _, c := range cases {
+		r := &DelegationResult{Scores: c.scores}
+		if got := r.ShouldSwitch("KH"); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}

@@ -123,17 +123,29 @@ func EnableForwarding() error {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
+	return enableForwarding(forwardingPaths)
+}
+
+var forwardingPaths = []string{
+	"/proc/sys/net/ipv4/ip_forward",
+	"/proc/sys/net/ipv6/conf/all/forwarding",
+}
+
+// enableForwarding sets each sysctl file to 1. A file already at 1 is left
+// alone, which is the case in containers started with `sysctls:` where /proc/sys
+// is read-only.
+func enableForwarding(paths []string) error {
 	var failures []string
-	for _, path := range []string{
-		"/proc/sys/net/ipv4/ip_forward",
-		"/proc/sys/net/ipv6/conf/all/forwarding",
-	} {
+	for _, path := range paths {
+		if cur, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(cur)) == "1" {
+			continue
+		}
 		if err := os.WriteFile(path, []byte("1\n"), 0o644); err != nil {
 			failures = append(failures, fmt.Sprintf("%s: %v", path, err))
 		}
 	}
 	if len(failures) > 0 {
-		return fmt.Errorf("could not enable forwarding: %s", strings.Join(failures, "; "))
+		return fmt.Errorf("could not enable forwarding (in Docker set sysctls net.ipv4.ip_forward=1 and net.ipv6.conf.all.forwarding=1): %s", strings.Join(failures, "; "))
 	}
 	return nil
 }

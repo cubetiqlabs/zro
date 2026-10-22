@@ -143,13 +143,21 @@ func (e *PoPDaemon) fetchMesh(ctx context.Context) (*meshState, error) {
 func (e *PoPDaemon) syncMeshTopology(ctx context.Context) {
 	st, err := e.fetchMesh(ctx)
 	if err != nil {
-		slog.Debug("Edge mesh sync failed", "pop_code", e.cfg.PoPCode, "error", err)
+		if now := time.Now().UnixNano(); now-e.lastSyncWarn.Load() > int64(time.Minute) {
+			e.lastSyncWarn.Store(now)
+			slog.Warn("Edge mesh sync failed (will keep retrying)", "pop_code", e.cfg.PoPCode, "error", err)
+		}
 		return
 	}
 
 	e.peersMu.Lock()
+	changed := !e.synced || e.peerCount != len(st.Nodes)
+	e.synced = true
 	e.peerCount = len(st.Nodes)
 	e.peersMu.Unlock()
+	if changed {
+		slog.Info("Edge mesh synchronized", "pop_code", e.cfg.PoPCode, "nodes", len(st.Nodes), "pops", len(st.PoPs))
+	}
 	e.knownKeys.Store(knownKeySet(st))
 
 	if err := e.wgManager.Reconcile(planPeers(e.cfg.PoPCode, st)); err != nil {

@@ -30,6 +30,8 @@ type DelegationResult struct {
 	SecondaryPoP *core.EdgePoP `json:"secondary_pop,omitempty"`
 	AssignedAt   time.Time     `json:"assigned_at"`
 	Reason       string        `json:"reason"`
+	// Scores ranks every healthy PoP, best first.
+	Scores []PoPScore `json:"-"`
 }
 
 // Engine coordinates smart routing delegation based on latency probes and PoP health.
@@ -137,6 +139,7 @@ func (e *Engine) Delegate(ctx context.Context, nodeID uuid.UUID) (*DelegationRes
 		PrimaryPoP: scores[0].PoP,
 		AssignedAt: time.Now(),
 		Reason:     fmt.Sprintf("Smart routed based on RTT %v (score: %.1f)", scores[0].RTT, scores[0].Score),
+		Scores:     scores,
 	}
 
 	if len(scores) > 1 {
@@ -145,4 +148,26 @@ func (e *Engine) Delegate(ctx context.Context, nodeID uuid.UUID) (*DelegationRes
 	}
 
 	return result, nil
+}
+
+// Switch hysteresis: a healthy home is only displaced by a PoP that is clearly
+// better, so jitter between similar PoPs does not flap a node between them.
+const (
+	switchMinGain  = 15.0 // score points (about ms)
+	switchMinRatio = 0.8  // new score must be at most 80% of the home's
+)
+
+// ShouldSwitch reports whether a node homed at home should move to the best
+// PoP. A home missing from the ranking is unhealthy, so the node always moves.
+func (r *DelegationResult) ShouldSwitch(home string) bool {
+	if len(r.Scores) == 0 || r.Scores[0].PoP.PoPCode == home {
+		return false
+	}
+	for _, s := range r.Scores {
+		if s.PoP.PoPCode == home {
+			best := r.Scores[0].Score
+			return s.Score-best >= switchMinGain && best <= s.Score*switchMinRatio
+		}
+	}
+	return true
 }
