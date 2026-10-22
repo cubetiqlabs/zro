@@ -183,6 +183,10 @@ func (e *PoPDaemon) Start(ctx context.Context) error {
 	if err == nil {
 		// Only keys the mesh knows (nodes and PoPs) may use the relay.
 		derpSrv.Authorize = e.isKnownKey
+		derpSrv.Limits = derp.Limits{
+			MaxConns: e.cfg.DERPMaxConns, MaxConnsPerIP: e.cfg.DERPMaxConnsPerIP,
+			PacketsPerSec: e.cfg.DERPPacketsPerSec, BytesPerSec: e.cfg.DERPBytesPerSec,
+		}
 		// The PoP's own WireGuard device is reachable through the relay too, so
 		// nodes behind UDP-hostile networks can still handshake with it.
 		if err := e.wgManager.AttachRelay(derpSrv.Local()); err != nil {

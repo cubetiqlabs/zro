@@ -61,6 +61,11 @@ edge:
   plane_ca_file: "" # CA bundle to trust for the plane's TLS certificate
   edge_api_key: "" # the shared key above; used only until the PoP is claimed
   is_anycast: false
+  # DERP (TCP) relay limits, 0 = unlimited. Rates are per session; over-rate packets are dropped.
+  derp_max_conns: 10000
+  derp_max_conns_per_ip: 256 # a NAT shares one IP
+  derp_packets_per_sec: 20000
+  derp_bytes_per_sec: 67108864 # 64 MiB/s
 
 # Client / Peer Node Configuration (IPless, P2P Mesh & Ingress Tunnels)
 node:
