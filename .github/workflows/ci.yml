@@ -52,6 +52,14 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
 
+  openapi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint OpenAPI
+        run: npx --yes @redocly/cli@latest lint api/openapi/openapi.yaml
+
   vulncheck:
     runs-on: ubuntu-latest
     timeout-minutes: 10

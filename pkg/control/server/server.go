@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cubis/zro/api/openapi"
 	v1 "github.com/cubis/zro/api/proto/v1"
 	"github.com/cubis/zro/pkg/config"
 	controlacl "github.com/cubis/zro/pkg/control/acl"
@@ -554,6 +555,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /healthz", s.handleLive)
 	s.mux.HandleFunc("GET /readyz", s.handleReady)
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
+	s.mux.HandleFunc("GET /api/v1/openapi.yaml", s.handleOpenAPI)
 
 	// Network Management (ZeroTier-styled 16-hex Network ID)
 	s.mux.HandleFunc("GET /api/v1/networks/{id}", s.tenantAuthMiddleware(s.handleGetNetwork))
@@ -614,6 +616,12 @@ func (s *Server) registerRoutes() {
 	if s.cfg.EnableGateway {
 		s.mux.HandleFunc("/", s.handleGatewayFallback)
 	}
+}
+
+// handleOpenAPI serves the API description; it is public like the docs it feeds.
+func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/yaml")
+	_, _ = w.Write(openapi.Spec)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

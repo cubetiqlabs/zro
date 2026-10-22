@@ -1,0 +1,977 @@
+openapi: 3.1.0
+info:
+  title: ZRO Control Plane API
+  version: 1.0.0
+  summary: REST API of the ZRO zero-trust mesh VPN control plane.
+  description: |
+    The control plane manages tenants, overlay networks, nodes, access rules and
+    edge PoPs. This document covers the REST API under `/api/v1`; the same
+    plane also speaks gRPC to nodes and edges (`api/proto/v1/control.proto`).
+
+    ## Conventions
+
+    * **Errors** always use one JSON envelope (see `Error`) and echo the
+      `X-Request-ID` header. Send your own `X-Request-ID` to trace a call.
+    * **Lists** under tenant/admin management endpoints are paginated with
+      `?limit=` (1–500, default 100) and an opaque `?cursor=`; the response is
+      `{"items": [...], "next_cursor": "..."}`. `next_cursor` is absent on the
+      last page.
+    * **Authentication** differs per audience; each operation lists its scheme.
+      Tenant keys look like `zro_key_…`, node tokens like `zro_node_…`.
+    * **Timestamps** are RFC 3339. **Network IDs** are 16 hex characters.
+    * Nodes and edges are normally driven by the `zro` binary; the node, edge
+      and gateway endpoints are documented for integrators and for completeness.
+  license:
+    name: See repository
+    url: https://github.com/sombochea/zro
+servers:
+  - url: http://localhost:8080
+    description: Local plane (default `listen_addr`)
+  - url: https://zro-plane.example.com
+    description: Production plane behind TLS
+tags:
+  - {name: Tenants, description: "Tenant administration (admin key)."}
+  - {name: Networks, description: "Overlay networks owned by a tenant."}
+  - {name: Nodes, description: "Members of a network."}
+  - {name: ACL, description: "Zero-trust access rules."}
+  - {name: PoPs, description: "Edge points of presence."}
+  - {name: Topology, description: "Live mesh graph."}
+  - {name: Events, description: "Real-time change feed (SSE and WebSocket)."}
+  - {name: Enrollment, description: "Joining a network. Used by `zro node`."}
+  - {name: Node API, description: "Calls a node makes with its node token."}
+  - {name: Edge API, description: "Calls an edge PoP makes."}
+  - {name: Health, description: "Liveness, readiness and metrics."}
+
+security:
+  - TenantKey: []
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: Service banner
+      security: []
+      responses:
+        "200":
+          description: Plane is up.
+          content:
+            application/json:
+              example: {status: healthy, service: zro-plane, timestamp: "2026-10-22T09:00:00Z"}
+  /healthz:
+    get:
+      tags: [Health]
+      operationId: getLiveness
+      summary: Liveness probe
+      security: []
+      responses:
+        "200": {description: Process is alive.}
+  /readyz:
+    get:
+      tags: [Health]
+      operationId: getReadiness
+      summary: Readiness probe (database reachable)
+      security: []
+      responses:
+        "200": {description: Ready to serve.}
+        "503": {description: Database unreachable.}
+  /metrics:
+    get:
+      tags: [Health]
+      operationId: getMetrics
+      summary: Prometheus metrics
+      description: Disabled unless `admin_api_key` is set.
+      security: [{AdminKey: []}]
+      responses:
+        "200":
+          description: Prometheus text exposition format.
+          content: {text/plain: {schema: {type: string}}}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+
+  /api/v1/openapi.yaml:
+    get:
+      tags: [Health]
+      operationId: getOpenAPI
+      summary: This document
+      security: []
+      responses:
+        "200":
+          description: The OpenAPI 3.1 description served by this plane.
+          content: {application/yaml: {schema: {type: string}}}
+
+  /api/v1/tenants:
+    get:
+      tags: [Tenants]
+      operationId: listTenants
+      summary: List tenants
+      security: [{AdminKey: []}]
+      parameters: [{$ref: "#/components/parameters/Limit"}, {$ref: "#/components/parameters/Cursor"}]
+      responses:
+        "200":
+          description: A page of tenants. API keys are never included.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TenantPage"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+    post:
+      tags: [Tenants]
+      operationId: createTenant
+      summary: Create a tenant
+      description: The plaintext `api_key` is returned **once**; store it.
+      security: [{AdminKey: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateTenantRequest"}
+            example: {name: Acme Corp, slug: acme}
+      responses:
+        "201":
+          description: Tenant created.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Tenant"}
+              example:
+                id: 5b0a3d7e-5c0b-4c1f-9a53-0d0e0f3a1b11
+                name: Acme Corp
+                slug: acme
+                is_active: true
+                created_at: "2026-10-22T09:00:00Z"
+                api_key: zro_key_3f1c0e9a7b2d4c5e8f6a1b2c3d4e5f60
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/v1/tenants/{id}:
+    parameters: [{$ref: "#/components/parameters/TenantID"}]
+    get:
+      tags: [Tenants]
+      operationId: getTenant
+      summary: Get a tenant
+      security: [{AdminKey: []}]
+      responses:
+        "200":
+          description: The tenant.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Tenant"}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Tenants]
+      operationId: deleteTenant
+      summary: Delete a tenant
+      description: The tenant must own no networks.
+      security: [{AdminKey: []}]
+      responses:
+        "204": {description: Deleted.}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/v1/tenants/{id}/rotate-key:
+    parameters: [{$ref: "#/components/parameters/TenantID"}]
+    post:
+      tags: [Tenants]
+      operationId: rotateTenantKey
+      summary: Rotate a tenant API key
+      description: The old key stops working immediately.
+      security: [{AdminKey: []}]
+      responses:
+        "200":
+          description: Tenant with its new plaintext key.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Tenant"}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /api/v1/networks:
+    get:
+      tags: [Networks]
+      operationId: listNetworks
+      summary: List the tenant's networks
+      parameters: [{$ref: "#/components/parameters/Limit"}, {$ref: "#/components/parameters/Cursor"}]
+      responses:
+        "200":
+          description: A page of networks.
+          content: {application/json: {schema: {$ref: "#/components/schemas/NetworkPage"}}}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [Networks]
+      operationId: createNetwork
+      summary: Create a network
+      description: CIDRs default to `100.64.0.0/10` and `fd00:cafe::/64`; they cannot be changed later.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateNetworkRequest"}
+            example: {name: production, dns_domain: prod.zro.internal}
+      responses:
+        "201":
+          description: Network created.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Network"}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /api/v1/networks/{id}:
+    parameters: [{$ref: "#/components/parameters/NetworkID"}]
+    get:
+      tags: [Networks]
+      operationId: getNetwork
+      summary: Get a network
+      responses:
+        "200":
+          description: The network.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Network"}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+    patch:
+      tags: [Networks]
+      operationId: updateNetwork
+      summary: Update a network
+      description: Only `name`, `dns_domain` and `is_active` can change; addressing is immutable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UpdateNetworkRequest"}
+            example: {name: prod-eu}
+      responses:
+        "200":
+          description: The updated network.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Network"}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Networks]
+      operationId: deleteNetwork
+      summary: Delete an empty network
+      description: Its ACL rules are removed with it. Fails with 409 while nodes remain.
+      responses:
+        "204": {description: Deleted.}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  /api/v1/nodes:
+    get:
+      tags: [Nodes]
+      operationId: listNodes
+      summary: List the nodes of a network
+      parameters:
+        - {name: network_id, in: query, required: true, schema: {$ref: "#/components/schemas/NetworkID"}}
+        - {$ref: "#/components/parameters/Limit"}
+        - {$ref: "#/components/parameters/Cursor"}
+      responses:
+        "200":
+          description: A page of nodes.
+          content: {application/json: {schema: {$ref: "#/components/schemas/NodePage"}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/nodes/{id}:
+    parameters: [{$ref: "#/components/parameters/NodeID"}]
+    get:
+      tags: [Nodes]
+      operationId: getNode
+      summary: Get a node
+      responses:
+        "200":
+          description: The node.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Node"}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Nodes]
+      operationId: deleteNode
+      summary: Remove a node
+      description: Frees its overlay address and tunnels. A node with its identity intact must be re-enrolled with a fresh token.
+      responses:
+        "204": {description: Removed.}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /api/v1/acl/rules:
+    get:
+      tags: [ACL]
+      operationId: listACLRules
+      summary: List a network's ACL rules
+      parameters:
+        - {name: network_id, in: query, required: true, schema: {$ref: "#/components/schemas/NetworkID"}}
+        - {$ref: "#/components/parameters/Limit"}
+        - {$ref: "#/components/parameters/Cursor"}
+      responses:
+        "200":
+          description: A page of rules, enforced in ascending `priority`.
+          content: {application/json: {schema: {$ref: "#/components/schemas/ACLRulePage"}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+    post:
+      tags: [ACL]
+      operationId: createACLRule
+      summary: Create an ACL rule
+      description: Omitted match fields default to `*`; `priority` defaults to 100; `action` to `ALLOW`. Nodes receive the change live.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateACLRuleRequest"}
+            example: {network_id: 8056c2e21c000001, priority: 10, source_tag: "tag:web", dest_tag: "tag:db", protocol: tcp, ports: "5432", action: ALLOW}
+      responses:
+        "201":
+          description: Rule created.
+          content: {application/json: {schema: {$ref: "#/components/schemas/ACLRule"}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/acl/rules/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      tags: [ACL]
+      operationId: getACLRule
+      summary: Get an ACL rule
+      responses:
+        "200":
+          description: The rule.
+          content: {application/json: {schema: {$ref: "#/components/schemas/ACLRule"}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [ACL]
+      operationId: deleteACLRule
+      summary: Delete an ACL rule
+      description: To change a rule, create the new one first, then delete the old one.
+      responses:
+        "204": {description: Deleted.}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /api/v1/mesh/graph:
+    get:
+      tags: [Topology]
+      operationId: getMeshGraph
+      summary: Live topology of a network
+      description: PoPs, nodes and the links between them, ready for a graph UI. `/api/v1/topology` is an alias.
+      parameters:
+        - {name: network_id, in: query, description: Defaults to the tenant's first network., schema: {$ref: "#/components/schemas/NetworkID"}}
+      responses:
+        "200":
+          description: The graph.
+          content: {application/json: {schema: {$ref: "#/components/schemas/MeshGraph"}}}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /api/v1/topology:
+    get:
+      tags: [Topology]
+      operationId: getTopology
+      summary: Alias of /api/v1/mesh/graph
+      parameters:
+        - {name: network_id, in: query, schema: {$ref: "#/components/schemas/NetworkID"}}
+      responses:
+        "200":
+          description: The graph.
+          content: {application/json: {schema: {$ref: "#/components/schemas/MeshGraph"}}}
+        "403": {$ref: "#/components/responses/Forbidden"}
+
+  /api/v1/events:
+    get:
+      tags: [Events]
+      operationId: streamEvents
+      summary: Server-sent event stream
+      description: |
+        Long-lived `text/event-stream`. Starts with `event: connected`, then one
+        event per change (`node_joined`, `node_left`, `node_rehomed`,
+        `mesh_graph_updated`, `acl_rules_updated`, `pop_status_changed`, …).
+        A tenant key sees only its own networks.
+      security: [{TenantKey: []}, {NodeToken: []}, {EdgeKey: []}]
+      responses:
+        "200":
+          description: Event stream.
+          content:
+            text/event-stream:
+              schema: {type: string}
+              example: "event: node_rehomed\ndata: {\"network_id\":\"8056c2e21c000001\",\"node_id\":\"…\",\"from_pop\":\"KH\",\"to_pop\":\"SG\"}\n\n"
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /api/v1/ws:
+    get:
+      tags: [Events]
+      operationId: websocketEvents
+      summary: WebSocket event stream
+      description: Same events as the SSE stream over RFC 6455. `/ws/v1/events` is an alias.
+      security: [{TenantKey: []}, {NodeToken: []}, {EdgeKey: []}]
+      responses:
+        "101": {description: Switching protocols.}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /api/v1/pops:
+    get:
+      tags: [PoPs]
+      operationId: listPoPs
+      summary: List edge PoPs
+      description: Public. Healthy PoPs only, unless `all=true`. Returns a bare array (not paginated); it is small and read by every node at startup.
+      security: []
+      parameters:
+        - {name: all, in: query, schema: {type: boolean, default: false}}
+      responses:
+        "200":
+          description: PoPs.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: "#/components/schemas/EdgePoP"}}
+  /api/v1/pops/{code}:
+    parameters: [{$ref: "#/components/parameters/PoPCode"}]
+    get:
+      tags: [PoPs]
+      operationId: getPoP
+      summary: Get an edge PoP
+      security: []
+      responses:
+        "200":
+          description: The PoP.
+          content: {application/json: {schema: {$ref: "#/components/schemas/EdgePoP"}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [PoPs]
+      operationId: deletePoP
+      summary: Remove a PoP
+      security: [{AdminKey: []}]
+      responses:
+        "204": {description: Removed.}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/pops/{code}/reset-key:
+    parameters: [{$ref: "#/components/parameters/PoPCode"}]
+    post:
+      tags: [PoPs]
+      operationId: resetPoPKey
+      summary: Reset a PoP's credential
+      description: Lets the PoP re-claim its code with the shared edge key. The old credential dies immediately.
+      security: [{AdminKey: []}]
+      responses:
+        "204": {description: Credential cleared.}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /api/v1/enroll:
+    post:
+      tags: [Enrollment]
+      operationId: enroll
+      summary: Join a network (or rejoin it)
+      description: |
+        The credential is an enrollment token minted with `zro token`
+        (single use per public key). A node that is already a member **rejoins**
+        by presenting its current node token as `Authorization: Bearer …` with
+        its own public key; no enrollment token is needed, so a restart works
+        after the original token has expired. Rejoining returns the same node
+        ID and overlay address with a fresh node token.
+      security: [{}, {NodeToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/EnrollRequest"}
+            example:
+              token: zro_tok_eyJuZXQiOiI4MDU2YzJlMjFjMDAwMDAxIn0.9c1d
+              public_key: 3kQ1Zp0d8Nn9lWm2hR7sT5vX1yB4cE6fG8aJ0uIoPqA=
+              hostname: app-01
+              tags: ["tag:web"]
+              endpoints: ["203.0.113.7:51820"]
+      responses:
+        "200":
+          description: Enrolled; save `node_token`.
+          content: {application/json: {schema: {$ref: "#/components/schemas/EnrollResponse"}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/v1/probes:
+    post:
+      tags: [Node API]
+      operationId: reportProbe
+      summary: Report a PoP latency probe
+      description: Feeds PoP selection. If another PoP now scores better (for example the home PoP is lost), the node is re-homed and edges re-route.
+      security: [{NodeToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/LatencySample"}
+            example: {pop_code: KH, rtt: 18000000, packet_loss: 0}
+      responses:
+        "202": {description: Accepted.}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /api/v1/network/{id}/peers:
+    get:
+      tags: [Node API]
+      operationId: listPeers
+      summary: Peers of the caller's network
+      security: [{NodeToken: []}]
+      parameters: [{$ref: "#/components/parameters/NetworkID"}]
+      responses:
+        "200":
+          description: Peers.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: "#/components/schemas/Node"}}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /api/v1/p2p/discover:
+    post:
+      tags: [Node API]
+      operationId: discoverPeer
+      summary: Resolve a peer and start hole punching
+      security: [{NodeToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                target_overlay_ip: {type: string, example: 100.64.0.12}
+                target_hostname: {type: string}
+                target_node_id: {type: string, format: uuid}
+                initiator_endpoints: {type: array, items: {type: string}}
+      responses:
+        "200":
+          description: Peer coordinates and fallback PoPs.
+          content: {application/json: {schema: {type: object, additionalProperties: true}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/acl/policy:
+    get:
+      tags: [Node API]
+      operationId: getACLPolicy
+      summary: Rules the calling node enforces
+      security: [{NodeToken: []}]
+      responses:
+        "200":
+          description: Rules.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: "#/components/schemas/ACLRule"}}
+  /api/v1/node:
+    delete:
+      tags: [Node API]
+      operationId: deregisterSelf
+      summary: Leave the network
+      security: [{NodeToken: []}]
+      responses:
+        "204": {description: Removed.}
+  /api/v1/tunnels:
+    get:
+      tags: [Node API]
+      operationId: listTunnels
+      summary: Tunnels of the calling node
+      security: [{NodeToken: []}]
+      responses:
+        "200":
+          description: Tunnels.
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: "#/components/schemas/Tunnel"}}
+    post:
+      tags: [Node API]
+      operationId: registerTunnel
+      summary: Expose a local HTTP service through the gateway
+      security: [{NodeToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Tunnel"}
+            example: {name: web, local_address: "127.0.0.1:8080", public_hostname: app.example.com, protocol: http}
+      responses:
+        "201":
+          description: Registered.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Tunnel"}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/v1/tunnels/{id}:
+    delete:
+      tags: [Node API]
+      operationId: deleteTunnel
+      summary: Remove a tunnel
+      security: [{NodeToken: []}]
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        "204": {description: Removed.}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/gateway/routes:
+    get:
+      tags: [Node API]
+      operationId: getGatewayRoutes
+      summary: Hostname routes for an ingress gateway
+      security: [{NodeToken: []}]
+      responses:
+        "200":
+          description: Routes.
+          content:
+            application/json:
+              example:
+                routes:
+                  - hostname: app.example.com
+                    protocol: http
+                    backends:
+                      - {address: "100.64.0.10:8080", node_id: 5b0a3d7e-5c0b-4c1f-9a53-0d0e0f3a1b11, node_hostname: app-01, weight: 100, healthy: true}
+
+  /api/v1/edge/register:
+    post:
+      tags: [Edge API]
+      operationId: registerEdge
+      summary: Register or claim a PoP
+      description: The first registration of a `pop_code` with the shared edge key returns a per-PoP `pop_key`, shown once. Later calls need that key.
+      security: [{EdgeKey: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/RegisterEdgeRequest"}
+            example: {pop_code: KH, region: Asia/Phnom_Penh, public_endpoint: "203.0.113.5:51820", public_key: "Zm9v…=", weight: 100}
+      responses:
+        "200":
+          description: Registered.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/EdgePoP"
+                  - properties:
+                      pop_key: {type: string, description: Per-PoP credential; only on the first claim.}
+              example: {pop_code: KH, region: Asia/Phnom_Penh, public_endpoint: "203.0.113.5:51820", is_healthy: true, weight: 100, pop_key: zro_pop_8a1c…}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /api/v1/edge/heartbeat:
+    post:
+      tags: [Edge API]
+      operationId: edgeHeartbeat
+      summary: PoP liveness
+      description: A PoP missing heartbeats for 15 s is marked unhealthy and excluded from node assignment.
+      security: [{PopKey: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pop_code: {type: string}
+                status: {type: string, example: online}
+                peers_count: {type: integer}
+                active_tunnels: {type: integer}
+                rtt_ms: {type: number}
+                public_endpoint: {type: string}
+      responses:
+        "200": {description: Acknowledged.}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/edge/deregister:
+    post:
+      tags: [Edge API]
+      operationId: edgeDeregister
+      summary: Take a PoP out of service
+      security: [{PopKey: []}]
+      responses:
+        "204": {description: Done.}
+  /api/v1/edge/sync:
+    get:
+      tags: [Edge API]
+      operationId: edgeSync
+      summary: Mesh snapshot for a PoP
+      description: Healthy PoPs and every node of every tenant. Edge principals only.
+      security: [{PopKey: []}]
+      responses:
+        "200":
+          description: Snapshot.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pops: {type: array, items: {$ref: "#/components/schemas/EdgePoP"}}
+                  nodes: {type: array, items: {$ref: "#/components/schemas/Node"}}
+                  prefixes: {type: array, items: {type: string}}
+
+components:
+  securitySchemes:
+    TenantKey:
+      type: http
+      scheme: bearer
+      description: Tenant API key (`zro_key_…`). Also accepted as `X-API-Key`. With `require_auth=false`, requests without a key act as a built-in dev tenant until a real tenant exists.
+    AdminKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+      description: The plane's `admin_api_key` (also accepted as a bearer token).
+    NodeToken:
+      type: http
+      scheme: bearer
+      description: Node token (`zro_node_…`) returned by enrollment. Also accepted as `X-Node-Token`.
+    EdgeKey:
+      type: apiKey
+      in: header
+      name: X-Edge-Key
+      description: Shared `edge_api_key`, or a per-PoP `zro_pop_…` credential.
+    PopKey:
+      type: apiKey
+      in: header
+      name: X-Edge-Key
+      description: Per-PoP `zro_pop_…` credential issued at first registration.
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      description: Page size.
+      schema: {type: integer, minimum: 1, maximum: 500, default: 100}
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque value from the previous page's `next_cursor`.
+      schema: {type: string}
+    TenantID:
+      {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+    NetworkID:
+      {name: id, in: path, required: true, schema: {$ref: "#/components/schemas/NetworkID"}}
+    NodeID:
+      {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+    PoPCode:
+      {name: code, in: path, required: true, schema: {type: string, example: KH}}
+
+  responses:
+    BadRequest:
+      description: Malformed or invalid request.
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}, example: {error: {code: invalid_request, message: invalid request body, request_id: 3f9c2a1b7d4e5f60}}}}
+    Unauthorized:
+      description: Missing or invalid credentials.
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}, example: {error: {code: unauthorized, message: "unauthorized: invalid or inactive API key", request_id: 3f9c2a1b7d4e5f60}}}}
+    Forbidden:
+      description: Authenticated but not allowed.
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    NotFound:
+      description: No such resource, or it belongs to another tenant.
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}, example: {error: {code: not_found, message: network not found, request_id: 3f9c2a1b7d4e5f60}}}}
+    Conflict:
+      description: State conflict (duplicate, still in use, already enrolled).
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [invalid_request, unauthorized, forbidden, not_found, conflict, rate_limited, internal, error]
+            message: {type: string}
+            request_id: {type: string, description: Echo of `X-Request-ID`.}
+    NetworkID:
+      type: string
+      pattern: "^[0-9a-f]{16}$"
+      example: 8056c2e21c000001
+    Page:
+      type: object
+      required: [items]
+      properties:
+        next_cursor: {type: string, description: Absent on the last page.}
+    CreateTenantRequest:
+      type: object
+      required: [name, slug]
+      properties:
+        name: {type: string}
+        slug: {type: string, pattern: "^[a-z0-9][a-z0-9-]{0,98}[a-z0-9]$"}
+    Tenant:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        slug: {type: string}
+        is_active: {type: boolean}
+        created_at: {type: string, format: date-time}
+        api_key: {type: string, description: Plaintext key; only on create and rotate.}
+    TenantPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - properties: {items: {type: array, items: {$ref: "#/components/schemas/Tenant"}}}
+    CreateNetworkRequest:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string}
+        ipv4_cidr: {type: string, example: 100.64.0.0/10}
+        ipv6_cidr: {type: string, example: "fd00:cafe::/64"}
+        dns_domain: {type: string, example: zro.internal}
+    UpdateNetworkRequest:
+      type: object
+      properties:
+        name: {type: string}
+        dns_domain: {type: string}
+        is_active: {type: boolean}
+    Network:
+      type: object
+      properties:
+        id: {$ref: "#/components/schemas/NetworkID"}
+        tenant_id: {type: string, format: uuid}
+        name: {type: string}
+        slug: {type: string}
+        ipv4_cidr: {type: string}
+        ipv6_cidr: {type: string}
+        dns_domain: {type: string}
+        mtu: {type: integer, example: 1420}
+        is_active: {type: boolean}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+      example:
+        id: 8056c2e21c000001
+        tenant_id: 5b0a3d7e-5c0b-4c1f-9a53-0d0e0f3a1b11
+        name: production
+        slug: production
+        ipv4_cidr: 100.64.0.0/10
+        ipv6_cidr: "fd00:cafe::/64"
+        dns_domain: prod.zro.internal
+        mtu: 1420
+        is_active: true
+        created_at: "2026-10-22T09:00:00Z"
+        updated_at: "2026-10-22T09:00:00Z"
+    NetworkPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - properties: {items: {type: array, items: {$ref: "#/components/schemas/Network"}}}
+    EdgePoP:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        pop_code: {type: string, example: KH}
+        region: {type: string, example: Asia/Phnom_Penh}
+        public_endpoint: {type: string, example: "203.0.113.5:51820"}
+        public_key: {type: string}
+        is_anycast: {type: boolean}
+        weight: {type: integer, example: 100}
+        is_healthy: {type: boolean}
+        last_seen_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    Node:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        network_id: {$ref: "#/components/schemas/NetworkID"}
+        hostname: {type: string}
+        public_key: {type: string, description: WireGuard public key (base64).}
+        overlay_ipv4: {type: string, example: 100.64.0.10}
+        overlay_ipv6: {type: string}
+        node_type: {type: string, enum: [peer, gateway]}
+        assigned_pop_id: {type: string, format: uuid}
+        assigned_pop: {$ref: "#/components/schemas/EdgePoP"}
+        tags: {type: array, items: {type: string}, example: ["tag:web"]}
+        allowed_ips: {type: array, items: {type: string}}
+        allowed_ports: {type: array, items: {type: string}, example: ["5432/tcp"]}
+        default_deny: {type: boolean}
+        endpoints: {type: array, items: {type: string}}
+        is_active: {type: boolean}
+        last_seen_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+    NodePage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - properties: {items: {type: array, items: {$ref: "#/components/schemas/Node"}}}
+    CreateACLRuleRequest:
+      type: object
+      required: [network_id]
+      properties:
+        network_id: {$ref: "#/components/schemas/NetworkID"}
+        priority: {type: integer, default: 100, description: Lower is evaluated first.}
+        source_ip: {type: string, default: "*", description: IP, CIDR or `*`.}
+        dest_ip: {type: string, default: "*"}
+        source_tag: {type: string, default: "*", example: "tag:web"}
+        dest_tag: {type: string, default: "*", example: "tag:db"}
+        protocol: {type: string, enum: [tcp, udp, icmp, "*"], default: "*"}
+        ports: {type: string, default: "*", example: "80,443"}
+        action: {type: string, enum: [ALLOW, DENY], default: ALLOW}
+    ACLRule:
+      allOf:
+        - $ref: "#/components/schemas/CreateACLRuleRequest"
+        - type: object
+          properties:
+            id: {type: string, format: uuid}
+            created_at: {type: string, format: date-time}
+            updated_at: {type: string, format: date-time}
+    ACLRulePage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - properties: {items: {type: array, items: {$ref: "#/components/schemas/ACLRule"}}}
+    Tunnel:
+      type: object
+      required: [name, local_address, public_hostname]
+      properties:
+        id: {type: string, format: uuid}
+        node_id: {type: string, format: uuid}
+        network_id: {$ref: "#/components/schemas/NetworkID"}
+        name: {type: string}
+        local_address: {type: string, example: "127.0.0.1:8080"}
+        public_hostname: {type: string, example: app.example.com}
+        protocol: {type: string, enum: [http], default: http}
+    LatencySample:
+      type: object
+      required: [pop_code]
+      properties:
+        pop_code: {type: string}
+        rtt: {type: integer, format: int64, description: Round trip in nanoseconds., example: 18000000}
+        packet_loss: {type: number, minimum: 0, maximum: 1}
+    EnrollRequest:
+      type: object
+      required: [public_key]
+      properties:
+        token: {type: string, description: Enrollment token; optional when rejoining with a node token.}
+        public_key: {type: string}
+        hostname: {type: string}
+        node_type: {type: string, enum: [peer, gateway]}
+        tags: {type: array, items: {type: string}}
+        endpoints: {type: array, items: {type: string}}
+        allowed_ports: {type: array, items: {type: string}}
+        default_deny: {type: boolean}
+        probes: {type: array, items: {$ref: "#/components/schemas/LatencySample"}}
+    EnrollResponse:
+      type: object
+      properties:
+        node_id: {type: string, format: uuid}
+        network_id: {$ref: "#/components/schemas/NetworkID"}
+        node_token: {type: string, description: Bearer token for node APIs; replaces the previous one.}
+        overlay_ipv4: {type: string}
+        overlay_ipv6: {type: string}
+        dns_domain: {type: string}
+        mtu: {type: integer}
+        ipv4_cidr: {type: string}
+        ipv6_cidr: {type: string}
+        allowed_ips: {type: array, items: {type: string}}
+        allowed_ports: {type: array, items: {type: string}}
+        default_deny: {type: boolean}
+        primary_pop: {$ref: "#/components/schemas/EdgePoP"}
+        secondary_pop: {$ref: "#/components/schemas/EdgePoP"}
+        peers: {type: array, items: {$ref: "#/components/schemas/Node"}}
+        acl_rules: {type: array, items: {$ref: "#/components/schemas/ACLRule"}}
+    RegisterEdgeRequest:
+      type: object
+      required: [pop_code, public_endpoint, public_key]
+      properties:
+        pop_code: {type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,15}$"}
+        region: {type: string}
+        public_endpoint: {type: string}
+        public_key: {type: string}
+        weight: {type: integer}
+        is_anycast: {type: boolean}
+    MeshGraph:
+      type: object
+      properties:
+        network_id: {$ref: "#/components/schemas/NetworkID"}
+        timestamp: {type: string, format: date-time}
+        nodes:
+          type: array
+          items:
+            type: object
+            properties:
+              id: {type: string, example: pop-KH}
+              type: {type: string, enum: [edge, gateway, peer]}
+              hostname: {type: string}
+              overlay_ipv4: {type: string}
+              status: {type: string, enum: [online, offline]}
+              assigned_pop: {type: string}
+              tags: {type: array, items: {type: string}}
+              last_seen_at: {type: string, format: date-time}
+              tunnels: {type: array, items: {type: string}}
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              id: {type: string}
+              source: {type: string}
+              target: {type: string}
+              type: {type: string, enum: [backbone_link, edge_mesh, p2p_direct, gateway_proxy]}
+              status: {type: string, enum: [active, degraded, idle]}
+              rtt_ms: {type: number}
+        stats: {type: object, additionalProperties: true}

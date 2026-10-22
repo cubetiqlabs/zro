@@ -57,6 +57,14 @@ go build -o bin/zro ./cmd/zro
 
 ---
 
+## Documentation
+
+- [Deployment](docs/deployment.md): standalone and cluster setups, security model, operations.
+- [API guide](docs/api.md) and [OpenAPI spec](api/openapi/openapi.yaml): REST contract with worked examples.
+- [Availability and failover](docs/ha-and-failover.md): rejoining, PoP re-homing, relay limits.
+
+---
+
 ## Docker & Production Deployment
 
 ### 1. Local / Standalone Mesh Simulation (Docker Compose)
