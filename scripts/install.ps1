@@ -1,11 +1,11 @@
 # Install the zro CLI on Windows.
-#   irm https://raw.githubusercontent.com/sombochea/zro/main/scripts/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/cubetiqlabs/zro/main/scripts/install.ps1 | iex
 # Environment: ZRO_VERSION (e.g. v0.1.0, default: latest), ZRO_INSTALL_DIR
 # (default: %LOCALAPPDATA%\zro).
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$repo = 'sombochea/zro'
+$repo = 'cubetiqlabs/zro'
 $base = if ($env:ZRO_DOWNLOAD_BASE) { $env:ZRO_DOWNLOAD_BASE } else { "https://github.com/$repo/releases" }
 
 $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
