@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubis/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/crypto"
 )
 
 func TestKeygenCommand(t *testing.T) {

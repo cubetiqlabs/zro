@@ -25,7 +25,7 @@ ARG DATE=
 ARG TARGETOS=linux
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
-    -ldflags="-s -w -extldflags '-static' -X github.com/cubis/zro/pkg/version.Version=${VERSION} -X github.com/cubis/zro/pkg/version.Commit=${COMMIT} -X github.com/cubis/zro/pkg/version.Date=${DATE}" \
+    -ldflags="-s -w -extldflags '-static' -X github.com/cubetiqlabs/zro/pkg/version.Version=${VERSION} -X github.com/cubetiqlabs/zro/pkg/version.Commit=${COMMIT} -X github.com/cubetiqlabs/zro/pkg/version.Date=${DATE}" \
     -trimpath \
     -o /bin/zro \
     ./cmd/zro

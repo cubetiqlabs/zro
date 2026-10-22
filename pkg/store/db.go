@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cubis/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/core"
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"

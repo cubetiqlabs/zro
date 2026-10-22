@@ -7,12 +7,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubis/zro/pkg/config"
-	controlauth "github.com/cubis/zro/pkg/control/auth"
-	"github.com/cubis/zro/pkg/control/events"
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/crypto"
-	"github.com/cubis/zro/pkg/store"
+	"github.com/cubetiqlabs/zro/pkg/config"
+	controlauth "github.com/cubetiqlabs/zro/pkg/control/auth"
+	"github.com/cubetiqlabs/zro/pkg/control/events"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/store"
 	"github.com/google/uuid"
 )
 

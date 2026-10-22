@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubis/zro/pkg/crypto"
-	"github.com/cubis/zro/pkg/dataplane/tun"
+	"github.com/cubetiqlabs/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/tun"
 )
 
 func TestIsWireGuardPacket(t *testing.T) {

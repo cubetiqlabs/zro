@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cubis/zro/pkg/config"
-	"github.com/cubis/zro/pkg/store"
+	"github.com/cubetiqlabs/zro/pkg/config"
+	"github.com/cubetiqlabs/zro/pkg/store"
 )
 
 func TestHealthReadinessAndMetrics(t *testing.T) {

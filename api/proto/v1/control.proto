@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package zro.control.v1;
 
-option go_package = "github.com/cubis/zro/api/proto/v1;v1";
+option go_package = "github.com/cubetiqlabs/zro/api/proto/v1;v1";
 
 // ControlPlaneService coordinates global mesh routing, enrollment, dynamic routes, and real-time events.
 service ControlPlaneService {

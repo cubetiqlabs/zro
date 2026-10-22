@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cubis/zro/pkg/control/events"
+	"github.com/cubetiqlabs/zro/pkg/control/events"
 	"golang.org/x/net/websocket"
 )
 

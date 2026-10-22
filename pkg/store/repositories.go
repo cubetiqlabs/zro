@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/cubis/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/core"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"

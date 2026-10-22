@@ -13,8 +13,8 @@ import (
 	"net/url"
 	"time"
 
-	v1 "github.com/cubis/zro/api/proto/v1"
-	controlgrpc "github.com/cubis/zro/pkg/control/grpc"
+	v1 "github.com/cubetiqlabs/zro/api/proto/v1"
+	controlgrpc "github.com/cubetiqlabs/zro/pkg/control/grpc"
 	"golang.org/x/net/websocket"
 )
 

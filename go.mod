@@ -1,4 +1,4 @@
-module github.com/cubis/zro
+module github.com/cubetiqlabs/zro
 
 go 1.27.2
 

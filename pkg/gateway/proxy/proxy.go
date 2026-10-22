@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cubis/zro/pkg/gateway/balancer"
+	"github.com/cubetiqlabs/zro/pkg/gateway/balancer"
 )
 
 // Engine serves as the core reverse proxy gateway.

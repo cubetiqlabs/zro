@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cubis/zro/pkg/control/events"
+	"github.com/cubetiqlabs/zro/pkg/control/events"
 	"github.com/google/uuid"
 	"golang.org/x/net/websocket"
 )

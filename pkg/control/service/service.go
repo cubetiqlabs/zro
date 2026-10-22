@@ -15,14 +15,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cubis/zro/pkg/config"
-	controlauth "github.com/cubis/zro/pkg/control/auth"
-	"github.com/cubis/zro/pkg/control/delegation"
-	"github.com/cubis/zro/pkg/control/enroll"
-	"github.com/cubis/zro/pkg/control/events"
-	"github.com/cubis/zro/pkg/control/ipam"
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/store"
+	"github.com/cubetiqlabs/zro/pkg/config"
+	controlauth "github.com/cubetiqlabs/zro/pkg/control/auth"
+	"github.com/cubetiqlabs/zro/pkg/control/delegation"
+	"github.com/cubetiqlabs/zro/pkg/control/enroll"
+	"github.com/cubetiqlabs/zro/pkg/control/events"
+	"github.com/cubetiqlabs/zro/pkg/control/ipam"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/store"
 	"github.com/google/uuid"
 )
 

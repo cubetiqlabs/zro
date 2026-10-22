@@ -3,8 +3,8 @@ package agent
 import (
 	"log/slog"
 
-	controlauth "github.com/cubis/zro/pkg/control/auth"
-	"github.com/cubis/zro/pkg/identity"
+	controlauth "github.com/cubetiqlabs/zro/pkg/control/auth"
+	"github.com/cubetiqlabs/zro/pkg/identity"
 )
 
 // LoadToken restores the node token saved by a previous run, so the agent can

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubis/zro/pkg/config"
-	"github.com/cubis/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/config"
+	"github.com/cubetiqlabs/zro/pkg/core"
 	"github.com/google/uuid"
 )
 

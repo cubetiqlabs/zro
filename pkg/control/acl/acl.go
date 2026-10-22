@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cubis/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/core"
 )
 
 // Evaluator checks whether traffic between source and destination is allowed.

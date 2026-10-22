@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// Set at link time: -X github.com/cubis/zro/pkg/version.Version=v1.2.3
+// Set at link time: -X github.com/cubetiqlabs/zro/pkg/version.Version=v1.2.3
 var (
 	Version = "dev"
 	Commit  = ""

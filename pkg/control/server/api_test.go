@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cubis/zro/api/openapi"
+	"github.com/cubetiqlabs/zro/api/openapi"
 	"go.yaml.in/yaml/v3"
 )
 

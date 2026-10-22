@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	controlauth "github.com/cubis/zro/pkg/control/auth"
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/version"
+	controlauth "github.com/cubetiqlabs/zro/pkg/control/auth"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/version"
 )
 
 // handleLive is the liveness probe: the process is up and serving.

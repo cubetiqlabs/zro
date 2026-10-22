@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubis/zro/pkg/config"
-	"github.com/cubis/zro/pkg/control/events"
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/crypto"
-	"github.com/cubis/zro/pkg/store"
+	"github.com/cubetiqlabs/zro/pkg/config"
+	"github.com/cubetiqlabs/zro/pkg/control/events"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/store"
 	"github.com/google/uuid"
 	"golang.org/x/net/websocket"
 )

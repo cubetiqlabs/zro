@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubis/zro/pkg/crypto"
-	"github.com/cubis/zro/pkg/dataplane/derp"
-	"github.com/cubis/zro/pkg/dataplane/tun"
+	"github.com/cubetiqlabs/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/derp"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/tun"
 )
 
 type side struct {

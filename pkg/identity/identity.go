@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cubis/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/crypto"
 )
 
 // DefaultDir is where agents keep state when state_dir is not configured:

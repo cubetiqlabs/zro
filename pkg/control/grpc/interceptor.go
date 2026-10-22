@@ -3,7 +3,7 @@ package grpc
 import (
 	"context"
 
-	controlauth "github.com/cubis/zro/pkg/control/auth"
+	controlauth "github.com/cubetiqlabs/zro/pkg/control/auth"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

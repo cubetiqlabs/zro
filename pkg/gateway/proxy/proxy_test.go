@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubis/zro/pkg/gateway/balancer"
+	"github.com/cubetiqlabs/zro/pkg/gateway/balancer"
 )
 
 func TestReverseProxyEngine(t *testing.T) {

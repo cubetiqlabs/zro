@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/dataplane/wireguard"
-	"github.com/cubis/zro/pkg/realtime"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/wireguard"
+	"github.com/cubetiqlabs/zro/pkg/realtime"
 )
 
 const (

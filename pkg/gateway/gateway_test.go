@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/cubis/zro/pkg/config"
-	"github.com/cubis/zro/pkg/control/server"
+	"github.com/cubetiqlabs/zro/pkg/config"
+	"github.com/cubetiqlabs/zro/pkg/control/server"
 	"github.com/google/uuid"
 )
 

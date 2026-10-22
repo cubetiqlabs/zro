@@ -3,10 +3,10 @@ package agent
 import (
 	"testing"
 
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/crypto"
-	"github.com/cubis/zro/pkg/dataplane/tun"
-	"github.com/cubis/zro/pkg/dataplane/wireguard"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/tun"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/wireguard"
 )
 
 func TestConnectMovesTheOverlayPrefixToTheNewPoP(t *testing.T) {

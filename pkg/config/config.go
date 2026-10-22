@@ -2,7 +2,7 @@ package config
 
 import (
 	"fmt"
-	"github.com/cubis/zro/pkg/identity"
+	"github.com/cubetiqlabs/zro/pkg/identity"
 	"reflect"
 	"strings"
 	"time"

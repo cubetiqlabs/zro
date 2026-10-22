@@ -3,7 +3,7 @@ package acl
 import (
 	"testing"
 
-	"github.com/cubis/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/core"
 	"github.com/google/uuid"
 )
 

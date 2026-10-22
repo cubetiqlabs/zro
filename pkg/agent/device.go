@@ -6,10 +6,10 @@ import (
 	"net/netip"
 	"sync/atomic"
 
-	"github.com/cubis/zro/pkg/dataplane/netcfg"
-	"github.com/cubis/zro/pkg/dataplane/netstack"
-	"github.com/cubis/zro/pkg/dataplane/overlay"
-	"github.com/cubis/zro/pkg/dataplane/tun"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/netcfg"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/netstack"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/overlay"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/tun"
 )
 
 // ModeNetstack selects the unprivileged userspace stack; anything else uses a

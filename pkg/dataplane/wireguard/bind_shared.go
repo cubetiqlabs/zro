@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cubis/zro/pkg/dataplane/relay"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/relay"
 	"golang.zx2c4.com/wireguard/conn"
 )
 

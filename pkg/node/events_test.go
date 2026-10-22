@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubis/zro/pkg/config"
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/config"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/crypto"
 )
 
 func TestSyncPeersAddsNewMembersAndDropsDepartedOnes(t *testing.T) {

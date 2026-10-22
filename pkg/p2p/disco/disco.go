@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cubis/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/crypto"
 )
 
 // Disco message types

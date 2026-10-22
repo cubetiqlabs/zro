@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/crypto"
-	"github.com/cubis/zro/pkg/store"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/store"
 )
 
 func TestAuthorize(t *testing.T) {

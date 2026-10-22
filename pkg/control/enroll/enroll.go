@@ -8,8 +8,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/crypto"
 )
 
 // Typed failures; transports map them to HTTP/gRPC status codes.

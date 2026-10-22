@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubis/zro/pkg/control/events"
-	"github.com/cubis/zro/pkg/control/ws"
+	"github.com/cubetiqlabs/zro/pkg/control/events"
+	"github.com/cubetiqlabs/zro/pkg/control/ws"
 )
 
 type collector struct {

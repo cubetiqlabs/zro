@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"sync"
 
-	v1 "github.com/cubis/zro/api/proto/v1"
-	"github.com/cubis/zro/pkg/control/acl"
-	"github.com/cubis/zro/pkg/core"
+	v1 "github.com/cubetiqlabs/zro/api/proto/v1"
+	"github.com/cubetiqlabs/zro/pkg/control/acl"
+	"github.com/cubetiqlabs/zro/pkg/core"
 	"github.com/google/uuid"
 )
 

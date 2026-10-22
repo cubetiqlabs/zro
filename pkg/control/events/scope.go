@@ -4,7 +4,7 @@
 package events
 
 import (
-	"github.com/cubis/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/core"
 	"github.com/google/uuid"
 )
 

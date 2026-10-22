@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubis/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/crypto"
 )
 
 func TestDiscoPingPong(t *testing.T) {

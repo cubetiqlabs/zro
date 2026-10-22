@@ -6,9 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/dataplane/derp"
-	"github.com/cubis/zro/pkg/dataplane/wireguard"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/derp"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/wireguard"
 )
 
 // pathMode is how the node reaches its edge PoP.

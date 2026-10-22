@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubis/zro/pkg/config"
-	"github.com/cubis/zro/pkg/control/server"
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/dataplane/wireguard"
-	"github.com/cubis/zro/pkg/node"
+	"github.com/cubetiqlabs/zro/pkg/config"
+	"github.com/cubetiqlabs/zro/pkg/control/server"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/wireguard"
+	"github.com/cubetiqlabs/zro/pkg/node"
 )
 
 // TestIngressReachesLocalServiceOverWireGuard is the whole ingress path in one

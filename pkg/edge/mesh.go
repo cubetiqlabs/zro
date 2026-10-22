@@ -10,10 +10,10 @@ import (
 	"sort"
 	"time"
 
-	v1 "github.com/cubis/zro/api/proto/v1"
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/dataplane/netcfg"
-	"github.com/cubis/zro/pkg/dataplane/wireguard"
+	v1 "github.com/cubetiqlabs/zro/api/proto/v1"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/netcfg"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/wireguard"
 )
 
 // popKeepalive keeps a PoP-to-PoP backbone link up. Only one end may start with

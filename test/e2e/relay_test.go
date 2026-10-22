@@ -14,13 +14,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubis/zro/pkg/config"
-	"github.com/cubis/zro/pkg/control/server"
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/crypto"
-	"github.com/cubis/zro/pkg/edge"
-	"github.com/cubis/zro/pkg/node"
-	"github.com/cubis/zro/pkg/store"
+	"github.com/cubetiqlabs/zro/pkg/config"
+	"github.com/cubetiqlabs/zro/pkg/control/server"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/edge"
+	"github.com/cubetiqlabs/zro/pkg/node"
+	"github.com/cubetiqlabs/zro/pkg/store"
 )
 
 func freeUDPPort(t *testing.T) int {

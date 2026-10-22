@@ -10,8 +10,8 @@ import (
 	"os"
 	"strings"
 
-	v1 "github.com/cubis/zro/api/proto/v1"
-	"github.com/cubis/zro/pkg/config"
+	v1 "github.com/cubetiqlabs/zro/api/proto/v1"
+	"github.com/cubetiqlabs/zro/pkg/config"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"

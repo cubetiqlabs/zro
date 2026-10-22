@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	controlevents "github.com/cubis/zro/pkg/control/events"
-	"github.com/cubis/zro/pkg/control/service"
+	controlevents "github.com/cubetiqlabs/zro/pkg/control/events"
+	"github.com/cubetiqlabs/zro/pkg/control/service"
 	"github.com/google/uuid"
 )
 

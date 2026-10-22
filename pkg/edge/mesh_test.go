@@ -4,8 +4,8 @@ import (
 	"encoding/base64"
 	"testing"
 
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/dataplane/wireguard"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/wireguard"
 )
 
 func node(key, v4, home string, endpoints ...string) core.Node {

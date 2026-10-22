@@ -8,7 +8,7 @@ import (
 	"net"
 	"net/netip"
 
-	"github.com/cubis/zro/pkg/tunnel"
+	"github.com/cubetiqlabs/zro/pkg/tunnel"
 )
 
 // startSOCKS runs the optional SOCKS5 proxy. It only accepts loopback clients

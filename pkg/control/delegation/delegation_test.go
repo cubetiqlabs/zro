@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/store"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/store"
 	"github.com/google/uuid"
 )
 

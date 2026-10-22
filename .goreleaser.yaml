@@ -15,9 +15,9 @@ builds:
     flags: [-trimpath]
     ldflags:
       - -s -w
-      - -X github.com/cubis/zro/pkg/version.Version={{ .Version }}
-      - -X github.com/cubis/zro/pkg/version.Commit={{ .ShortCommit }}
-      - -X github.com/cubis/zro/pkg/version.Date={{ .Date }}
+      - -X github.com/cubetiqlabs/zro/pkg/version.Version={{ .Version }}
+      - -X github.com/cubetiqlabs/zro/pkg/version.Commit={{ .ShortCommit }}
+      - -X github.com/cubetiqlabs/zro/pkg/version.Date={{ .Date }}
 
 # zro_<version>_<os>_<arch>.tar.gz (zip on Windows); the installers and `zro update` rely on this name.
 archives:

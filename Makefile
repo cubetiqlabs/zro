@@ -2,7 +2,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT  ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null)
 DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-PKG      = github.com/cubis/zro/pkg/version
+PKG      = github.com/cubetiqlabs/zro/pkg/version
 LDFLAGS  = -s -w -X $(PKG).Version=$(VERSION) -X $(PKG).Commit=$(COMMIT) -X $(PKG).Date=$(DATE)
 
 .PHONY: help build build-sqlite test race vet fmt fmt-check vuln proto docker clean

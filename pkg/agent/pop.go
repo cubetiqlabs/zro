@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cubis/zro/pkg/core"
-	"github.com/cubis/zro/pkg/dataplane/netcfg"
-	"github.com/cubis/zro/pkg/dataplane/wireguard"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/netcfg"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/wireguard"
 )
 
 const popKeepalive = 25 * time.Second

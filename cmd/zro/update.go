@@ -6,9 +6,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/cubis/zro/pkg/identity"
-	"github.com/cubis/zro/pkg/update"
-	"github.com/cubis/zro/pkg/version"
+	"github.com/cubetiqlabs/zro/pkg/identity"
+	"github.com/cubetiqlabs/zro/pkg/update"
+	"github.com/cubetiqlabs/zro/pkg/version"
 	"github.com/spf13/cobra"
 )
 

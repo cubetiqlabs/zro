@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/cubis/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/core"
 	"github.com/google/uuid"
 )
 
