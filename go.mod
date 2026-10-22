@@ -1,6 +1,6 @@
 module github.com/cubis/zro
 
-go 1.27.1
+go 1.27.2
 
 require (
 	github.com/google/uuid v1.6.0
@@ -16,13 +16,13 @@ require (
 	gorm.io/driver/postgres v1.6.3
 	gorm.io/driver/sqlite v1.6.0
 	gorm.io/gorm v1.31.2
-	gvisor.dev/gvisor v0.0.0-20250503011706-39ed1f5ac29c
+	gvisor.dev/gvisor v0.0.0-20261022012034-6d278f8fc31c
 )
 
 require (
 	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
-	github.com/google/btree v1.1.2 // indirect
+	github.com/google/btree v1.1.3 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
@@ -42,9 +42,10 @@ require (
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
-	golang.org/x/time v0.7.0 // indirect
+	golang.org/x/time v0.16.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20261019180522-ce908d29299b // indirect
 )
