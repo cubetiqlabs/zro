@@ -181,7 +181,7 @@ type Tunnel struct {
 	Name           string    `gorm:"size:100;not null" json:"name"`
 	LocalAddress   string    `gorm:"size:100;not null" json:"local_address"` // e.g. "127.0.0.1:8080"
 	PublicHostname string    `gorm:"size:255;index" json:"public_hostname"`  // e.g. "api.cubis.tech"
-	Protocol       string    `gorm:"size:20;default:'http'" json:"protocol"` // "http", "tcp", "grpc"
+	Protocol       string    `gorm:"size:20;default:'http'" json:"protocol"` // only "http" is served by the gateway
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }

@@ -493,7 +493,7 @@ func TestFullMeshSmoke(t *testing.T) {
 	_ = gwDaemon1.Stop()
 
 	// 12. Smoke Step 11: Universal Tunneling (SOCKS5 & UDP Datagram Tunneling)
-	socksSrv := tunnel.NewSOCKS5Server(nil)
+	socksSrv := tunnel.NewSOCKS5Server((&net.Dialer{}).DialContext)
 	socksL, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("smoke: failed to bind SOCKS5 listener: %v", err)

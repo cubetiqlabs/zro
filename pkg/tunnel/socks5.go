@@ -8,27 +8,43 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"sync"
+	"time"
 )
 
 // SOCKS5Server implements an RFC 1928 SOCKS5 proxy server allowing any application
 // to route arbitrary TCP/HTTP/HTTPS/SSH traffic through the ZRO overlay network.
 type SOCKS5Server struct {
+	mu       sync.Mutex
 	listener net.Listener
+	closed   bool
 	dialer   func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
-// NewSOCKS5Server creates a SOCKS5 server with an optional custom overlay dialer.
+// NewSOCKS5Server creates a SOCKS5 server that opens every connection with
+// dialer. The dialer decides what is reachable; there is deliberately no
+// default, because a default of "the host network" would make this an open proxy.
 func NewSOCKS5Server(dialer func(ctx context.Context, network, addr string) (net.Conn, error)) *SOCKS5Server {
 	if dialer == nil {
-		var stdDialer net.Dialer
-		dialer = stdDialer.DialContext
+		panic("tunnel: NewSOCKS5Server requires a dialer")
 	}
 	return &SOCKS5Server{dialer: dialer}
 }
 
+const (
+	socksHandshakeTimeout = 10 * time.Second
+	socksDialTimeout      = 10 * time.Second
+)
+
 // Serve accepts incoming connections on listener l.
 func (s *SOCKS5Server) Serve(l net.Listener) error {
+	s.mu.Lock()
+	if s.closed { // Close won the race with Serve
+		s.mu.Unlock()
+		return l.Close()
+	}
 	s.listener = l
+	s.mu.Unlock()
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -50,14 +66,20 @@ func (s *SOCKS5Server) ListenAndServe(listenAddr string) error {
 
 // Close stops the SOCKS5 server.
 func (s *SOCKS5Server) Close() error {
-	if s.listener != nil {
-		return s.listener.Close()
+	s.mu.Lock()
+	s.closed = true
+	l := s.listener
+	s.mu.Unlock()
+	if l != nil {
+		return l.Close()
 	}
 	return nil
 }
 
 func (s *SOCKS5Server) handleClient(conn net.Conn) {
 	defer conn.Close()
+	// A client that stalls mid-handshake must not hold the connection forever.
+	_ = conn.SetDeadline(time.Now().Add(socksHandshakeTimeout))
 
 	// 1. Version & Method negotiation
 	// [VER: 1B (0x05)][NMETHODS: 1B][METHODS: NB]
@@ -135,7 +157,9 @@ func (s *SOCKS5Server) handleClient(conn net.Conn) {
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(int(port)))
 
 	// 3. Dial target destination via overlay dialer
-	destConn, err := s.dialer(context.Background(), "tcp", targetAddr)
+	dialCtx, cancel := context.WithTimeout(context.Background(), socksDialTimeout)
+	destConn, err := s.dialer(dialCtx, "tcp", targetAddr)
+	cancel()
 	if err != nil {
 		_ = s.sendReply(conn, 0x04) // host unreachable
 		return
@@ -147,18 +171,9 @@ func (s *SOCKS5Server) handleClient(conn net.Conn) {
 		return
 	}
 
-	// 5. Bidirectional copy
-	errCh := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(destConn, conn)
-		errCh <- err
-	}()
-	go func() {
-		_, err := io.Copy(conn, destConn)
-		errCh <- err
-	}()
-
-	<-errCh
+	// 5. Bidirectional copy (no deadline once the tunnel is established)
+	_ = conn.SetDeadline(time.Time{})
+	_ = bridge(conn, destConn, context.Background())
 }
 
 func (s *SOCKS5Server) sendReply(conn net.Conn, rep byte) error {

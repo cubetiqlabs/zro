@@ -53,6 +53,7 @@ type Daemon struct {
 	udpConn         *net.UDPConn
 	discoEngine     *disco.Engine
 	relay           *relayState
+	socks           *tunnel.SOCKS5Server
 	tunnelClient    *tunnel.Client
 	httpClient      *http.Client
 	token           controlauth.TokenHolder // bearer token issued at enrollment
@@ -113,6 +114,7 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 		punchWaiters: make(map[string]chan struct{}),
 	}
 
+	agent.LoadToken(cfg.StateDir, "node.token", &d.token)
 	d.httpClient = &http.Client{
 		Timeout:   10 * time.Second,
 		Transport: controlauth.NewBearerTransport(nil, cfg.PlaneEndpoint, d.token.Get),
@@ -286,6 +288,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		return fmt.Errorf("enrolled into network %s but network_id is configured as %s; check the enrollment token", enrollResp.NetworkID, d.cfg.NetworkID)
 	}
 	d.token.Set(enrollResp.NodeToken)
+	agent.SaveToken(d.cfg.StateDir, "node.token", enrollResp.NodeToken)
 	d.policy.setRules(enrollResp.ACLRules)
 	d.overlayPrefixes = core.OverlayPrefixes(enrollResp.IPv4CIDR, enrollResp.IPv6CIDR)
 	d.nodeID = enrollResp.NodeID
@@ -323,6 +326,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}
 
 	// 6. Launch background workers (latency probes & local tunnels)
+	if d.cfg.SOCKSListen != "" {
+		if err := d.startSOCKS(); err != nil {
+			return err
+		}
+	}
+
 	d.wg.Add(4)
 	go d.relayWorker(ctx)
 	go d.probeWorker(ctx)
@@ -583,6 +592,9 @@ func (d *Daemon) Stop() error {
 	}
 	if d.grpcClient != nil {
 		_ = d.grpcClient.Close()
+	}
+	if d.socks != nil {
+		_ = d.socks.Close()
 	}
 	d.wg.Wait()
 	return nil

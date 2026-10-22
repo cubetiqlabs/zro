@@ -13,6 +13,7 @@ import (
 	"github.com/cubis/zro/pkg/agent"
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/dataplane/wireguard"
+	"github.com/google/uuid"
 )
 
 // ListenMesh accepts overlay TCP connections on port. Connections the
@@ -177,3 +178,6 @@ func (d *Daemon) PeerHandshaken(publicKey string) bool {
 	at, err := d.wgManager.LastHandshake(publicKey)
 	return err == nil && !at.IsZero()
 }
+
+// NodeID is the identity the plane assigned at enrollment.
+func (d *Daemon) NodeID() uuid.UUID { return d.nodeID }

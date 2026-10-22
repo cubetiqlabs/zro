@@ -908,3 +908,129 @@ func TestEdgePoPClaimAndPerPoPCredentials(t *testing.T) {
 		t.Fatalf("the old credential must be dead after a reset, got %d", code)
 	}
 }
+
+func TestManagementEndpointsAreTenantScoped(t *testing.T) {
+	db, err := store.NewDB("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const secret = "mgmt-secret"
+	srv := NewServer(&config.ControlPlaneConfig{SecretKey: secret, AdminAPIKey: "admin", RequireAuth: true, DefaultCIDRv4: "100.64.0.0/16", DefaultCIDRv6: "fd00:cafe::/64"}, db)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	do := func(method, path, bearer string, body any) (int, []byte) {
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest(method, ts.URL+path, bytes.NewReader(b))
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(resp.Body)
+		return resp.StatusCode, buf.Bytes()
+	}
+	mk := func(slug string) (string, string) {
+		_, body := do("POST", "/api/v1/tenants", "admin", map[string]string{"name": slug, "slug": slug})
+		var tr tenantResponse
+		_ = json.Unmarshal(body, &tr)
+		_, nb := do("POST", "/api/v1/networks", tr.APIKey, CreateNetworkRequest{Name: slug})
+		var n core.Network
+		_ = json.Unmarshal(nb, &n)
+		return tr.APIKey, n.ID
+	}
+	keyA, netA := mk("alpha")
+	keyB, netB := mk("beta")
+
+	// Update: owner only; addressing stays immutable.
+	if code, _ := do("PATCH", "/api/v1/networks/"+netA, keyB, map[string]string{"name": "hijack"}); code != http.StatusNotFound {
+		t.Fatalf("updating another tenant's network: %d", code)
+	}
+	if code, body := do("PATCH", "/api/v1/networks/"+netA, keyA, map[string]any{"name": "renamed", "dns_domain": "A.Corp.Internal", "ipv4_cidr": "10.0.0.0/8"}); code != http.StatusOK || !bytes.Contains(body, []byte(`"name":"renamed"`)) || bytes.Contains(body, []byte("10.0.0.0/8")) {
+		t.Fatalf("owner update: %d %s", code, body)
+	}
+	if code, _ := do("PATCH", "/api/v1/networks/"+netA, keyA, map[string]string{"dns_domain": "not a domain!"}); code != http.StatusBadRequest {
+		t.Fatalf("bad dns_domain: %d", code)
+	}
+
+	// Nodes: list and remove, scoped to the owner.
+	kp, _ := crypto.GenerateKeyPair()
+	tok := crypto.GenerateEnrollmentToken(secret, netA, "n1", time.Hour, kp.PublicKey)
+	code, body := do("POST", "/api/v1/enroll", "", EnrollRequest{Token: tok, PublicKey: kp.PublicKey, Hostname: "n1"})
+	var enrolled EnrollResponse
+	_ = json.Unmarshal(body, &enrolled)
+	if code != http.StatusOK {
+		t.Fatalf("enroll: %d %s", code, body)
+	}
+	if code, _ := do("GET", "/api/v1/nodes?network_id="+netA, keyB, nil); code != http.StatusNotFound {
+		t.Fatalf("listing another tenant's nodes: %d", code)
+	}
+	var nodes []core.Node
+	_, body = do("GET", "/api/v1/nodes?network_id="+netA, keyA, nil)
+	_ = json.Unmarshal(body, &nodes)
+	if len(nodes) != 1 {
+		t.Fatalf("expected one node, got %d", len(nodes))
+	}
+	if code, _ := do("DELETE", "/api/v1/nodes/"+enrolled.NodeID.String(), keyB, nil); code != http.StatusNotFound {
+		t.Fatalf("deleting another tenant's node: %d", code)
+	}
+
+	// A network with members cannot be deleted; an empty one can.
+	if code, _ := do("DELETE", "/api/v1/networks/"+netA, keyA, nil); code != http.StatusConflict {
+		t.Fatalf("deleting a non-empty network: %d", code)
+	}
+	if code, _ := do("DELETE", "/api/v1/nodes/"+enrolled.NodeID.String(), keyA, nil); code != http.StatusNoContent {
+		t.Fatalf("owner removing its node: %d", code)
+	}
+	if code, _ := do("DELETE", "/api/v1/networks/"+netA, keyA, nil); code != http.StatusNoContent {
+		t.Fatalf("deleting an empty network: %d", code)
+	}
+	if code, _ := do("DELETE", "/api/v1/networks/"+netB, keyA, nil); code != http.StatusNotFound {
+		t.Fatalf("deleting another tenant's network: %d", code)
+	}
+
+	// PoP removal is admin-only.
+	_, _ = do("POST", "/api/v1/edge/register", "", nil) // (unauthenticated; ignored)
+	_ = db.EdgePoPs.Create(context.Background(), &core.EdgePoP{ID: uuid.New(), PoPCode: "ZZ", Region: "r", PublicEndpoint: "1.1.1.1:1", PublicKey: kp.PublicKey})
+	if code, _ := do("DELETE", "/api/v1/pops/ZZ", keyA, nil); code != http.StatusUnauthorized {
+		t.Fatalf("tenant removing a PoP: %d", code)
+	}
+	if code, _ := do("DELETE", "/api/v1/pops/ZZ", "admin", nil); code != http.StatusNoContent {
+		t.Fatalf("admin removing a PoP: %d", code)
+	}
+}
+
+func TestAnonymousModeNeverActsAsARealTenant(t *testing.T) {
+	db, err := store.NewDB("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// require_auth is off (the default), but a real tenant already exists.
+	srv := NewServer(&config.ControlPlaneConfig{SecretKey: "s", AdminAPIKey: "admin"}, db)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	req, _ := http.NewRequest("POST", ts.URL+"/api/v1/tenants", strings.NewReader(`{"name":"acme","slug":"acme"}`))
+	req.Header.Set("Authorization", "Bearer admin")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create tenant: %v", err)
+	}
+	resp.Body.Close()
+
+	for _, path := range []string{"/api/v1/networks", "/api/v1/mesh/graph", "/api/v1/nodes?network_id=x"} {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("anonymous %s must be refused once real tenants exist, got %d", path, resp.StatusCode)
+		}
+	}
+	if resp, _ := http.Get(ts.URL + "/api/v1/events"); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("anonymous event stream must be refused, got %d", resp.StatusCode)
+	}
+}

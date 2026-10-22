@@ -79,7 +79,7 @@ func TestSOCKS5TunnelRoundtrip(t *testing.T) {
 	}()
 
 	// 2. Start SOCKS5 Server
-	socksServer := NewSOCKS5Server(nil)
+	socksServer := NewSOCKS5Server((&net.Dialer{}).DialContext)
 	socksListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to bind socks5 listener: %v", err)

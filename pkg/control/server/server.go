@@ -258,10 +258,22 @@ func withEdgePoP(ctx context.Context, popCode string) context.Context {
 	return context.WithValue(ctx, edgeContextKey, true)
 }
 
+// devTenantSlug identifies the throwaway tenant used by unauthenticated development mode.
+const devTenantSlug = "default-org"
+
+// defaultTenant returns the tenant anonymous callers act as when require_auth
+// is off. It is a dedicated dev tenant, created only on an empty database. It is
+// never an arbitrary real tenant: once real tenants exist and no dev tenant does,
+// it returns nil and anonymous requests are refused.
 func (s *Server) defaultTenant(ctx context.Context) *core.Tenant {
 	tenants, _ := s.db.Tenants.List(ctx)
+	for i := range tenants {
+		if tenants[i].Slug == devTenantSlug {
+			return &tenants[i]
+		}
+	}
 	if len(tenants) > 0 {
-		return &tenants[0]
+		return nil
 	}
 
 	key, _, err := controlauth.GenerateToken("zro_key_")
@@ -271,7 +283,7 @@ func (s *Server) defaultTenant(ctx context.Context) *core.Tenant {
 	defaultTenant := &core.Tenant{
 		ID:        uuid.New(),
 		Name:      "Default Organization",
-		Slug:      "default-org",
+		Slug:      devTenantSlug,
 		APIKey:    key,
 		IsActive:  true,
 		CreatedAt: time.Now(),
@@ -302,8 +314,12 @@ func (s *Server) tenantAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// Permissive / dev mode: bind to default tenant.
+		// Permissive / dev mode: bind to the dev tenant, never to a real one.
 		tenant := s.defaultTenant(r.Context())
+		if tenant == nil {
+			http.Error(w, `{"error":"unauthorized: API key required (anonymous access is only available before any tenant exists)"}`, http.StatusUnauthorized)
+			return
+		}
 		next(w, r.WithContext(withTenant(r.Context(), tenant)))
 	}
 }
@@ -364,7 +380,11 @@ func (s *Server) authenticateStream(r *http.Request) (context.Context, string) {
 	if s.cfg.RequireAuth {
 		return nil, "unauthorized: stream credentials required"
 	}
-	return withTenant(ctx, s.defaultTenant(ctx)), ""
+	tenant := s.defaultTenant(ctx)
+	if tenant == nil {
+		return nil, "unauthorized: stream credentials required"
+	}
+	return withTenant(ctx, tenant), ""
 }
 
 // streamAuthMiddleware authenticates streaming endpoints; handlers then apply
@@ -536,6 +556,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 
 	// Network Management (ZeroTier-styled 16-hex Network ID)
+	s.mux.HandleFunc("PATCH /api/v1/networks/{id}", s.tenantAuthMiddleware(s.handleUpdateNetwork))
+	s.mux.HandleFunc("DELETE /api/v1/networks/{id}", s.tenantAuthMiddleware(s.handleDeleteNetwork))
+	s.mux.HandleFunc("GET /api/v1/nodes", s.tenantAuthMiddleware(s.handleListNodes))
+	s.mux.HandleFunc("DELETE /api/v1/nodes/{id}", s.tenantAuthMiddleware(s.handleDeleteNode))
+	s.mux.HandleFunc("DELETE /api/v1/pops/{code}", s.adminAuthMiddleware(s.handleDeletePoP))
 	s.mux.HandleFunc("POST /api/v1/networks", s.tenantAuthMiddleware(s.handleCreateNetwork))
 	s.mux.HandleFunc("GET /api/v1/networks", s.tenantAuthMiddleware(s.handleListNetworks))
 
@@ -625,13 +650,7 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 
 	netID := core.GenerateNetworkID() // ZeroTier-style 16-hex character ID
 
-	tenant := TenantFromContext(r.Context())
-	var tenantID uuid.UUID
-	if tenant != nil {
-		tenantID = tenant.ID
-	} else {
-		tenantID = s.defaultTenant(r.Context()).ID
-	}
+	tenantID := TenantFromContext(r.Context()).ID // set by tenantAuthMiddleware
 
 	network := &core.Network{
 		ID:        netID,
@@ -660,11 +679,7 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListNetworks(w http.ResponseWriter, r *http.Request) {
-	tenant := TenantFromContext(r.Context())
-	if tenant == nil {
-		tenant = s.defaultTenant(r.Context())
-	}
-	tenantID := tenant.ID
+	tenantID := TenantFromContext(r.Context()).ID // set by tenantAuthMiddleware
 
 	networks, err := s.db.Networks.ListByTenantID(r.Context(), tenantID)
 	if err != nil {
@@ -999,6 +1014,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+	req.CurrentToken = controlauth.NodeToken(r)
 	resp, err := s.svc.Enroll(r.Context(), req)
 	if err != nil {
 		writeServiceError(w, err)
