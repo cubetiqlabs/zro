@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"log/slog"
 	"net"
 	"regexp"
 	"strconv"
@@ -376,10 +377,40 @@ func (s *Service) ReportProbe(ctx context.Context, node *core.Node, sample core.
 	sample.NodeID = node.ID // never trust a caller-supplied node ID
 	sample.Timestamp = time.Now()
 	s.delegator.RecordProbe(sample)
-	if res, err := s.delegator.Delegate(ctx, node.ID); err == nil && res != nil {
-		return res.PrimaryPoP.PoPCode
+	res, err := s.delegator.Delegate(ctx, node.ID)
+	if err != nil || res == nil {
+		return ""
 	}
-	return ""
+	s.rehome(ctx, node, res.PrimaryPoP)
+	return res.PrimaryPoP.PoPCode
+}
+
+// rehome moves node's home to pop when delegation prefers another PoP (its
+// home went unhealthy or its probes degraded), so edges stop routing to the
+// old home. ponytail: no explicit hysteresis; the node only probes its home
+// and unprobed PoPs score 500ms, so a healthy home is never displaced.
+func (s *Service) rehome(ctx context.Context, node *core.Node, pop core.EdgePoP) {
+	if node.AssignedPoPID != nil && *node.AssignedPoPID == pop.ID {
+		return
+	}
+	old := ""
+	if node.AssignedPoP != nil {
+		old = node.AssignedPoP.PoPCode
+	}
+	node.AssignedPoPID = &pop.ID
+	node.AssignedPoP = &pop
+	if err := s.db.Nodes.Update(ctx, node); err != nil {
+		slog.Warn("failed to re-home node", "node", node.ID, "error", err)
+		return
+	}
+	scope := events.Scope{}
+	if network, err := s.db.Networks.GetByID(ctx, node.NetworkID); err == nil && network != nil {
+		scope = events.OfNetwork(network)
+	}
+	s.publish(scope, "node_rehomed", map[string]any{
+		"network_id": node.NetworkID, "node_id": node.ID, "from_pop": old, "to_pop": pop.PoPCode,
+	})
+	s.publish(scope, "mesh_graph_updated", map[string]any{"network_id": node.NetworkID})
 }
 
 // --- P2P discovery ------------------------------------------------------
