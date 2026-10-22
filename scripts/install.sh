@@ -1,11 +1,11 @@
 #!/bin/sh
 # Install the zro CLI on Linux or macOS.
-#   curl -fsSL https://raw.githubusercontent.com/sombochea/zro/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/cubetiqlabs/zro/main/scripts/install.sh | sh
 # Environment: ZRO_VERSION (e.g. v0.1.0, default: latest), ZRO_INSTALL_DIR
 # (default: /usr/local/bin if writable, else ~/.local/bin).
 set -eu
 
-REPO="sombochea/zro"
+REPO="cubetiqlabs/zro"
 BASE="${ZRO_DOWNLOAD_BASE:-https://github.com/$REPO/releases}"
 
 die() { echo "install: $*" >&2; exit 1; }

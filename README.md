@@ -18,7 +18,7 @@ Enterprise-grade global networking fabric and virtual ether-switch built in Go. 
 ### 1. Install (or build)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sombochea/zro/main/scripts/install.sh | sh   # Windows & Docker: docs/install.md
+curl -fsSL https://raw.githubusercontent.com/cubetiqlabs/zro/main/scripts/install.sh | sh   # Windows & Docker: docs/install.md
 ```
 
 From source:

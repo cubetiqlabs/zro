@@ -23,7 +23,7 @@ info:
       and gateway endpoints are documented for integrators and for completeness.
   license:
     name: See repository
-    url: https://github.com/sombochea/zro
+    url: https://github.com/cubetiqlabs/zro
 servers:
   - url: http://localhost:8080
     description: Local plane (default `listen_addr`)

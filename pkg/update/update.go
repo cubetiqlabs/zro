@@ -25,7 +25,7 @@ import (
 )
 
 // Repo is the GitHub repository releases are read from.
-const Repo = "sombochea/zro"
+const Repo = "cubetiqlabs/zro"
 
 // APIBase is the GitHub API root (a variable so tests can point it elsewhere).
 var APIBase = "https://api.github.com"

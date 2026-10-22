@@ -41,6 +41,6 @@ changelog:
 
 release:
   github:
-    owner: sombochea
+    owner: cubetiqlabs
     name: zro
   prerelease: auto

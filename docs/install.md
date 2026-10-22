@@ -1,13 +1,13 @@
 # Installing the zro CLI
 
 Prebuilt binaries for Linux, macOS and Windows (amd64 and arm64) are published on the
-[Releases page](https://github.com/sombochea/zro/releases). Each release carries a
+[Releases page](https://github.com/cubetiqlabs/zro/releases). Each release carries a
 `checksums.txt` that the installers and `zro update` verify before installing anything.
 
 ## Linux and macOS
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sombochea/zro/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/cubetiqlabs/zro/main/scripts/install.sh | sh
 ```
 
 Installs to `/usr/local/bin` if writable, otherwise `~/.local/bin`. Options (environment):
@@ -20,7 +20,7 @@ Installs to `/usr/local/bin` if writable, otherwise `~/.local/bin`. Options (env
 ## Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/sombochea/zro/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/cubetiqlabs/zro/main/scripts/install.ps1 | iex
 ```
 
 Installs `zro.exe` to `%LOCALAPPDATA%\zro` and adds it to your user `PATH`. Same
@@ -29,8 +29,8 @@ Installs `zro.exe` to `%LOCALAPPDATA%\zro` and adds it to your user `PATH`. Same
 ## Docker
 
 ```bash
-docker pull ghcr.io/sombochea/zro:latest        # or :0.1.0 / :0.1
-docker run --rm ghcr.io/sombochea/zro version
+docker pull ghcr.io/cubetiqlabs/zro:latest        # or :0.1.0 / :0.1
+docker run --rm ghcr.io/cubetiqlabs/zro version
 ```
 
 The image is multi-arch (amd64, arm64). See [deployment.md](deployment.md) for running the plane, edges and gateways.
