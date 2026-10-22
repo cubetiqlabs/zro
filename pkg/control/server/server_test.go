@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -354,8 +355,9 @@ func TestMeshGraphAndEdgeHeartbeatsAndACLs(t *testing.T) {
 	listAclReq := httptest.NewRequest("GET", "/api/v1/acl/rules?network_id="+createdNet.ID, nil)
 	listAclRec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(listAclRec, listAclReq)
-	var rules []core.ACLRule
-	_ = json.NewDecoder(listAclRec.Body).Decode(&rules)
+	var rulePage Page[core.ACLRule]
+	_ = json.NewDecoder(listAclRec.Body).Decode(&rulePage)
+	rules := rulePage.Items
 	if len(rules) != 1 || rules[0].Ports != "5432" {
 		t.Fatalf("expected 1 ACL rule on port 5432, got %v", rules)
 	}
@@ -523,12 +525,12 @@ func TestServerAuthAndTenantIsolation(t *testing.T) {
 	reqListB, _ := http.NewRequest("GET", ts.URL+"/api/v1/networks", nil)
 	reqListB.Header.Set("X-API-Key", "key_beta_67890")
 	rListB, _ := http.DefaultClient.Do(reqListB)
-	var netsB []core.Network
+	var netsB Page[core.Network]
 	_ = json.NewDecoder(rListB.Body).Decode(&netsB)
 	_ = rListB.Body.Close()
 
-	if len(netsB) != 0 {
-		t.Fatalf("Tenant Beta should see 0 networks, got %d", len(netsB))
+	if len(netsB.Items) != 0 {
+		t.Fatalf("Tenant Beta should see 0 networks, got %d", len(netsB.Items))
 	}
 
 	// Case 5: Tenant Beta attempts to create an ACL rule on Tenant Alpha's network -> MUST RETURN 403 Forbidden
@@ -967,9 +969,10 @@ func TestManagementEndpointsAreTenantScoped(t *testing.T) {
 	if code, _ := do("GET", "/api/v1/nodes?network_id="+netA, keyB, nil); code != http.StatusNotFound {
 		t.Fatalf("listing another tenant's nodes: %d", code)
 	}
-	var nodes []core.Node
+	var nodePage Page[core.Node]
 	_, body = do("GET", "/api/v1/nodes?network_id="+netA, keyA, nil)
-	_ = json.Unmarshal(body, &nodes)
+	_ = json.Unmarshal(body, &nodePage)
+	nodes := nodePage.Items
 	if len(nodes) != 1 {
 		t.Fatalf("expected one node, got %d", len(nodes))
 	}
@@ -1032,5 +1035,88 @@ func TestAnonymousModeNeverActsAsARealTenant(t *testing.T) {
 	}
 	if resp, _ := http.Get(ts.URL + "/api/v1/events"); resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("anonymous event stream must be refused, got %d", resp.StatusCode)
+	}
+}
+
+func TestAPIContract(t *testing.T) {
+	db, err := store.NewDB("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(&config.ControlPlaneConfig{SecretKey: "contract", AdminAPIKey: "admin", RequireAuth: true, DefaultCIDRv4: "100.64.0.0/16", DefaultCIDRv6: "fd00:cafe::/64"}, db)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	do := func(method, path, bearer string, body any) (*http.Response, []byte) {
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest(method, ts.URL+path, bytes.NewReader(b))
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		req.Header.Set("X-Request-ID", "req-123")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(resp.Body)
+		return resp, buf.Bytes()
+	}
+	tenant := func(slug string) string {
+		_, body := do("POST", "/api/v1/tenants", "admin", map[string]string{"name": slug, "slug": slug})
+		var tr tenantResponse
+		_ = json.Unmarshal(body, &tr)
+		return tr.APIKey
+	}
+	keyA, keyB := tenant("alpha"), tenant("beta")
+
+	// Errors share one JSON envelope and echo the request ID.
+	resp, body := do("GET", "/api/v1/networks", "wrong", nil)
+	var e errorBody
+	if err := json.Unmarshal(body, &e); err != nil || resp.StatusCode != 401 || e.Error.Code != "unauthorized" ||
+		e.Error.Message == "" || e.Error.RequestID != "req-123" || resp.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("error envelope: %d %s (%v)", resp.StatusCode, body, err)
+	}
+
+	// Lists are paginated with an opaque cursor, and walking them yields every item once.
+	var ids []string
+	for i := 0; i < 3; i++ {
+		_, nb := do("POST", "/api/v1/networks", keyA, CreateNetworkRequest{Name: "n" + strconv.Itoa(i)})
+		var n core.Network
+		_ = json.Unmarshal(nb, &n)
+		ids = append(ids, n.ID)
+	}
+	seen, cursor := map[string]bool{}, ""
+	for pages := 0; pages < 5; pages++ {
+		_, pb := do("GET", "/api/v1/networks?limit=2&cursor="+cursor, keyA, nil)
+		var pg Page[core.Network]
+		if err := json.Unmarshal(pb, &pg); err != nil || len(pg.Items) > 2 {
+			t.Fatalf("page: %s (%v)", pb, err)
+		}
+		for _, n := range pg.Items {
+			seen[n.ID] = true
+		}
+		if cursor = pg.NextCursor; cursor == "" {
+			break
+		}
+	}
+	if len(seen) != 3 {
+		t.Fatalf("pagination lost or repeated items: %v", seen)
+	}
+	if resp, _ := do("GET", "/api/v1/networks?limit=0", keyA, nil); resp.StatusCode != 400 {
+		t.Fatalf("limit=0: %d", resp.StatusCode)
+	}
+	if resp, _ := do("GET", "/api/v1/networks?cursor=!!", keyA, nil); resp.StatusCode != 400 {
+		t.Fatalf("bad cursor: %d", resp.StatusCode)
+	}
+
+	// Get-by-ID is tenant-scoped: another tenant's resource looks missing.
+	if resp, _ := do("GET", "/api/v1/networks/"+ids[0], keyA, nil); resp.StatusCode != 200 {
+		t.Fatalf("owner get: %d", resp.StatusCode)
+	}
+	if resp, _ := do("GET", "/api/v1/networks/"+ids[0], keyB, nil); resp.StatusCode != 404 {
+		t.Fatalf("cross-tenant get: %d", resp.StatusCode)
+	}
+	if resp, body := do("GET", "/api/v1/tenants/"+uuid.New().String(), "admin", nil); resp.StatusCode != 404 || bytes.Contains(body, []byte("zro_key_")) {
+		t.Fatalf("missing tenant: %d %s", resp.StatusCode, body)
 	}
 }

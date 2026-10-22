@@ -119,7 +119,7 @@ func (s *Server) Start() error {
 
 	s.httpServer = &http.Server{
 		Addr:         s.cfg.ListenAddr,
-		Handler:      s.mux,
+		Handler:      s.Handler(),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 	}
@@ -204,7 +204,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 // Handler returns the HTTP handler (useful for testing).
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return withRequestID(s.mux)
 }
 
 type contextKey string
@@ -301,7 +301,7 @@ func (s *Server) tenantAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		if apiKey != "" {
 			tenant, err := s.db.Tenants.GetByAPIKey(r.Context(), apiKey)
 			if err != nil || tenant == nil || !tenant.IsActive {
-				http.Error(w, `{"error":"unauthorized: invalid or inactive API key"}`, http.StatusUnauthorized)
+				apiError(w, "unauthorized: invalid or inactive API key", http.StatusUnauthorized)
 				return
 			}
 			next(w, r.WithContext(withTenant(r.Context(), tenant)))
@@ -310,14 +310,14 @@ func (s *Server) tenantAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 		// When no API key is provided:
 		if s.cfg.RequireAuth {
-			http.Error(w, `{"error":"unauthorized: API key required in Authorization or X-API-Key header"}`, http.StatusUnauthorized)
+			apiError(w, "unauthorized: API key required in Authorization or X-API-Key header", http.StatusUnauthorized)
 			return
 		}
 
 		// Permissive / dev mode: bind to the dev tenant, never to a real one.
 		tenant := s.defaultTenant(r.Context())
 		if tenant == nil {
-			http.Error(w, `{"error":"unauthorized: API key required (anonymous access is only available before any tenant exists)"}`, http.StatusUnauthorized)
+			apiError(w, "unauthorized: API key required (anonymous access is only available before any tenant exists)", http.StatusUnauthorized)
 			return
 		}
 		next(w, r.WithContext(withTenant(r.Context(), tenant)))
@@ -330,12 +330,12 @@ func (s *Server) nodeAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := controlauth.NodeToken(r)
 		if token == "" {
-			http.Error(w, `{"error":"unauthorized: node token required"}`, http.StatusUnauthorized)
+			apiError(w, "unauthorized: node token required", http.StatusUnauthorized)
 			return
 		}
 		node, err := s.db.Nodes.GetByTokenHash(r.Context(), controlauth.HashToken(token))
 		if err != nil || node == nil || !node.IsActive {
-			http.Error(w, `{"error":"unauthorized: invalid or inactive node token"}`, http.StatusUnauthorized)
+			apiError(w, "unauthorized: invalid or inactive node token", http.StatusUnauthorized)
 			return
 		}
 		s.svc.Touch(r.Context(), node)
@@ -393,7 +393,7 @@ func (s *Server) streamAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, msg := s.authenticateStream(r)
 		if msg != "" {
-			http.Error(w, `{"error":"`+msg+`"}`, http.StatusUnauthorized)
+			apiError(w, msg, http.StatusUnauthorized)
 			return
 		}
 		next(w, r.WithContext(ctx))
@@ -502,11 +502,11 @@ func (s *Server) edgeAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 				next(w, r.WithContext(ctx))
 				return
 			}
-			http.Error(w, `{"error":"unauthorized: invalid edge credential"}`, http.StatusUnauthorized)
+			apiError(w, "unauthorized: invalid edge credential", http.StatusUnauthorized)
 			return
 		}
 		if !s.edgeOpen() {
-			http.Error(w, `{"error":"unauthorized: edge credential required"}`, http.StatusUnauthorized)
+			apiError(w, "unauthorized: edge credential required", http.StatusUnauthorized)
 			return
 		}
 		next(w, r.WithContext(withEdge(r.Context())))
@@ -517,7 +517,7 @@ func (s *Server) edgeAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 func (s *Server) popAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return s.edgeAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if popCodeOf(r.Context()) == "" && !s.edgeOpen() {
-			http.Error(w, `{"error":"forbidden: a per-PoP credential is required; re-register to obtain one"}`, http.StatusForbidden)
+			apiError(w, "forbidden: a per-PoP credential is required; re-register to obtain one", http.StatusForbidden)
 			return
 		}
 		next(w, r)
@@ -556,6 +556,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 
 	// Network Management (ZeroTier-styled 16-hex Network ID)
+	s.mux.HandleFunc("GET /api/v1/networks/{id}", s.tenantAuthMiddleware(s.handleGetNetwork))
+	s.mux.HandleFunc("GET /api/v1/nodes/{id}", s.tenantAuthMiddleware(s.handleGetNode))
+	s.mux.HandleFunc("GET /api/v1/pops/{code}", s.handleGetPoP)
+	s.mux.HandleFunc("GET /api/v1/tenants/{id}", s.adminAuthMiddleware(s.handleGetTenant))
+	s.mux.HandleFunc("GET /api/v1/acl/rules/{id}", s.tenantAuthMiddleware(s.handleGetACLRule))
 	s.mux.HandleFunc("PATCH /api/v1/networks/{id}", s.tenantAuthMiddleware(s.handleUpdateNetwork))
 	s.mux.HandleFunc("DELETE /api/v1/networks/{id}", s.tenantAuthMiddleware(s.handleDeleteNetwork))
 	s.mux.HandleFunc("GET /api/v1/nodes", s.tenantAuthMiddleware(s.handleListNodes))
@@ -631,7 +636,7 @@ type CreateNetworkRequest struct {
 func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 	var req CreateNetworkRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		apiError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
@@ -667,7 +672,7 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.db.Networks.Create(r.Context(), network); err != nil {
-		http.Error(w, fmt.Sprintf("failed to create network: %v", err), http.StatusInternalServerError)
+		apiError(w, fmt.Sprintf("failed to create network: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -683,12 +688,11 @@ func (s *Server) handleListNetworks(w http.ResponseWriter, r *http.Request) {
 
 	networks, err := s.db.Networks.ListByTenantID(r.Context(), tenantID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		apiError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(networks)
+	writePage(w, r, networks)
 }
 
 func (s *Server) handleListPoPs(w http.ResponseWriter, r *http.Request) {
@@ -700,7 +704,7 @@ func (s *Server) handleListPoPs(w http.ResponseWriter, r *http.Request) {
 		pops, err = s.db.EdgePoPs.ListHealthy(r.Context())
 	}
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		apiError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -722,16 +726,16 @@ var popCodeRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,15}$`)
 func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 	var req RegisterEdgePoPRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		apiError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
 	if !popCodeRE.MatchString(req.PoPCode) || req.PublicEndpoint == "" {
-		http.Error(w, "valid pop_code and public_endpoint are required", http.StatusBadRequest)
+		apiError(w, "valid pop_code and public_endpoint are required", http.StatusBadRequest)
 		return
 	}
 	if err := crypto.ValidatePublicKey(req.PublicKey); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		apiError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -745,11 +749,11 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 	// A claimed PoP can only be re-registered by its own credential, so a holder
 	// of the shared key cannot overwrite another PoP's key and endpoint.
 	if existing != nil && existing.KeyHash != "" && caller != existing.PoPCode {
-		http.Error(w, "pop is already claimed; present its credential or have an admin reset it", http.StatusForbidden)
+		apiError(w, "pop is already claimed; present its credential or have an admin reset it", http.StatusForbidden)
 		return
 	}
 	if caller != "" && (existing == nil || caller != req.PoPCode) {
-		http.Error(w, "credential does not belong to this pop", http.StatusForbidden)
+		apiError(w, "credential does not belong to this pop", http.StatusForbidden)
 		return
 	}
 
@@ -757,7 +761,7 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 	if existing == nil || existing.KeyHash == "" {
 		var err error
 		if popKey, keyHash, err = controlauth.GenerateToken(popKeyPrefix); err != nil {
-			http.Error(w, "failed to issue pop credential", http.StatusInternalServerError)
+			apiError(w, "failed to issue pop credential", http.StatusInternalServerError)
 			return
 		}
 	}
@@ -776,7 +780,7 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 		pop.LastSeenAt = time.Now()
 		pop.UpdatedAt = time.Now()
 		if err := s.db.EdgePoPs.Update(r.Context(), &pop); err != nil {
-			http.Error(w, "failed to update PoP", http.StatusInternalServerError)
+			apiError(w, "failed to update PoP", http.StatusInternalServerError)
 			return
 		}
 	} else {
@@ -795,7 +799,7 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 			UpdatedAt:      time.Now(),
 		}
 		if err := s.db.EdgePoPs.Create(r.Context(), &pop); err != nil {
-			http.Error(w, "failed to register PoP", http.StatusInternalServerError)
+			apiError(w, "failed to register PoP", http.StatusInternalServerError)
 			return
 		}
 	}
@@ -823,12 +827,12 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleResetPoPKey(w http.ResponseWriter, r *http.Request) {
 	pop, err := s.db.EdgePoPs.GetByPoPCode(r.Context(), r.PathValue("code"))
 	if err != nil || pop == nil {
-		http.Error(w, "pop not found", http.StatusNotFound)
+		apiError(w, "pop not found", http.StatusNotFound)
 		return
 	}
 	pop.KeyHash = ""
 	if err := s.db.EdgePoPs.Update(r.Context(), pop); err != nil {
-		http.Error(w, "failed to reset pop credential", http.StatusInternalServerError)
+		apiError(w, "failed to reset pop credential", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -839,13 +843,13 @@ func (s *Server) handleResetPoPKey(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleEdgeDeregister(w http.ResponseWriter, r *http.Request) {
 	pop, err := s.db.EdgePoPs.GetByPoPCode(r.Context(), popCodeOf(r.Context()))
 	if err != nil || pop == nil {
-		http.Error(w, "pop not found", http.StatusNotFound)
+		apiError(w, "pop not found", http.StatusNotFound)
 		return
 	}
 	pop.IsHealthy = false
 	pop.UpdatedAt = time.Now()
 	if err := s.db.EdgePoPs.Update(r.Context(), pop); err != nil {
-		http.Error(w, "failed to update pop", http.StatusInternalServerError)
+		apiError(w, "failed to update pop", http.StatusInternalServerError)
 		return
 	}
 	s.broadcastDelta(controlevents.Scope{}, map[string]any{"event": "pop_status_changed", "pop_code": pop.PoPCode, "is_healthy": false, "status": "offline"})
@@ -866,17 +870,17 @@ type EdgeHeartbeatRequest struct {
 func (s *Server) handleEdgeHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var req EdgeHeartbeatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		apiError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
 	if caller := popCodeOf(r.Context()); caller != "" && caller != req.PoPCode {
-		http.Error(w, "credential does not belong to this pop", http.StatusForbidden)
+		apiError(w, "credential does not belong to this pop", http.StatusForbidden)
 		return
 	}
 	pop, err := s.db.EdgePoPs.GetByPoPCode(r.Context(), req.PoPCode)
 	if err != nil || pop == nil {
-		http.Error(w, "pop not found", http.StatusNotFound)
+		apiError(w, "pop not found", http.StatusNotFound)
 		return
 	}
 
@@ -999,7 +1003,7 @@ func writeServiceError(w http.ResponseWriter, err error) {
 	if code == http.StatusInternalServerError {
 		slog.Error("control plane request failed", "error", err)
 	}
-	http.Error(w, service.Message(err), code)
+	apiError(w, service.Message(err), code)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -1011,7 +1015,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 	var req EnrollRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		apiError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 	req.CurrentToken = controlauth.NodeToken(r)
@@ -1026,7 +1030,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleP2PDiscover(w http.ResponseWriter, r *http.Request) {
 	var req P2PDiscoverRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		apiError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 	resp, err := s.svc.DiscoverP2P(r.Context(), NodeFromContext(r.Context()), req)
@@ -1040,7 +1044,7 @@ func (s *Server) handleP2PDiscover(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleReportProbes(w http.ResponseWriter, r *http.Request) {
 	var sample core.LatencySample
 	if err := json.NewDecoder(r.Body).Decode(&sample); err != nil {
-		http.Error(w, "invalid probe payload", http.StatusBadRequest)
+		apiError(w, "invalid probe payload", http.StatusBadRequest)
 		return
 	}
 	s.svc.ReportProbe(r.Context(), NodeFromContext(r.Context()), sample)
@@ -1050,7 +1054,7 @@ func (s *Server) handleReportProbes(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetPeers(w http.ResponseWriter, r *http.Request) {
 	node := NodeFromContext(r.Context())
 	if r.PathValue("id") != node.NetworkID {
-		http.Error(w, "forbidden: network access denied", http.StatusForbidden)
+		apiError(w, "forbidden: network access denied", http.StatusForbidden)
 		return
 	}
 	peers, err := s.svc.Peers(r.Context(), node)
@@ -1064,7 +1068,7 @@ func (s *Server) handleGetPeers(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRegisterTunnel(w http.ResponseWriter, r *http.Request) {
 	var req core.Tunnel
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid tunnel payload", http.StatusBadRequest)
+		apiError(w, "invalid tunnel payload", http.StatusBadRequest)
 		return
 	}
 	tunnel, err := s.svc.RegisterTunnel(r.Context(), NodeFromContext(r.Context()), req)
@@ -1114,7 +1118,7 @@ func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteTunnel(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		http.Error(w, "invalid tunnel id", http.StatusBadRequest)
+		apiError(w, "invalid tunnel id", http.StatusBadRequest)
 		return
 	}
 	if err := s.svc.DeleteTunnel(r.Context(), NodeFromContext(r.Context()), id); err != nil {
@@ -1131,7 +1135,7 @@ func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	scope, scoped := s.eventScope(r.Context())
 	if !ok || !scoped {
-		http.Error(w, "streaming unavailable", http.StatusForbidden)
+		apiError(w, "streaming unavailable", http.StatusForbidden)
 		return
 	}
 
@@ -1165,7 +1169,7 @@ func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	scope, ok := s.eventScope(r.Context())
 	if !ok {
-		http.Error(w, "streaming unavailable", http.StatusForbidden)
+		apiError(w, "streaming unavailable", http.StatusForbidden)
 		return
 	}
 	ws.Serve(w, r, s.bus.Subscribe(scope), s.cfg.AllowedOrigins)
@@ -1286,7 +1290,7 @@ func (s *Server) handleGetMeshGraph(w http.ResponseWriter, r *http.Request) {
 			netID = nets[0].ID
 		}
 	} else if _, ok := s.authorizeNetwork(ctx, netID); !ok {
-		http.Error(w, "forbidden: network access denied", http.StatusForbidden)
+		apiError(w, "forbidden: network access denied", http.StatusForbidden)
 		return
 	}
 
@@ -1458,12 +1462,12 @@ type CreateACLRuleRequest struct {
 func (s *Server) handleCreateACLRule(w http.ResponseWriter, r *http.Request) {
 	var req CreateACLRuleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		apiError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
 	if req.NetworkID == "" {
-		http.Error(w, "network_id is required", http.StatusBadRequest)
+		apiError(w, "network_id is required", http.StatusBadRequest)
 		return
 	}
 
@@ -1471,11 +1475,11 @@ func (s *Server) handleCreateACLRule(w http.ResponseWriter, r *http.Request) {
 	if tenant != nil {
 		net, err := s.db.Networks.GetByID(r.Context(), req.NetworkID)
 		if err != nil || net == nil {
-			http.Error(w, "network not found", http.StatusNotFound)
+			apiError(w, "network not found", http.StatusNotFound)
 			return
 		}
 		if net.TenantID != tenant.ID {
-			http.Error(w, "forbidden: network does not belong to tenant", http.StatusForbidden)
+			apiError(w, "forbidden: network does not belong to tenant", http.StatusForbidden)
 			return
 		}
 	}
@@ -1521,12 +1525,12 @@ func (s *Server) handleCreateACLRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := controlacl.ValidateRule(rule); err != nil {
-		http.Error(w, "invalid ACL rule: "+err.Error(), http.StatusBadRequest)
+		apiError(w, "invalid ACL rule: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	if err := s.db.ACLs.Create(r.Context(), rule); err != nil {
-		http.Error(w, fmt.Sprintf("failed to create ACL rule: %v", err), http.StatusInternalServerError)
+		apiError(w, fmt.Sprintf("failed to create ACL rule: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -1550,7 +1554,7 @@ func (s *Server) handleCreateACLRule(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListACLRules(w http.ResponseWriter, r *http.Request) {
 	netID := r.URL.Query().Get("network_id")
 	if netID == "" {
-		http.Error(w, "network_id query parameter is required", http.StatusBadRequest)
+		apiError(w, "network_id query parameter is required", http.StatusBadRequest)
 		return
 	}
 
@@ -1558,47 +1562,46 @@ func (s *Server) handleListACLRules(w http.ResponseWriter, r *http.Request) {
 	if tenant != nil {
 		net, err := s.db.Networks.GetByID(r.Context(), netID)
 		if err != nil || net == nil {
-			http.Error(w, "network not found", http.StatusNotFound)
+			apiError(w, "network not found", http.StatusNotFound)
 			return
 		}
 		if net.TenantID != tenant.ID {
-			http.Error(w, "forbidden: network does not belong to tenant", http.StatusForbidden)
+			apiError(w, "forbidden: network does not belong to tenant", http.StatusForbidden)
 			return
 		}
 	}
 
 	rules, err := s.db.ACLs.ListByNetworkID(r.Context(), netID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		apiError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(rules)
+	writePage(w, r, rules)
 }
 
 func (s *Server) handleDeleteACLRule(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
 	id, err := uuid.Parse(idStr)
 	if err != nil {
-		http.Error(w, "invalid rule id", http.StatusBadRequest)
+		apiError(w, "invalid rule id", http.StatusBadRequest)
 		return
 	}
 
 	rule, err := s.db.ACLs.GetByID(r.Context(), id)
 	if err != nil || rule == nil {
-		http.Error(w, "rule not found", http.StatusNotFound)
+		apiError(w, "rule not found", http.StatusNotFound)
 		return
 	}
 	network, ok := s.authorizeNetwork(r.Context(), rule.NetworkID)
 	if !ok {
 		// Same response as a missing rule so rule IDs cannot be probed across tenants.
-		http.Error(w, "rule not found", http.StatusNotFound)
+		apiError(w, "rule not found", http.StatusNotFound)
 		return
 	}
 
 	if err := s.db.ACLs.Delete(r.Context(), id); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		apiError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -1622,7 +1625,7 @@ func (s *Server) adminAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		expected := s.cfg.AdminAPIKey
 		if expected == "" {
-			http.Error(w, `{"error":"tenant administration is disabled; set control_plane.admin_api_key"}`, http.StatusForbidden)
+			apiError(w, "tenant administration is disabled; set control_plane.admin_api_key", http.StatusForbidden)
 			return
 		}
 		key := controlauth.BearerToken(r)
@@ -1630,7 +1633,7 @@ func (s *Server) adminAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			key = strings.TrimSpace(r.Header.Get("X-Admin-Key"))
 		}
 		if subtle.ConstantTimeCompare([]byte(key), []byte(expected)) != 1 {
-			http.Error(w, `{"error":"unauthorized: invalid admin key"}`, http.StatusUnauthorized)
+			apiError(w, "unauthorized: invalid admin key", http.StatusUnauthorized)
 			return
 		}
 		next(w, r)
@@ -1662,18 +1665,18 @@ func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 		Slug string `json:"slug"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Name) == "" || !slugRE.MatchString(req.Slug) {
-		http.Error(w, "name and a lower-case slug are required", http.StatusBadRequest)
+		apiError(w, "name and a lower-case slug are required", http.StatusBadRequest)
 		return
 	}
 	key, _, err := controlauth.GenerateToken("zro_key_")
 	if err != nil {
-		http.Error(w, "failed to generate API key", http.StatusInternalServerError)
+		apiError(w, "failed to generate API key", http.StatusInternalServerError)
 		return
 	}
 	now := time.Now()
 	tenant := &core.Tenant{ID: uuid.New(), Name: req.Name, Slug: req.Slug, APIKey: key, IsActive: true, CreatedAt: now, UpdatedAt: now}
 	if err := s.db.Tenants.Create(r.Context(), tenant); err != nil {
-		http.Error(w, "failed to create tenant (slug may be taken)", http.StatusConflict)
+		apiError(w, "failed to create tenant (slug may be taken)", http.StatusConflict)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1684,34 +1687,33 @@ func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListTenants(w http.ResponseWriter, r *http.Request) {
 	tenants, err := s.db.Tenants.List(r.Context())
 	if err != nil {
-		http.Error(w, "failed to list tenants", http.StatusInternalServerError)
+		apiError(w, "failed to list tenants", http.StatusInternalServerError)
 		return
 	}
 	out := make([]tenantResponse, 0, len(tenants))
 	for i := range tenants {
 		out = append(out, toTenantResponse(&tenants[i], false))
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(out)
+	writePage(w, r, out)
 }
 
 func (s *Server) handleDeleteTenant(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		http.Error(w, "invalid tenant id", http.StatusBadRequest)
+		apiError(w, "invalid tenant id", http.StatusBadRequest)
 		return
 	}
 	nets, err := s.db.Networks.ListByTenantID(r.Context(), id)
 	if err != nil {
-		http.Error(w, "failed to check tenant networks", http.StatusInternalServerError)
+		apiError(w, "failed to check tenant networks", http.StatusInternalServerError)
 		return
 	}
 	if len(nets) > 0 {
-		http.Error(w, "tenant still owns networks; delete them first", http.StatusConflict)
+		apiError(w, "tenant still owns networks; delete them first", http.StatusConflict)
 		return
 	}
 	if err := s.db.Tenants.Delete(r.Context(), id); err != nil {
-		http.Error(w, "failed to delete tenant", http.StatusInternalServerError)
+		apiError(w, "failed to delete tenant", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -1720,21 +1722,21 @@ func (s *Server) handleDeleteTenant(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRotateTenantKey(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		http.Error(w, "invalid tenant id", http.StatusBadRequest)
+		apiError(w, "invalid tenant id", http.StatusBadRequest)
 		return
 	}
 	key, _, err := controlauth.GenerateToken("zro_key_")
 	if err != nil {
-		http.Error(w, "failed to generate API key", http.StatusInternalServerError)
+		apiError(w, "failed to generate API key", http.StatusInternalServerError)
 		return
 	}
 	if err := s.db.Tenants.RotateAPIKey(r.Context(), id, key); err != nil {
-		http.Error(w, "tenant not found", http.StatusNotFound)
+		apiError(w, "tenant not found", http.StatusNotFound)
 		return
 	}
 	tenant, err := s.db.Tenants.GetByID(r.Context(), id)
 	if err != nil {
-		http.Error(w, "tenant not found", http.StatusNotFound)
+		apiError(w, "tenant not found", http.StatusNotFound)
 		return
 	}
 	tenant.APIKey = key
