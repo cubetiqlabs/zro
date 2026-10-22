@@ -95,6 +95,7 @@ services:
       - edge-kh-state:/var/lib/zro
     ports:
       - "51820:51820/udp"
+      - "51820:51820/tcp"
     networks:
       - zro-mesh
 
@@ -134,6 +135,7 @@ services:
       - edge-sg-state:/var/lib/zro
     ports:
       - "51821:51821/udp"
+      - "51821:51821/tcp"
     networks:
       - zro-mesh
 

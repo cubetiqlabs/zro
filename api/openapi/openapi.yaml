@@ -205,6 +205,25 @@ paths:
           content: {application/json: {schema: {$ref: "#/components/schemas/Network"}}}
         "400": {$ref: "#/components/responses/BadRequest"}
         "401": {$ref: "#/components/responses/Unauthorized"}
+  /api/v1/networks/{id}/tokens:
+    parameters: [{$ref: "#/components/parameters/NetworkID"}]
+    post:
+      tags: [Networks]
+      operationId: createEnrollmentToken
+      summary: Mint a node enrollment token
+      description: Returns a signed, single-use token plus the `zro join` command that redeems it. The body is optional.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateTokenRequest"}
+            example: {hostname: web-1, hours: 24}
+      responses:
+        "201":
+          description: The token.
+          content: {application/json: {schema: {$ref: "#/components/schemas/EnrollmentToken"}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
   /api/v1/networks/{id}:
     parameters: [{$ref: "#/components/parameters/NetworkID"}]
     get:
@@ -478,7 +497,14 @@ paths:
             schema: {$ref: "#/components/schemas/LatencySample"}
             example: {pop_code: KH, rtt: 18000000, packet_loss: 0}
       responses:
-        "202": {description: Accepted.}
+        "202":
+          description: Accepted. `primary_pop_code` is the PoP the plane homes the node at; the node should connect to it.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  primary_pop_code: {type: string}
         "401": {$ref: "#/components/responses/Unauthorized"}
   /api/v1/network/{id}/peers:
     get:
@@ -783,6 +809,21 @@ components:
         ipv4_cidr: {type: string, example: 100.64.0.0/10}
         ipv6_cidr: {type: string, example: "fd00:cafe::/64"}
         dns_domain: {type: string, example: zro.internal}
+    CreateTokenRequest:
+      type: object
+      properties:
+        hostname: {type: string, description: Lock the token to this node name.}
+        node_type: {type: string, enum: [peer, gateway], default: peer}
+        hours: {type: integer, minimum: 1, maximum: 720, default: 24}
+        pubkey: {type: string, description: Bind the token to this WireGuard public key.}
+    EnrollmentToken:
+      type: object
+      properties:
+        token: {type: string}
+        network_id: {type: string}
+        node_type: {type: string}
+        expires_at: {type: string, format: date-time}
+        join_command: {type: string}
     UpdateNetworkRequest:
       type: object
       properties:

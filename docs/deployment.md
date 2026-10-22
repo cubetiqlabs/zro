@@ -39,7 +39,7 @@ ZRO is a high-performance, cloud-native global mesh networking and ether-switch 
 | **Control Plane** | `8443/tcp` | Private / Internal | REST API & RFC 6455 WebSockets Event Hub |
 | **Control Plane** | `9443/tcp` | Private / Internal | Optional gRPC service (off unless `grpc_listen_addr` is set; **TLS required**, see [gRPC](#grpc-optional)) |
 | **PostgreSQL** | `5432/tcp` | Internal Only | State store (Tenants, Networks, Nodes, PoPs, ACLs) |
-| **Edge PoPs** | `51820/udp` | **Public** | WireGuard UDP encapsulation, STUN, & Disco signaling |
+| **Edge PoPs** | `51820/udp` + `51820/tcp` | **Public** | WireGuard UDP, STUN & Disco signaling; TCP is the DERP relay fallback |
 | **Gateways** | `80/tcp`, `443/tcp` | **Public** | Ingress reverse proxy & ACME / Let's Encrypt TLS |
 | **Client Nodes** | Ephemeral UDP | Outbound Only | STUN reflexive discovery & direct P2P hole punching |
 

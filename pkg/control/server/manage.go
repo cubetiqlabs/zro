@@ -2,12 +2,16 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	controlevents "github.com/cubetiqlabs/zro/pkg/control/events"
 	"github.com/cubetiqlabs/zro/pkg/control/service"
+	"github.com/cubetiqlabs/zro/pkg/core"
+	"github.com/cubetiqlabs/zro/pkg/crypto"
 	"github.com/google/uuid"
 )
 
@@ -212,4 +216,72 @@ func (s *Server) handleGetACLRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rule)
+}
+
+const (
+	defaultTokenHours = 24
+	maxTokenHours     = 720
+)
+
+// handleCreateEnrollmentToken mints a node enrollment token for a network the
+// tenant owns, so operators need neither the cluster secret nor the CLI.
+func (s *Server) handleCreateEnrollmentToken(w http.ResponseWriter, r *http.Request) {
+	network, ok := s.authorizeNetwork(r.Context(), r.PathValue("id"))
+	if !ok {
+		apiError(w, "network not found", http.StatusNotFound)
+		return
+	}
+	var req struct {
+		Hostname string `json:"hostname"`
+		NodeType string `json:"node_type"`
+		Hours    int    `json:"hours"`
+		PubKey   string `json:"pubkey"`
+	}
+	// An empty body means "all defaults".
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		apiError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Hours == 0 {
+		req.Hours = defaultTokenHours
+	}
+	if req.Hours < 0 || req.Hours > maxTokenHours {
+		apiError(w, fmt.Sprintf("hours must be between 1 and %d", maxTokenHours), http.StatusBadRequest)
+		return
+	}
+	if req.NodeType == "" {
+		req.NodeType = string(core.NodeTypePeer)
+	}
+	if req.NodeType != string(core.NodeTypePeer) && req.NodeType != string(core.NodeTypeGateway) {
+		apiError(w, "node_type must be peer or gateway", http.StatusBadRequest)
+		return
+	}
+	if req.Hostname != "" && !service.ValidHostname(strings.ToLower(req.Hostname)) {
+		apiError(w, "hostname must be a valid DNS name", http.StatusBadRequest)
+		return
+	}
+	if req.PubKey != "" {
+		if err := crypto.ValidatePublicKey(req.PubKey); err != nil {
+			apiError(w, "invalid pubkey", http.StatusBadRequest)
+			return
+		}
+	}
+
+	expires := time.Now().Add(time.Duration(req.Hours) * time.Hour)
+	token, err := crypto.SignEnrollmentToken(s.cfg.SecretKey, crypto.EnrollmentTokenPayload{
+		NetworkID: network.ID, Hostname: req.Hostname, NodeType: req.NodeType,
+		BoundPublicKey: req.PubKey, Expiry: expires.Unix(),
+	})
+	if err != nil {
+		apiError(w, "failed to sign token", http.StatusInternalServerError)
+		return
+	}
+	join := "zro join --token " + token
+	if s.cfg.PublicURL != "" {
+		join = "zro join --plane " + s.cfg.PublicURL + " --token " + token
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"token": token, "network_id": network.ID, "node_type": req.NodeType,
+		"expires_at": expires.UTC(), "join_command": join,
+	})
 }

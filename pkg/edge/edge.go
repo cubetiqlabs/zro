@@ -45,6 +45,8 @@ type PoPDaemon struct {
 	peerCount    int
 	knownKeys    atomic.Pointer[map[[32]byte]struct{}] // public keys allowed on the DERP relay
 	peersMu      sync.RWMutex
+	synced       bool         // first mesh sync done (guarded by peersMu)
+	lastSyncWarn atomic.Int64 // unix nanos of the last sync failure warning
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -337,7 +339,10 @@ func (e *PoPDaemon) credential() string {
 	return e.cfg.EdgeAPIKey
 }
 
-func (e *PoPDaemon) sendHeartbeat(ctx context.Context) {
+// sendHeartbeat reports whether the plane accepted the heartbeat. A rejection
+// (PoP unknown after a plane reset, credential refused) means the PoP must
+// register again.
+func (e *PoPDaemon) sendHeartbeat(ctx context.Context) bool {
 	e.peersMu.RLock()
 	peersCount := e.peerCount
 	e.peersMu.RUnlock()
@@ -352,19 +357,29 @@ func (e *PoPDaemon) sendHeartbeat(ctx context.Context) {
 
 	body, err := json.Marshal(hbPayload)
 	if err != nil {
-		return
+		return true
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", e.cfg.PlaneEndpoint+"/api/v1/edge/heartbeat", bytes.NewReader(body))
 	if err != nil {
-		return
+		return true
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := e.httpClient.Do(req)
-	if err == nil {
-		_ = resp.Body.Close()
+	if err != nil {
+		slog.Warn("Heartbeat to Control Plane failed", "pop_code", e.cfg.PoPCode, "error", err)
+		return true // plane unreachable: keep credentials, retry next tick
 	}
+	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusAccepted {
+		return true
+	}
+	if resp.StatusCode >= 500 {
+		return true
+	}
+	slog.Warn("Control Plane rejected heartbeat; registering again", "pop_code", e.cfg.PoPCode, "status", resp.StatusCode)
+	return false
 }
 
 func (e *PoPDaemon) syncWorker(ctx context.Context) {
@@ -372,7 +387,7 @@ func (e *PoPDaemon) syncWorker(ctx context.Context) {
 
 	registered := e.registerWithControlPlane(ctx)
 	if registered {
-		e.sendHeartbeat(ctx)
+		registered = e.sendHeartbeat(ctx)
 		e.syncMeshTopology(ctx)
 	}
 
@@ -388,7 +403,7 @@ func (e *PoPDaemon) syncWorker(ctx context.Context) {
 				registered = e.registerWithControlPlane(ctx)
 			}
 			if registered {
-				e.sendHeartbeat(ctx)
+				registered = e.sendHeartbeat(ctx)
 				e.syncMeshTopology(ctx)
 			}
 		}

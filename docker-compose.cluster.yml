@@ -45,6 +45,9 @@ services:
     profiles: ["edge"]
     image: ghcr.io/cubetiqlabs/zro:${ZRO_VERSION:-latest}
     restart: always
+    # Host networking cannot take `sysctls:`; /proc/sys is read-only in the container, so enable
+    # forwarding once on the HOST (persist in /etc/sysctl.d/99-zro.conf):
+    #   sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
     network_mode: host
     cap_add:
       - NET_ADMIN

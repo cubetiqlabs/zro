@@ -44,6 +44,8 @@ type Daemon struct {
 	primaryPoP   core.EdgePoP
 	secondaryPoP *core.EdgePoP
 	popMu        sync.RWMutex
+	pops         []core.EdgePoP       // latest PoP catalog from the plane (guarded by popMu)
+	popKick      chan struct{}        // wakes popWorker for an immediate refresh
 	peers        map[string]core.Node // pubKey -> node
 	peersMu      sync.RWMutex
 
@@ -111,6 +113,7 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 		defaultDeny:  cfg.DefaultDeny,
 		stunWaiters:  make(map[[12]byte]chan *stun.ReflexiveAddress),
 		relay:        newRelayState(),
+		popKick:      make(chan struct{}, 1),
 		punchWaiters: make(map[string]chan struct{}),
 	}
 
@@ -164,7 +167,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}
 
 	// 2. Section 5.1 Step 2: Fetch PoP catalog and conduct parallel UDP RTT probes
-	pops, _ := d.fetchPoPs(ctx)
+	pops, err := d.fetchPoPs(ctx)
+	if err != nil {
+		slog.Warn("Could not fetch the Edge PoP catalog (will retry in the background)", "error", err)
+	}
+	d.setCatalog(pops)
 	probes, bestPoP := d.probePoPs(ctx, pops)
 
 	// Discover our reflexive endpoint on the shared socket, not on the
@@ -179,109 +186,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}
 
-	// 3. Section 5.1 Steps 3-4: Enroll with Control Plane and report probe telemetry for Smart Delegation
-	var enrollResp server.EnrollResponse
-
-	if d.grpcClient != nil {
-		var protoProbes []*v1.LatencyProbe
-		for _, p := range probes {
-			protoProbes = append(protoProbes, &v1.LatencyProbe{
-				PopCode:    p.PoPCode,
-				RttNs:      p.RTT.Nanoseconds(),
-				PacketLoss: p.PacketLoss,
-			})
-		}
-
-		gResp, err := d.grpcClient.Enroll(ctx, &v1.EnrollRequest{
-			Token:        d.cfg.EnrollmentToken,
-			PublicKey:    d.keyPair.PublicKey,
-			Hostname:     d.cfg.Hostname,
-			NodeType:     "peer",
-			Tags:         d.cfg.Tags,
-			Endpoints:    endpoints,
-			Probes:       protoProbes,
-			AllowedPorts: d.allowedPorts,
-			DefaultDeny:  &d.defaultDeny,
-		})
-		if err != nil {
-			return fmt.Errorf("gRPC enrollment failed: %w", err)
-		}
-
-		nodeUUID, _ := uuid.Parse(gResp.NodeId)
-		enrollResp = server.EnrollResponse{
-			NodeID:      nodeUUID,
-			NetworkID:   gResp.NetworkId,
-			NodeToken:   gResp.NodeToken,
-			ACLRules:    rulesFromProto(gResp.AclRules),
-			IPv4CIDR:    gResp.Ipv4Cidr,
-			IPv6CIDR:    gResp.Ipv6Cidr,
-			OverlayIPv4: gResp.OverlayIpv4,
-			OverlayIPv6: gResp.OverlayIpv6,
-		}
-		if gResp.PrimaryPop != nil {
-			enrollResp.PrimaryPoP = core.EdgePoP{
-				PoPCode:        gResp.PrimaryPop.PopCode,
-				PublicEndpoint: gResp.PrimaryPop.PublicEndpoint,
-				PublicKey:      gResp.PrimaryPop.PublicKey,
-				Region:         gResp.PrimaryPop.Region,
-			}
-		}
-		if gResp.SecondaryPop != nil {
-			sec := core.EdgePoP{
-				PoPCode:        gResp.SecondaryPop.PopCode,
-				PublicEndpoint: gResp.SecondaryPop.PublicEndpoint,
-				PublicKey:      gResp.SecondaryPop.PublicKey,
-				Region:         gResp.SecondaryPop.Region,
-			}
-			enrollResp.SecondaryPoP = &sec
-		}
-		for _, p := range gResp.Peers {
-			enrollResp.Peers = append(enrollResp.Peers, core.Node{
-				Hostname:    p.Hostname,
-				PublicKey:   p.PublicKey,
-				OverlayIPv4: p.OverlayIpv4,
-				OverlayIPv6: p.OverlayIpv6,
-				Endpoints:   core.StringList(p.Endpoints),
-				Tags:        core.StringList(p.Tags),
-			})
-		}
-	} else {
-		enrollReq := server.EnrollRequest{
-			Token:        d.cfg.EnrollmentToken,
-			PublicKey:    d.keyPair.PublicKey,
-			Hostname:     d.cfg.Hostname,
-			NodeType:     core.NodeTypePeer,
-			Tags:         core.StringList(d.cfg.Tags),
-			Endpoints:    core.StringList(endpoints),
-			AllowedPorts: core.StringList(d.allowedPorts),
-			DefaultDeny:  &d.defaultDeny,
-			Probes:       probes,
-		}
-
-		bodyBytes, err := json.Marshal(enrollReq)
-		if err != nil {
-			return err
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "POST", d.cfg.PlaneEndpoint+"/api/v1/enroll", bytes.NewReader(bodyBytes))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := d.httpClient.Do(req)
-		if err != nil {
-			return fmt.Errorf("enrollment request failed: %w", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("enrollment rejected by control plane: status %d", resp.StatusCode)
-		}
-
-		if err := json.NewDecoder(resp.Body).Decode(&enrollResp); err != nil {
-			return fmt.Errorf("failed to decode enrollment response: %w", err)
-		}
+	// 3. Section 5.1 Steps 3-4: Enroll with Control Plane and report probe telemetry for Smart Delegation.
+	// A plane that is down or restarting is retried; a rejected token is not.
+	enrollResp, err := d.enrollWithRetry(ctx, endpoints, probes)
+	if err != nil {
+		return err
 	}
 
 	if d.cfg.NetworkID != "" && !strings.EqualFold(d.cfg.NetworkID, enrollResp.NetworkID) {
@@ -334,7 +243,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 
 	d.wg.Add(4)
 	go d.relayWorker(ctx)
-	go d.probeWorker(ctx)
+	go d.popWorker(ctx)
 	go d.tunnelWorker(ctx)
 	go d.realtimeListener(ctx)
 
@@ -352,6 +261,9 @@ func (d *Daemon) fetchPoPs(ctx context.Context) ([]core.EdgePoP, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("PoP catalog rejected: status %d", resp.StatusCode)
+	}
 
 	var pops []core.EdgePoP
 	if err := json.NewDecoder(resp.Body).Decode(&pops); err != nil {
@@ -707,76 +619,6 @@ func (d *Daemon) connectPeer(ctx context.Context, peer core.Node) {
 	_, _ = d.DiscoverAndConnectPeer(ctx, peer.OverlayIPv4)
 }
 
-func (d *Daemon) probeWorker(ctx context.Context) {
-	defer d.wg.Done()
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-
-	var consecutiveFails int
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			d.popMu.RLock()
-			primary := d.primaryPoP
-			secondary := d.secondaryPoP
-			d.popMu.RUnlock()
-
-			if primary.PublicEndpoint == "" {
-				continue
-			}
-
-			// Probe primary Edge PoP
-			rtt, _, err := stun.ProbeEndpoint(primary.PublicEndpoint, 1*time.Second)
-			loss := 0.0
-			if err != nil {
-				loss = 1.0
-				rtt = 500 * time.Millisecond
-				consecutiveFails++
-			} else {
-				consecutiveFails = 0
-			}
-
-			// UDP blocked but the TCP relay works: tunnel WireGuard through it.
-			d.relay.mu.Lock()
-			cur := d.relay.mode
-			d.relay.mu.Unlock()
-			if want := nextPath(cur, err == nil, consecutiveFails, d.relay.isUp()); want != cur {
-				slog.Warn("Edge PoP path changed", "pop", primary.PoPCode, "relay", want == pathRelay)
-				_ = d.applyPath(primary, want)
-			}
-
-			// Report probe telemetry to Control Plane
-			sample := core.LatencySample{
-				NodeID:     d.nodeID,
-				PoPCode:    primary.PoPCode,
-				RTT:        rtt,
-				PacketLoss: loss,
-				Timestamp:  time.Now(),
-			}
-
-			d.reportProbe(ctx, sample)
-
-			// Failover to secondary Edge PoP if primary is unreachable (consecutive failures >= 2)
-			if consecutiveFails >= 2 && !d.relay.isUp() && secondary != nil && secondary.PublicEndpoint != "" {
-				slog.Warn("Primary Edge PoP degraded/unreachable, failing over to secondary Edge PoP",
-					"old_primary", primary.PoPCode,
-					"new_primary", secondary.PoPCode)
-
-				d.popMu.Lock()
-				d.primaryPoP = *secondary
-				d.secondaryPoP = &primary
-				d.popMu.Unlock()
-
-				_ = d.connectToEdgePoP(*secondary)
-				consecutiveFails = 0
-			}
-		}
-	}
-}
-
 func (d *Daemon) tunnelWorker(ctx context.Context) {
 	defer d.wg.Done()
 
@@ -844,15 +686,25 @@ func (d *Daemon) discoverPeer(ctx context.Context, req server.P2PDiscoverRequest
 	return &out, nil
 }
 
-// reportProbe sends a latency sample to the plane (best effort).
-func (d *Daemon) reportProbe(ctx context.Context, sample core.LatencySample) {
+// reportProbe sends a latency sample to the plane and returns the PoP code the
+// plane homes this node at ("" when unknown or on failure).
+func (d *Daemon) reportProbe(ctx context.Context, sample core.LatencySample) string {
 	if d.grpcClient != nil {
-		_, _ = d.grpcClient.ReportProbes(ctx, &v1.ProbeReportRequest{
+		resp, err := d.grpcClient.ReportProbes(ctx, &v1.ProbeReportRequest{
 			NodeId: d.nodeID.String(), PopCode: sample.PoPCode, RttNs: sample.RTT.Nanoseconds(), PacketLoss: sample.PacketLoss,
 		})
-		return
+		if err != nil {
+			return ""
+		}
+		return resp.PrimaryPopCode
 	}
-	_ = d.postPlane(ctx, "/api/v1/probes", sample, http.StatusAccepted, nil)
+	var out struct {
+		PrimaryPoPCode string `json:"primary_pop_code"`
+	}
+	if err := d.postPlane(ctx, "/api/v1/probes", sample, http.StatusAccepted, &out); err != nil {
+		return ""
+	}
+	return out.PrimaryPoPCode
 }
 
 // registerTunnel registers an exposed service with the plane.
