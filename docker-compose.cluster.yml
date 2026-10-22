@@ -11,7 +11,7 @@ services:
   # Standalone / Clustered Control Plane (Behind Cloud Load Balancer)
   plane:
     profiles: ["plane"]
-    image: ${ZRO_IMAGE:-cubis/zro:latest}
+    image: ghcr.io/sombochea/zro:${ZRO_VERSION:-latest}
     restart: always
     command: ["plane"]
     environment:
@@ -43,7 +43,7 @@ services:
   # Uses host networking to eliminate Docker bridge NAT overhead and achieve line-rate WireGuard throughput.
   edge:
     profiles: ["edge"]
-    image: ${ZRO_IMAGE:-cubis/zro:latest}
+    image: ghcr.io/sombochea/zro:${ZRO_VERSION:-latest}
     restart: always
     network_mode: host
     cap_add:
@@ -72,7 +72,7 @@ services:
   # Standalone Ingress Gateway (L4/L7 Reverse Proxy & Load Balancer)
   gateway:
     profiles: ["gateway"]
-    image: ${ZRO_IMAGE:-cubis/zro:latest}
+    image: ghcr.io/sombochea/zro:${ZRO_VERSION:-latest}
     restart: always
     network_mode: host
     cap_add:

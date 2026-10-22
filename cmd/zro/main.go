@@ -29,8 +29,9 @@ import (
 var (
 	cfgFile string
 	rootCmd = &cobra.Command{
-		Use:   "zro",
-		Short: "ZRO: High-Performance Global Networking & Ether-Switch Mesh",
+		Use:              "zro",
+		PersistentPreRun: func(cmd *cobra.Command, args []string) { notifyIfOutdated(cmd) },
+		Short:            "ZRO: High-Performance Global Networking & Ether-Switch Mesh",
 		Long: `ZRO is an enterprise-grade global networking fabric with userspace WireGuard,
 smart routing, IPless nodes, zero-trust ACLs, and cloud-native load balancing.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -71,6 +72,7 @@ func init() {
 	rootCmd.AddCommand(newTokenCmd())
 	rootCmd.AddCommand(newNetworkCmd())
 	rootCmd.AddCommand(newP2PCmd())
+	rootCmd.AddCommand(newUpdateCmd())
 }
 
 func main() {

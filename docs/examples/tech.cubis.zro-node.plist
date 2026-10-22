@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- ~/Library/LaunchAgents/tech.cubis.zro-node.plist ; load with: launchctl load ~/Library/LaunchAgents/tech.cubis.zro-node.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>tech.cubis.zro-node</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/zro</string>
+    <string>node</string>
+    <string>--config</string>
+    <string>/usr/local/etc/zro/zro.yaml</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>ZRO_NODE_INTERFACE_MODE</key><string>netstack</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>/tmp/zro-node.log</string>
+</dict>
+</plist>

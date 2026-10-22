@@ -13,6 +13,7 @@ import (
 	"github.com/cubis/zro/pkg/core"
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/store"
+	"github.com/google/uuid"
 )
 
 const testSecret = "service-test-secret"
@@ -175,5 +176,38 @@ func TestDeregisterFreesAddressAndReaperRemovesStaleNodes(t *testing.T) {
 	}
 	if n, _ := f.db.Nodes.GetByID(ctx, b.NodeID); n == nil {
 		t.Fatal("fresh node must survive the reaper")
+	}
+}
+
+func TestProbeLossRehomesNodeToHealthyPoP(t *testing.T) {
+	f := newFixture(t)
+	svc := f.service()
+	ctx := context.Background()
+	for _, code := range []string{"a", "b"} {
+		pop := &core.EdgePoP{ID: uuid.New(), Region: "r", PublicKey: code, PoPCode: code, PublicEndpoint: code + ":1", IsHealthy: true, Weight: 100, LastSeenAt: time.Now()}
+		if err := f.db.EdgePoPs.Create(ctx, pop); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req, _ := f.enrollReq(t, "n")
+	req.Probes = []core.LatencySample{{PoPCode: "a", RTT: 10 * time.Millisecond}}
+	resp, err := svc.Enroll(ctx, req)
+	if err != nil || resp.PrimaryPoP.PoPCode != "a" {
+		t.Fatalf("expected home a, got %v / %v", resp, err)
+	}
+	node, _ := f.db.Nodes.GetByTokenHash(ctx, controlauth.HashToken(resp.NodeToken))
+
+	// A healthy home is never displaced by a report.
+	svc.ReportProbe(ctx, node, core.LatencySample{PoPCode: "a", RTT: 12 * time.Millisecond})
+	if got, _ := f.db.Nodes.GetByTokenHash(ctx, controlauth.HashToken(resp.NodeToken)); got.AssignedPoP.PoPCode != "a" {
+		t.Fatalf("home moved without cause: %s", got.AssignedPoP.PoPCode)
+	}
+
+	// Total loss on the home moves the node, and the move is persisted.
+	if primary := svc.ReportProbe(ctx, node, core.LatencySample{PoPCode: "a", RTT: 500 * time.Millisecond, PacketLoss: 1}); primary != "b" {
+		t.Fatalf("expected b after loss on a, got %q", primary)
+	}
+	if got, _ := f.db.Nodes.GetByTokenHash(ctx, controlauth.HashToken(resp.NodeToken)); got.AssignedPoP == nil || got.AssignedPoP.PoPCode != "b" {
+		t.Fatalf("new home not persisted: %+v", got.AssignedPoP)
 	}
 }

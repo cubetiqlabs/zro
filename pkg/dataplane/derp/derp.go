@@ -13,11 +13,13 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cubis/zro/pkg/crypto"
 	"github.com/cubis/zro/pkg/dataplane/relay"
 	"golang.org/x/crypto/curve25519"
+	"golang.org/x/time/rate"
 )
 
 // DERP Frame Types
@@ -64,12 +66,73 @@ type Server struct {
 	// Authorize, if set, decides which authenticated public keys may use the
 	// relay. Without it any holder of a valid key pair is admitted.
 	Authorize func(pub [KeyLen]byte) bool
+
+	// Limits bounds connections and per-session throughput; zero fields are
+	// unlimited. Set before Serve.
+	Limits Limits
+
+	conns   int            // open connections, including ones still handshaking
+	ipConns map[string]int // open connections per source IP
+	dropped atomic.Uint64
+}
+
+// Limits caps relay resource use. Over-rate packets are dropped, not queued or
+// disconnected: WireGuard retransmits, and a flooding client only hurts itself.
+type Limits struct {
+	MaxConns      int // total open connections
+	MaxConnsPerIP int // open connections per source IP (NATs share one)
+	PacketsPerSec int // per session
+	BytesPerSec   int // per session
+}
+
+// Dropped returns how many packets the rate limits have discarded.
+func (s *Server) Dropped() uint64 { return s.dropped.Load() }
+
+// admitConn reserves a connection slot for ip, or reports that a cap is hit.
+func (s *Server) admitConn(ip string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if (s.Limits.MaxConns > 0 && s.conns >= s.Limits.MaxConns) ||
+		(s.Limits.MaxConnsPerIP > 0 && s.ipConns[ip] >= s.Limits.MaxConnsPerIP) {
+		return false
+	}
+	if s.ipConns == nil {
+		s.ipConns = make(map[string]int)
+	}
+	s.conns++
+	s.ipConns[ip]++
+	return true
+}
+
+func (s *Server) releaseConn(ip string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.conns--
+	if s.ipConns[ip]--; s.ipConns[ip] <= 0 {
+		delete(s.ipConns, ip)
+	}
 }
 
 type clientSession struct {
 	pubKey [KeyLen]byte
 	conn   net.Conn
 	mu     sync.Mutex
+	pps    *rate.Limiter // nil = unlimited
+	bps    *rate.Limiter
+}
+
+// allow reports whether a packet of n bytes is within the session's rate.
+func (c *clientSession) allow(n int) bool {
+	return (c.pps == nil || c.pps.Allow()) && (c.bps == nil || c.bps.AllowN(time.Now(), n))
+}
+
+// newLimiter allows perSec events per second with one second of burst, or at
+// least min so a single maximum-size frame always fits.
+func newLimiter(perSec, min int) *rate.Limiter {
+	if perSec <= 0 {
+		return nil
+	}
+	return rate.NewLimiter(rate.Limit(perSec), max(perSec, min))
 }
 
 func (c *clientSession) write(frame []byte) error {
@@ -110,7 +173,15 @@ func (s *Server) Serve(l net.Listener) error {
 		if err != nil {
 			return err
 		}
-		go s.handleConn(conn)
+		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+		if !s.admitConn(ip) {
+			conn.Close()
+			continue
+		}
+		go func() {
+			defer s.releaseConn(ip)
+			s.handleConn(conn)
+		}()
 	}
 }
 
@@ -171,7 +242,11 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 
-	session := &clientSession{pubKey: clientPubKey, conn: conn}
+	session := &clientSession{
+		pubKey: clientPubKey, conn: conn,
+		pps: newLimiter(s.Limits.PacketsPerSec, 1),
+		bps: newLimiter(s.Limits.BytesPerSec, MaxPacketLen+64),
+	}
 	s.mu.Lock()
 	if old := s.clients[clientPubKey]; old != nil {
 		_ = old.conn.Close() // a reconnect replaces the stale session
@@ -208,6 +283,10 @@ func (s *Server) handleConn(conn net.Conn) {
 			var dstKey [KeyLen]byte
 			copy(dstKey[:], frame[1:1+KeyLen])
 			payload := frame[1+KeyLen:]
+			if !session.allow(len(frame)) {
+				s.dropped.Add(1)
+				continue
+			}
 
 			if dstKey == s.pubKey {
 				s.local.deliver(clientPubKey, payload)

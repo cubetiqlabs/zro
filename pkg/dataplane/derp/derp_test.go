@@ -218,3 +218,59 @@ func TestServerLocalEndpointRoundtrip(t *testing.T) {
 		t.Fatalf("expected ErrClientNotFound, got %v", err)
 	}
 }
+
+func TestConnectionCapsRejectExtraClients(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, addr := startServer(t, func(s *Server) { s.Limits.MaxConnsPerIP = 1 })
+
+	kp1, _ := crypto.GenerateKeyPair()
+	c1, err := ConnectDERP(ctx, addr, kp1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	kp2, _ := crypto.GenerateKeyPair()
+	if c2, err := ConnectDERP(ctx, addr, kp2); err == nil {
+		c2.Close()
+		t.Fatal("a second connection from the same IP must be refused")
+	}
+}
+
+func TestSessionRateLimitDropsExcessPackets(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	srv, addr := startServer(t, func(s *Server) { s.Limits.PacketsPerSec = 5 })
+
+	kpA, _ := crypto.GenerateKeyPair()
+	a, err := ConnectDERP(ctx, addr, kpA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	kpB, _ := crypto.GenerateKeyPair()
+	b, err := ConnectDERP(ctx, addr, kpB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	keyB, _ := parseKey(kpB.PublicKey)
+	time.Sleep(50 * time.Millisecond) // let the server register both sessions
+
+	for i := 0; i < 50; i++ {
+		_ = a.Send(keyB, []byte("x"))
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.Dropped() < 40 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.Dropped() < 40 {
+		t.Fatalf("expected most of 50 packets dropped at 5/s, dropped %d", srv.Dropped())
+	}
+	// Delivery within the burst still works.
+	select {
+	case <-b.Recv():
+	case <-time.After(time.Second):
+		t.Fatal("packets within the rate must still be relayed")
+	}
+}

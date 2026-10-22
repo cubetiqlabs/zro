@@ -70,6 +70,13 @@ type EdgeConfig struct {
 	EdgeAPIKey          string `mapstructure:"edge_api_key"`
 	IsAnycast           bool   `mapstructure:"is_anycast"`
 	UsePrivateIP        bool   `mapstructure:"use_private_ip"`
+
+	// DERP relay limits; 0 disables a limit. Rates apply per session and
+	// over-rate packets are dropped.
+	DERPMaxConns      int `mapstructure:"derp_max_conns"`
+	DERPMaxConnsPerIP int `mapstructure:"derp_max_conns_per_ip"`
+	DERPPacketsPerSec int `mapstructure:"derp_packets_per_sec"`
+	DERPBytesPerSec   int `mapstructure:"derp_bytes_per_sec"`
 }
 
 // LocalTunnelConfig defines a service exposed by a node.
@@ -169,6 +176,10 @@ func Load(cfgFile string) (*AppConfig, error) {
 	v.SetDefault("edge.use_private_ip", false)
 	v.SetDefault("edge.plane_endpoint", "https://zro-plane.cubis.tech:443")
 	v.SetDefault("edge.is_anycast", false)
+	v.SetDefault("edge.derp_max_conns", 10000)
+	v.SetDefault("edge.derp_max_conns_per_ip", 256)
+	v.SetDefault("edge.derp_packets_per_sec", 20000)
+	v.SetDefault("edge.derp_bytes_per_sec", 64<<20)
 
 	// Node defaults
 	v.SetDefault("node.interface_mode", "tun")

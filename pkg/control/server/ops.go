@@ -44,7 +44,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	key := controlauth.BearerToken(r)
 	if subtle.ConstantTimeCompare([]byte(key), []byte(expected)) != 1 {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		apiError(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
