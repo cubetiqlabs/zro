@@ -57,7 +57,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - run: shellcheck scripts/install.sh
+      - run: shellcheck scripts/install.sh scripts/release.sh
 
   openapi:
     runs-on: ubuntu-latest

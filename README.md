@@ -65,6 +65,7 @@ go build -o bin/zro ./cmd/zro
 
 ## Documentation
 
+- [Releasing](docs/releasing.md): `scripts/release.sh` (version bump, changelog, tag, push).
 - [Install and update](docs/install.md): installers for Linux/macOS/Windows, `zro update`, services.
 - [Deployment](docs/deployment.md): standalone and cluster setups, security model, operations.
 - [API guide](docs/api.md) and [OpenAPI spec](api/openapi/openapi.yaml): REST contract with worked examples.
