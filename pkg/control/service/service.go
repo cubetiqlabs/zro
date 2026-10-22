@@ -104,9 +104,12 @@ const maxAllocAttempts = 8
 // same node ID and overlay address with a fresh bearer token, so restarts do
 // not leak nodes or addresses.
 func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollResponse, error) {
-	grant, err := enroll.Authorize(ctx, s.cfg.SecretKey, s.db.Enrollments, enroll.Request{
-		Token: req.Token, PublicKey: req.PublicKey, Hostname: req.Hostname, NodeType: req.NodeType,
-	})
+	grant, err := s.resumeGrant(ctx, req)
+	if grant == nil && err == nil {
+		grant, err = enroll.Authorize(ctx, s.cfg.SecretKey, s.db.Enrollments, enroll.Request{
+			Token: req.Token, PublicKey: req.PublicKey, Hostname: req.Hostname, NodeType: req.NodeType,
+		})
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, enroll.ErrUnauthenticated):
@@ -185,6 +188,28 @@ func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollRespons
 	})
 	s.publish(scope, "mesh_graph_updated", map[string]any{"network_id": network.ID})
 	return resp, nil
+}
+
+// resumeGrant admits a node that is already a member and proves it with its
+// current node token plus its public key, so a restart does not need an
+// enrollment token (which may have expired or been redeemed). It returns nil
+// when the request is not such a resume, leaving normal enrollment to run.
+func (s *Service) resumeGrant(ctx context.Context, req EnrollRequest) (*enroll.Grant, error) {
+	if req.CurrentToken == "" {
+		return nil, nil
+	}
+	n, err := s.db.Nodes.GetByTokenHash(ctx, controlauth.HashToken(req.CurrentToken))
+	if err != nil || n == nil || !n.IsActive || n.PublicKey != req.PublicKey { // unknown token: not a resume
+		return nil, nil
+	}
+	if req.NodeType != "" && req.NodeType != n.NodeType {
+		return nil, newErr(KindForbidden, "this key is enrolled as a %s", n.NodeType)
+	}
+	hostname := req.Hostname
+	if hostname == "" {
+		hostname = n.Hostname
+	}
+	return &enroll.Grant{NetworkID: n.NetworkID, Hostname: hostname, NodeType: n.NodeType}, nil
 }
 
 // admit returns the persisted node for this key: the existing one (refreshed)
