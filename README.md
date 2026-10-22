@@ -15,7 +15,13 @@ Enterprise-grade global networking fabric and virtual ether-switch built in Go. 
 
 ## Quickstart
 
-### 1. Build Binary
+### 1. Install (or build)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sombochea/zro/main/scripts/install.sh | sh   # Windows & Docker: docs/install.md
+```
+
+From source:
 ```bash
 go build -o bin/zro ./cmd/zro
 ```
@@ -59,6 +65,7 @@ go build -o bin/zro ./cmd/zro
 
 ## Documentation
 
+- [Install and update](docs/install.md): installers for Linux/macOS/Windows, `zro update`, services.
 - [Deployment](docs/deployment.md): standalone and cluster setups, security model, operations.
 - [API guide](docs/api.md) and [OpenAPI spec](api/openapi/openapi.yaml): REST contract with worked examples.
 - [Availability and failover](docs/ha-and-failover.md): rejoining, PoP re-homing, relay limits.

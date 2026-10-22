@@ -1,0 +1,18 @@
+# /etc/systemd/system/zro-node.service
+[Unit]
+Description=ZRO node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/zro node --config /etc/zro/zro.yaml
+Restart=always
+RestartSec=3
+# Needed for the kernel TUN interface; drop both for netstack mode.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+StateDirectory=zro
+Environment=ZRO_NODE_STATE_DIR=/var/lib/zro
+
+[Install]
+WantedBy=multi-user.target
