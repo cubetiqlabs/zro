@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.1.1 - 2026-10-22
+
+- fix(edge,node): reliable PoP failover, edge re-register, and token API (97acade)
+
 ## v0.1.0 - 2026-10-22
 
 - fix(release): install syft so GoReleaser can generate SBOMs (f467b85)
