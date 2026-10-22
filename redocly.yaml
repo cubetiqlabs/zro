@@ -1,2 +1,4 @@
 extends:
   - minimal
+rules:
+  operation-2xx-response: off # WebSocket upgrades answer 101
