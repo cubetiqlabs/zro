@@ -15,12 +15,6 @@ import (
 	"github.com/cubis/zro/pkg/gateway/balancer"
 )
 
-// RouteMapping connects a public hostname to a load-balanced upstream pool.
-type RouteMapping struct {
-	Hostname string
-	Balancer *balancer.Balancer
-}
-
 // Engine serves as the core reverse proxy gateway.
 type Engine struct {
 	mu        sync.RWMutex

@@ -65,7 +65,20 @@ func TestEnrollIsIdempotentPerKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := svc.Enroll(ctx, req) // restart with the same key and token
+
+	// Knowing the public key and the (long-lived) enrollment token is not enough
+	// to take over a node that is already a member.
+	if _, err := svc.Enroll(ctx, req); KindOf(err) != KindConflict {
+		t.Fatalf("re-enrolling without the node token must conflict, got %v", err)
+	}
+	stolen := req
+	stolen.CurrentToken = "zro_node_not-the-token"
+	if _, err := svc.Enroll(ctx, stolen); KindOf(err) != KindConflict {
+		t.Fatalf("re-enrolling with a wrong token must conflict, got %v", err)
+	}
+
+	req.CurrentToken = first.NodeToken // a restart: same key, same enrollment token, saved node token
+	second, err := svc.Enroll(ctx, req)
 	if err != nil {
 		t.Fatal(err)
 	}

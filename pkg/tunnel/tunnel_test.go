@@ -55,14 +55,6 @@ func TestTunnelLocalServiceExposure(t *testing.T) {
 	if unregisteredRec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for unknown hostname, got %d", unregisteredRec.Code)
 	}
-
-	// 5. Test IngressRouter
-	router := NewIngressRouter()
-	router.Register("api.cubis.internal", "100.64.0.10:8080")
-	target, found := router.Lookup("api.cubis.internal")
-	if !found || target != "100.64.0.10:8080" {
-		t.Fatalf("ingress router lookup failed: target=%s, found=%v", target, found)
-	}
 }
 
 func TestSOCKS5TunnelRoundtrip(t *testing.T) {
@@ -87,7 +79,7 @@ func TestSOCKS5TunnelRoundtrip(t *testing.T) {
 	}()
 
 	// 2. Start SOCKS5 Server
-	socksServer := NewSOCKS5Server(nil)
+	socksServer := NewSOCKS5Server((&net.Dialer{}).DialContext)
 	socksListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to bind socks5 listener: %v", err)
@@ -109,10 +101,7 @@ func TestSOCKS5TunnelRoundtrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	conn, err := SOCKS5DialContext(ctx, socksAddr, targetListener.Addr().String())
-	if err != nil {
-		t.Fatalf("SOCKS5DialContext failed: %v", err)
-	}
+	conn := socksConnect(ctx, t, socksAddr, targetListener.Addr().String())
 	defer conn.Close()
 
 	// 4. Send and verify echo
@@ -131,52 +120,29 @@ func TestSOCKS5TunnelRoundtrip(t *testing.T) {
 	}
 }
 
-func TestUDPTunnelRoundtrip(t *testing.T) {
-	// 1. Start target UDP echo server
-	targetConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+// socksConnect performs an RFC 1928 no-auth CONNECT to an IPv4 target.
+func socksConnect(ctx context.Context, t *testing.T, socksAddr, target string) net.Conn {
+	t.Helper()
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", socksAddr)
 	if err != nil {
-		t.Fatalf("failed to bind UDP target: %v", err)
+		t.Fatalf("dial socks server: %v", err)
 	}
-	defer targetConn.Close()
-
-	go func() {
-		buf := make([]byte, 1024)
-		for {
-			n, from, err := targetConn.ReadFromUDP(buf)
-			if err != nil {
-				return
-			}
-			_, _ = targetConn.WriteToUDP(buf[:n], from)
-		}
-	}()
-
-	// 2. Start UDP tunnel pointing to target
-	tunnel, err := NewUDPTunnel("127.0.0.1:0", targetConn.LocalAddr().String())
-	if err != nil {
-		t.Fatalf("NewUDPTunnel failed: %v", err)
-	}
-	defer tunnel.Close()
-
-	// 3. Client sends to UDP tunnel listener
-	clientConn, err := net.Dial("udp", tunnel.localConn.LocalAddr().String())
-	if err != nil {
-		t.Fatalf("failed to dial UDP tunnel: %v", err)
-	}
-	defer clientConn.Close()
-
-	payload := []byte("UDP_PAYLOAD_THROUGH_ZRO_TUNNEL")
-	if _, err := clientConn.Write(payload); err != nil {
-		t.Fatalf("failed to send UDP through tunnel: %v", err)
+	_, _ = conn.Write([]byte{0x05, 0x01, 0x00})
+	greeting := make([]byte, 2)
+	if _, err := io.ReadFull(conn, greeting); err != nil || greeting[1] != 0x00 {
+		t.Fatalf("socks greeting failed: %v %x", err, greeting)
 	}
 
-	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	respBuf := make([]byte, 1024)
-	n, err := clientConn.Read(respBuf)
-	if err != nil {
-		t.Fatalf("failed to receive UDP response through tunnel: %v", err)
+	host, portStr, _ := net.SplitHostPort(target)
+	var port int
+	_, _ = fmt.Sscanf(portStr, "%d", &port)
+	req := append([]byte{0x05, 0x01, 0x00, 0x01}, net.ParseIP(host).To4()...)
+	req = append(req, byte(port>>8), byte(port))
+	_, _ = conn.Write(req)
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(conn, reply); err != nil || reply[1] != 0x00 {
+		t.Fatalf("socks connect failed: %v %x", err, reply)
 	}
-
-	if !bytes.Equal(respBuf[:n], payload) {
-		t.Fatalf("UDP tunnel echo mismatch: expected %s, got %s", payload, respBuf[:n])
-	}
+	return conn
 }

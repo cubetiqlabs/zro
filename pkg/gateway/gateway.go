@@ -117,6 +117,7 @@ func NewDaemon(cfg *config.GatewayConfig) (*Daemon, error) {
 		dynamicHosts:  make(map[string]bool),
 	}
 
+	agent.LoadToken(cfg.StateDir, "gateway.token", &d.token)
 	d.httpClient = &http.Client{
 		Timeout:   10 * time.Second,
 		Transport: controlauth.NewBearerTransport(nil, cfg.PlaneEndpoint, d.token.Get),
@@ -274,6 +275,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	go d.healthCheckWorker(ctx)
 
 	// 4. Automated ACME TLS termination if enabled
+	var httpHandler http.Handler = d.proxyEngine
 	if d.cfg.AutoTLS && d.cfg.Domain != "" {
 		acmeMgr, err := acme.NewManager(acme.Config{
 			Enabled: true,
@@ -288,10 +290,17 @@ func (d *Daemon) Start(ctx context.Context) error {
 				ReadTimeout:  15 * time.Second,
 				WriteTimeout: 15 * time.Second,
 			}
+			// Port 80 must answer ACME HTTP-01 challenges as well, otherwise issuance
+			// depends on TLS-ALPN-01 alone; everything else still reaches the proxy.
+			httpHandler = acmeMgr.HTTPHandler(d.proxyEngine)
 			go func() {
 				slog.Info("ZRO Ingress Gateway HTTPS listening with AutoTLS", "addr", d.cfg.ListenHTTPS, "domain", d.cfg.Domain)
-				_ = d.httpsServer.ListenAndServeTLS("", "")
+				if err := d.httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+					slog.Error("Gateway HTTPS server error", "error", err)
+				}
 			}()
+		} else {
+			slog.Error("AutoTLS is enabled but the ACME manager could not start; serving HTTP only", "error", err)
 		}
 	}
 
@@ -299,7 +308,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if d.cfg.ListenHTTP != "" {
 		d.httpServer = &http.Server{
 			Addr:         d.cfg.ListenHTTP,
-			Handler:      d.proxyEngine,
+			Handler:      httpHandler,
 			ReadTimeout:  15 * time.Second,
 			WriteTimeout: 15 * time.Second,
 		}
@@ -430,6 +439,7 @@ func (d *Daemon) enrollAndConnect(ctx context.Context) error {
 		return fmt.Errorf("enrolled into network %s but network_id is configured as %s; check the enrollment token", enrollResp.NetworkID, d.cfg.NetworkID)
 	}
 	d.token.Set(enrollResp.NodeToken)
+	agent.SaveToken(d.cfg.StateDir, "gateway.token", enrollResp.NodeToken)
 	d.overlayPrefixes = core.OverlayPrefixes(enrollResp.IPv4CIDR, enrollResp.IPv6CIDR)
 	d.nodeID = enrollResp.NodeID
 	d.networkID = enrollResp.NetworkID

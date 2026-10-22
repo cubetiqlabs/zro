@@ -78,6 +78,7 @@ node:
   # netstack: unprivileged userspace TCP/IP stack; no host interface, no routes.
   interface_mode: "tun"
   interface_name: "zro0"
+  socks_listen: "" # e.g. "127.0.0.1:1080": SOCKS5 proxy into the overlay (loopback only, overlay IPs only)
   listen_port: 0 # Shared WireGuard/STUN UDP port; 0 = ephemeral
   mtu: 1420
   enable_p2p: true
@@ -92,7 +93,7 @@ node:
     - name: "internal-api"
       local_address: "127.0.0.1:8080"
       public_hostname: "api.cubis.tech"
-      protocol: "http"
+      protocol: "http" # only http is supported by the gateway
 
 # Cloud-Native Ingress Gateway & Load Balancer
 gateway:

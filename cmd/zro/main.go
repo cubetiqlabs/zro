@@ -21,7 +21,6 @@ import (
 	"github.com/cubis/zro/pkg/gateway"
 	"github.com/cubis/zro/pkg/node"
 	"github.com/cubis/zro/pkg/store"
-	"github.com/cubis/zro/pkg/tunnel"
 	"github.com/cubis/zro/pkg/version"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
@@ -71,7 +70,6 @@ func init() {
 	rootCmd.AddCommand(newKeygenCmd())
 	rootCmd.AddCommand(newTokenCmd())
 	rootCmd.AddCommand(newNetworkCmd())
-	rootCmd.AddCommand(newSocksCmd())
 	rootCmd.AddCommand(newP2PCmd())
 }
 
@@ -388,31 +386,6 @@ func newNetworkCmd() *cobra.Command {
 	createCmd.Flags().StringVar(&apiKey, "api-key", os.Getenv("ZRO_API_KEY"), "Tenant API key (default $ZRO_API_KEY)")
 
 	cmd.AddCommand(createCmd)
-	return cmd
-}
-
-func newSocksCmd() *cobra.Command {
-	var listenAddr string
-	cmd := &cobra.Command{
-		Use:   "socks",
-		Short: "Run the built-in SOCKS5 proxy server for tunneling any application",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			srv := tunnel.NewSOCKS5Server(nil)
-			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-			defer stop()
-
-			go func() {
-				if err := srv.ListenAndServe(listenAddr); err != nil && err != http.ErrServerClosed {
-					slog.Error("SOCKS5 server error", "error", err)
-				}
-			}()
-
-			<-ctx.Done()
-			slog.Info("Stopping SOCKS5 server...")
-			return srv.Close()
-		},
-	}
-	cmd.Flags().StringVarP(&listenAddr, "listen", "l", ":1080", "Listen address for SOCKS5 proxy")
 	return cmd
 }
 

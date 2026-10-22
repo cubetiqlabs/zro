@@ -5,6 +5,7 @@ package service
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"net"
 	"regexp"
@@ -48,9 +49,6 @@ func New(cfg *config.ControlPlaneConfig, db *store.DB, bus *events.Bus) *Service
 	}
 }
 
-// Delegator exposes the shared smart-routing engine (probe history, PoP health).
-func (s *Service) Delegator() *delegation.Engine { return s.delegator }
-
 // publish emits a change event limited to scope; data also carries the event name.
 func (s *Service) publish(scope events.Scope, name string, data map[string]any) {
 	data["event"] = name
@@ -70,6 +68,12 @@ type EnrollRequest struct {
 	AllowedPorts core.StringList      `json:"allowed_ports,omitempty"`
 	DefaultDeny  *bool                `json:"default_deny,omitempty"`
 	Probes       []core.LatencySample `json:"probes,omitempty"` // pre-enrollment RTT telemetry
+
+	// CurrentToken is the bearer token the caller already holds for this key, if
+	// any. Re-enrolling a key that is already a member requires it: public keys
+	// are visible to every peer and enrollment tokens live in config files for
+	// good, so neither may be enough to take over an existing node.
+	CurrentToken string `json:"-"`
 }
 
 // EnrollResponse is returned to the newly enrolled node.
@@ -216,6 +220,10 @@ func (s *Service) admit(ctx context.Context, network *core.Network, grant *enrol
 		if existing.NodeType != grant.NodeType {
 			return nil, newErr(KindConflict, "this key is already enrolled as a %s", existing.NodeType)
 		}
+		presented := controlauth.HashToken(req.CurrentToken)
+		if req.CurrentToken == "" || subtle.ConstantTimeCompare([]byte(presented), []byte(existing.TokenHash)) != 1 {
+			return nil, newErr(KindConflict, "this key is already enrolled; present its current node token, or have the network owner remove the node first")
+		}
 		apply(existing)
 		if err := s.db.Nodes.Update(ctx, existing); err != nil {
 			return nil, internal("failed to refresh node", err)
@@ -281,6 +289,9 @@ func (s *Service) dropAllocator(networkID string) {
 	delete(s.ipamCache, networkID)
 	s.ipamMu.Unlock()
 }
+
+// ForgetNetwork drops the cached allocator of a deleted network.
+func (s *Service) ForgetNetwork(networkID string) { s.dropAllocator(networkID) }
 
 // releaseIP returns an address to the cached allocator, if one is loaded.
 func (s *Service) releaseIP(networkID, ip string) {
@@ -429,9 +440,12 @@ func (s *Service) scopeForNetwork(ctx context.Context, networkID string) events.
 // hostnameRE matches an RFC 1123 DNS name (lower-case, dot-separated labels).
 var hostnameRE = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
+// ValidHostname reports whether name is an RFC 1123 DNS name.
+func ValidHostname(name string) bool { return len(name) <= 253 && hostnameRE.MatchString(name) }
+
 func validateTunnel(t *core.Tunnel) error {
 	t.PublicHostname = strings.ToLower(strings.TrimSpace(t.PublicHostname))
-	if len(t.PublicHostname) > 253 || !hostnameRE.MatchString(t.PublicHostname) {
+	if !ValidHostname(t.PublicHostname) {
 		return errors.New("public_hostname must be a valid DNS name")
 	}
 	host, port, err := net.SplitHostPort(t.LocalAddress)
@@ -441,12 +455,14 @@ func validateTunnel(t *core.Tunnel) error {
 	if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
 		return errors.New("local_address has an invalid port")
 	}
+	// The ingress gateway is an HTTP reverse proxy; accepting other protocols
+	// would publish routes nothing can serve.
 	switch t.Protocol {
 	case "":
 		t.Protocol = "http"
-	case "http", "tcp", "grpc":
+	case "http":
 	default:
-		return errors.New("protocol must be http, tcp or grpc")
+		return errors.New("protocol must be http (tcp and grpc ingress are not supported)")
 	}
 	if t.Name == "" {
 		t.Name = t.PublicHostname

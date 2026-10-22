@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	v1 "github.com/cubis/zro/api/proto/v1"
@@ -15,6 +16,7 @@ import (
 	"github.com/cubis/zro/pkg/store"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -157,6 +159,7 @@ func (s *Server) Enroll(ctx context.Context, req *v1.EnrollRequest) (*v1.EnrollR
 		AllowedPorts: req.AllowedPorts,
 		DefaultDeny:  req.DefaultDeny,
 		Probes:       probes,
+		CurrentToken: bearerFromContext(ctx),
 	})
 	if err != nil {
 		return nil, toStatus(err)
@@ -369,7 +372,13 @@ func (s *Server) StreamMeshEvents(req *v1.StreamEventsRequest, stream v1.Control
 	}
 }
 
-// BroadcastEvent publishes an unscoped (control-plane wide) event.
-func (s *Server) BroadcastEvent(eventType string, payload any) {
-	s.bus.Publish(events.Scope{}, eventType, payload)
+// bearerFromContext returns the bearer token in the call's metadata, if any.
+func bearerFromContext(ctx context.Context) string {
+	md, _ := metadata.FromIncomingContext(ctx)
+	for _, v := range md.Get("authorization") {
+		if tok, ok := strings.CutPrefix(v, "Bearer "); ok {
+			return strings.TrimSpace(tok)
+		}
+	}
+	return ""
 }

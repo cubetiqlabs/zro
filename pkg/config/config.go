@@ -77,23 +77,25 @@ type LocalTunnelConfig struct {
 	Name           string `mapstructure:"name"`
 	LocalAddress   string `mapstructure:"local_address"`   // "127.0.0.1:8080"
 	PublicHostname string `mapstructure:"public_hostname"` // "app.cubis.tech"
-	Protocol       string `mapstructure:"protocol"`        // "http", "tcp", "grpc"
+	Protocol       string `mapstructure:"protocol"`        // only "http" is supported
 }
 
 // NodeConfig configures the zro-node client daemon.
 type NodeConfig struct {
-	Hostname            string `mapstructure:"hostname"`
-	StateDir            string `mapstructure:"state_dir"` // persists the WireGuard identity; empty = ephemeral
-	NetworkID           string `mapstructure:"network_id"`
-	EnrollmentToken     string `mapstructure:"enrollment_token"`
-	PlaneEndpoint       string `mapstructure:"plane_endpoint"`
-	PlaneTransport      string `mapstructure:"plane_transport"` // "rest" or "grpc"
-	PlaneGRPC           `mapstructure:",squash"`
-	InterfaceMode       string              `mapstructure:"interface_mode"` // "tun" or "netstack"
-	InterfaceName       string              `mapstructure:"interface_name"` // "zro0"
-	ListenPort          int                 `mapstructure:"listen_port"`    // shared UDP port; 0 = ephemeral
-	MTU                 int                 `mapstructure:"mtu"`
-	EnableP2P           bool                `mapstructure:"enable_p2p"`
+	Hostname        string `mapstructure:"hostname"`
+	StateDir        string `mapstructure:"state_dir"` // persists the WireGuard identity; empty = ephemeral
+	NetworkID       string `mapstructure:"network_id"`
+	EnrollmentToken string `mapstructure:"enrollment_token"`
+	PlaneEndpoint   string `mapstructure:"plane_endpoint"`
+	PlaneTransport  string `mapstructure:"plane_transport"` // "rest" or "grpc"
+	PlaneGRPC       `mapstructure:",squash"`
+	InterfaceMode   string `mapstructure:"interface_mode"` // "tun" or "netstack"
+	InterfaceName   string `mapstructure:"interface_name"` // "zro0"
+	ListenPort      int    `mapstructure:"listen_port"`    // shared UDP port; 0 = ephemeral
+	MTU             int    `mapstructure:"mtu"`
+	EnableP2P       bool   `mapstructure:"enable_p2p"`
+	// SOCKSListen, if set, runs a SOCKS5 proxy on this loopback address that reaches the overlay only.
+	SOCKSListen         string              `mapstructure:"socks_listen"`
 	Tags                []string            `mapstructure:"tags"`
 	AllowedInboundPorts []string            `mapstructure:"allowed_inbound_ports"` // e.g. ["5432/tcp"]
 	DefaultDeny         bool                `mapstructure:"default_deny"`          // zero-trust default deny all

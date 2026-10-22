@@ -21,7 +21,7 @@ type IngressDefinition struct {
 	Name           string    `json:"name"`
 	LocalAddress   string    `json:"local_address"`   // e.g. "127.0.0.1:8080"
 	PublicHostname string    `json:"public_hostname"` // e.g. "api.cubis.tech"
-	Protocol       string    `json:"protocol"`        // "http", "tcp"
+	Protocol       string    `json:"protocol"`        // only "http"
 }
 
 // Client manages local service forwarding on a node.
@@ -97,10 +97,17 @@ func (c *Client) PipeTCP(ctx context.Context, incoming net.Conn, localAddress st
 	}
 	defer upstream.Close()
 
-	// Unblock both copies if the caller gives up.
+	return bridge(incoming, upstream, ctx)
+}
+
+// bridge copies a<->b until both directions finish. Each direction half-closes
+// its destination at EOF, so a peer that finished sending can still receive the
+// reply; a real error (or ctx ending) tears both connections down. It returns
+// the first real error.
+func bridge(a, b net.Conn, ctx context.Context) error {
 	stop := context.AfterFunc(ctx, func() {
-		_ = incoming.Close()
-		_ = upstream.Close()
+		_ = a.Close()
+		_ = b.Close()
 	})
 	defer stop()
 
@@ -112,44 +119,16 @@ func (c *Client) PipeTCP(ctx context.Context, incoming net.Conn, localAddress st
 		}
 		errCh <- err
 	}
-	go pipe(upstream, incoming)
-	go pipe(incoming, upstream)
+	go pipe(a, b)
+	go pipe(b, a)
 
 	var first error
 	for i := 0; i < 2; i++ {
 		if err := <-errCh; err != nil && first == nil && ctx.Err() == nil {
 			first = err
-			_ = incoming.Close() // a real error: stop the other direction too
-			_ = upstream.Close()
+			_ = a.Close()
+			_ = b.Close()
 		}
 	}
 	return first
-}
-
-// IngressRouter routes requests at the Gateway level to active node tunnels.
-type IngressRouter struct {
-	mu     sync.RWMutex
-	routes map[string]string // hostname -> node overlay address (e.g. "api.cubis.tech" -> "100.64.0.10:8080")
-}
-
-// NewIngressRouter creates an Ingress router.
-func NewIngressRouter() *IngressRouter {
-	return &IngressRouter{
-		routes: make(map[string]string),
-	}
-}
-
-// Register maps a public hostname to a target overlay address.
-func (r *IngressRouter) Register(hostname, overlayAddr string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.routes[hostname] = overlayAddr
-}
-
-// Lookup finds the overlay destination for a hostname.
-func (r *IngressRouter) Lookup(hostname string) (string, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	target, exists := r.routes[hostname]
-	return target, exists
 }

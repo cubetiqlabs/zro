@@ -100,6 +100,8 @@ the sysctls in.
 | Node token | One node | The node-facing API for its own network. Issued at enrollment, rotated on every re-enrollment, revoked when the node leaves. |
 | Enrollment token | Handed to a node once | Joins one network as one role (`peer` or `gateway`), bound to a hostname and, ideally, the node's public key. Single use per key. |
 
+Without `require_auth`, anonymous callers act as a throwaway development tenant that exists only on an empty database; as soon as a real tenant exists, anonymous tenant requests are refused.
+
 Rules of thumb: set `require_auth: true`; generate every secret with `openssl rand -hex 32`; never put tokens in URLs (they are only accepted in the `Authorization` header); mount a persistent `state_dir` for every agent.
 
 ---
@@ -276,7 +278,9 @@ node:
 ```bash
 zro node -c /etc/zro/zro.yaml
 ```
-Re-enrolling the same key (for example after a restart) returns the same node ID and address and a fresh node token. To leave the mesh permanently, call `DELETE /api/v1/node` with the node token (the address is freed). Nodes that disappear are reaped after `node_ttl`.
+Re-enrolling the same key (for example after a restart) returns the same node ID and address and a fresh node token. The agent saves its node token next to its key in `state_dir` (`node.token` / `gateway.token`, mode 0600) and presents it when re-enrolling; the plane refuses a re-enrollment that cannot, so a leaked enrollment token plus a (public) WireGuard key cannot take over a node. If that file is lost, the network owner removes the node (`DELETE /api/v1/nodes/{id}`) and it enrolls fresh. To remove a node, the owning tenant calls `DELETE /api/v1/nodes/{id}` (list them with `GET /api/v1/nodes?network_id=...`); its tunnels and overlay address are freed. A node can also deregister itself with `DELETE /api/v1/node` (node token), and nodes that disappear are reaped after `node_ttl`. Networks are renamed with `PATCH /api/v1/networks/{id}` (addressing is immutable) and deleted with `DELETE /api/v1/networks/{id}` once empty; an admin removes a PoP with `DELETE /api/v1/pops/{code}`.
+
+`socks_listen: "127.0.0.1:1080"` additionally starts a SOCKS5 proxy into the overlay. It accepts only loopback listeners (it has no authentication) and only reaches overlay IP addresses, never the host network.
 
 `interface_mode: netstack` runs a userspace TCP/IP stack: no `/dev/net/tun`, no capabilities, no host routes. Services then live on the overlay through the daemon (ingress tunnels, `ListenMesh`, `DialMesh`) rather than as host sockets.
 
@@ -295,7 +299,7 @@ node:
     - name: "api-service"
       local_address: "127.0.0.1:3000"
       public_hostname: "api.example.com"
-      protocol: "http"
+      protocol: "http"            # the gateway is an HTTP reverse proxy; tcp and grpc are rejected
 ```
 
 The node listens on its **overlay address** at the tunnel's port and pipes each connection to `local_address`, so the service can stay bound to loopback. The port is opened in the node's inbound policy automatically (you configured the tunnel explicitly). A service already bound to `0.0.0.0` is reachable on the overlay address as is.

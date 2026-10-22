@@ -210,3 +210,27 @@ func TestNetworkPolicyOverridesLocalFirewall(t *testing.T) {
 		t.Fatal("removing the policy must close what it opened")
 	}
 }
+
+func TestSOCKSProxyIsLoopbackAndOverlayOnly(t *testing.T) {
+	d := newMeshNode(t, "sx", "100.64.0.50", config.NodeConfig{DefaultDeny: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Destinations outside the overlay (the host's own network, names) are refused.
+	for _, target := range []string{"127.0.0.1:22", "10.0.0.5:80", "example.com:443"} {
+		if conn, err := d.dialOverlayOnly(ctx, "tcp", target); err == nil {
+			conn.Close()
+			t.Fatalf("%s must not be reachable through the proxy", target)
+		}
+	}
+
+	// Without authentication it may only listen on loopback.
+	d.cfg.SOCKSListen = "0.0.0.0:0"
+	if err := d.startSOCKS(); err == nil {
+		t.Fatal("a non-loopback SOCKS listener must be refused")
+	}
+	d.cfg.SOCKSListen = "127.0.0.1:0"
+	if err := d.startSOCKS(); err != nil {
+		t.Fatalf("loopback listener: %v", err)
+	}
+}

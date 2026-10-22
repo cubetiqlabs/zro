@@ -139,7 +139,6 @@ func (d *Daemon) dropPeer(p core.Node) {
 	delete(d.peers, p.PublicKey)
 	d.peersMu.Unlock()
 	_ = d.wgManager.RemovePeer(p.PublicKey)
-	d.routingTable.RemoveRoute(p.OverlayIPv4)
 	slog.Info("Peer left the mesh", "peer", p.Hostname, "overlay_ipv4", p.OverlayIPv4)
 }
 

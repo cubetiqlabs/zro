@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"golang.org/x/crypto/acme/autocert"
@@ -80,11 +79,4 @@ func (m *Manager) TLSConfig() *tls.Config {
 // and forwards other traffic to the fallback handler or redirects to HTTPS.
 func (m *Manager) HTTPHandler(fallback http.Handler) http.Handler {
 	return m.manager.HTTPHandler(fallback)
-}
-
-// LocalCertFile returns paths to cached certificate files if they exist.
-func (m *Manager) LocalCertFile(domain string) (certFile, keyFile string) {
-	certFile = filepath.Join(m.cfg.CertDir, domain+".crt")
-	keyFile = filepath.Join(m.cfg.CertDir, domain+".key")
-	return certFile, keyFile
 }

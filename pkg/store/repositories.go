@@ -88,7 +88,7 @@ func (r *networkRepo) Create(ctx context.Context, network *core.Network) error {
 
 func (r *networkRepo) GetByID(ctx context.Context, id string) (*core.Network, error) {
 	var net core.Network
-	if err := r.db.WithContext(ctx).Preload("Nodes").Preload("ACLRules").Preload("Routes").First(&net, "id = ?", id).Error; err != nil {
+	if err := r.db.WithContext(ctx).Preload("Nodes").Preload("ACLRules").First(&net, "id = ?", id).Error; err != nil {
 		return nil, err
 	}
 	return &net, nil
@@ -303,36 +303,6 @@ func (r *aclRepo) Delete(ctx context.Context, id uuid.UUID) error {
 }
 
 // --- Route Repository ---
-
-type routeRepo struct {
-	db *gorm.DB
-}
-
-func newRouteRepo(db *gorm.DB) core.RouteRepository {
-	return &routeRepo{db: db}
-}
-
-func (r *routeRepo) Create(ctx context.Context, route *core.Route) error {
-	return r.db.WithContext(ctx).Create(route).Error
-}
-
-func (r *routeRepo) GetByID(ctx context.Context, id uuid.UUID) (*core.Route, error) {
-	var route core.Route
-	if err := r.db.WithContext(ctx).First(&route, "id = ?", id).Error; err != nil {
-		return nil, err
-	}
-	return &route, nil
-}
-
-func (r *routeRepo) ListByNetworkID(ctx context.Context, networkID string) ([]core.Route, error) {
-	var routes []core.Route
-	err := r.db.WithContext(ctx).Where("network_id = ?", networkID).Find(&routes).Error
-	return routes, err
-}
-
-func (r *routeRepo) Delete(ctx context.Context, id uuid.UUID) error {
-	return r.db.WithContext(ctx).Delete(&core.Route{}, "id = ?", id).Error
-}
 
 // --- Tunnel Repository ---
 

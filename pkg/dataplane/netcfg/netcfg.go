@@ -90,25 +90,6 @@ func ConfigureOverlay(name, ipv4, ipv6 string, mtu int) error {
 	return nil
 }
 
-// AddHostRoute points a single overlay /32 (or /128) at the interface so the
-// host stack sends that peer's traffic into the WireGuard device.
-func AddHostRoute(name, ipValue string) error {
-	if err := ValidateInterfaceName(name); err != nil {
-		return err
-	}
-	ip, err := validateIP(ipValue)
-	if err != nil {
-		return err
-	}
-	if runtime.GOOS != "linux" {
-		return nil
-	}
-	if ip.To4() != nil {
-		return run("ip", "route", "replace", ip.String()+"/32", "dev", name)
-	}
-	return run("ip", "-6", "route", "replace", ip.String()+"/128", "dev", name)
-}
-
 // AddSubnetRoute points a CIDR at the interface (used by gateway/edge relay).
 func AddSubnetRoute(name, cidr string) error {
 	if err := ValidateInterfaceName(name); err != nil {

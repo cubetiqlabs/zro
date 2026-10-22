@@ -65,24 +65,6 @@ func DerivePublicKey(privateKeyBase64 string) (string, error) {
 	return base64.StdEncoding.EncodeToString(pub), nil
 }
 
-// GeneratePresharedKey generates a 32-byte pre-shared key (PSK) in base64.
-func GeneratePresharedKey() (string, error) {
-	var psk [KeySize]byte
-	if _, err := rand.Read(psk[:]); err != nil {
-		return "", fmt.Errorf("failed to generate random psk: %w", err)
-	}
-	return base64.StdEncoding.EncodeToString(psk[:]), nil
-}
-
-// GenerateRandomHex returns a cryptographically secure random hex string of n bytes.
-func GenerateRandomHex(n int) (string, error) {
-	bytes := make([]byte, n)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(bytes), nil
-}
-
 // EnrollmentTokenPayload carries node enrollment claims.
 type EnrollmentTokenPayload struct {
 	NetworkID      string    `json:"net"`

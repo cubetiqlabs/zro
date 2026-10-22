@@ -97,7 +97,6 @@ type Network struct {
 
 	Nodes    []Node    `gorm:"foreignKey:NetworkID" json:"nodes,omitempty"`
 	ACLRules []ACLRule `gorm:"foreignKey:NetworkID" json:"acl_rules,omitempty"`
-	Routes   []Route   `gorm:"foreignKey:NetworkID" json:"routes,omitempty"`
 }
 
 // EdgePoP represents a globally distributed Edge Data Plane Node (Public IP PoP).
@@ -107,7 +106,6 @@ type EdgePoP struct {
 	Region         string    `gorm:"size:100;not null" json:"region"`
 	PublicEndpoint string    `gorm:"size:100;not null" json:"public_endpoint"` // e.g. "173.1.1.1:51820"
 	PublicKey      string    `gorm:"size:64;not null" json:"public_key"`
-	PrivateKey     string    `gorm:"size:64" json:"-"` // encrypted / kept local to PoP
 	KeyHash        string    `gorm:"size:64" json:"-"` // SHA-256 of the per-PoP credential issued at first registration
 	IsAnycast      bool      `gorm:"default:false" json:"is_anycast"`
 	Weight         int       `gorm:"default:100" json:"weight"`
@@ -123,7 +121,6 @@ type NodeType string
 const (
 	NodeTypePeer    NodeType = "peer"
 	NodeTypeGateway NodeType = "gateway"
-	NodeTypeTunnel  NodeType = "tunnel"
 )
 
 // Node represents an IPless client, agent, internal service, or gateway in the mesh.
@@ -175,18 +172,6 @@ type ACLRule struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// Route defines subnet router advertisements inside the overlay mesh.
-type Route struct {
-	ID              uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
-	NetworkID       string    `gorm:"size:16;not null;index" json:"network_id"`
-	NodeID          uuid.UUID `gorm:"type:uuid;not null;index" json:"node_id"`
-	DestinationCIDR string    `gorm:"size:50;not null" json:"destination_cidr"` // e.g. "192.168.1.0/24"
-	Metric          int       `gorm:"default:10" json:"metric"`
-	IsAdvertised    bool      `gorm:"default:true" json:"is_advertised"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
-}
-
 // Tunnel defines a Cloudflared-style exposed service from a node to the mesh or gateway.
 type Tunnel struct {
 	ID             uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
@@ -196,7 +181,7 @@ type Tunnel struct {
 	Name           string    `gorm:"size:100;not null" json:"name"`
 	LocalAddress   string    `gorm:"size:100;not null" json:"local_address"` // e.g. "127.0.0.1:8080"
 	PublicHostname string    `gorm:"size:255;index" json:"public_hostname"`  // e.g. "api.cubis.tech"
-	Protocol       string    `gorm:"size:20;default:'http'" json:"protocol"` // "http", "tcp", "grpc"
+	Protocol       string    `gorm:"size:20;default:'http'" json:"protocol"` // only "http" is served by the gateway
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }

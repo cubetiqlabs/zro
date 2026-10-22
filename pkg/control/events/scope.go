@@ -36,11 +36,6 @@ func ForTenant(tenantID uuid.UUID) Scope {
 	return Scope{TenantID: tenantID}
 }
 
-// IsGlobal reports whether the scope observes all events.
-func (s Scope) IsGlobal() bool {
-	return s.Global
-}
-
 // Matches reports whether an event with the given scope is visible to the
 // subscriber. Events without a tenant or network are treated as global
 // control-plane events (for example edge PoP registration).
