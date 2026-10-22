@@ -1,6 +1,10 @@
 # syntax=docker/dockerfile:1.4
 # Stage 1: Statically compiled Go builder
-FROM golang:1.27-alpine AS builder
+# Cross-compile on the build host's architecture; no emulation needed for Go.
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
+
+# go.mod may be newer than the base image's patch release; fetch the toolchain it asks for.
+ENV GOTOOLCHAIN=auto
 
 WORKDIR /src
 
@@ -18,7 +22,9 @@ COPY . .
 ARG VERSION=dev
 ARG COMMIT=
 ARG DATE=
-RUN CGO_ENABLED=0 GOOS=linux go build \
+ARG TARGETOS=linux
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w -extldflags '-static' -X github.com/cubis/zro/pkg/version.Version=${VERSION} -X github.com/cubis/zro/pkg/version.Commit=${COMMIT} -X github.com/cubis/zro/pkg/version.Date=${DATE}" \
     -trimpath \
     -o /bin/zro \

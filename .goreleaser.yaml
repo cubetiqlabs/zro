@@ -1,0 +1,46 @@
+version: 2
+project_name: zro
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: zro
+    main: ./cmd/zro
+    binary: zro
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/cubis/zro/pkg/version.Version={{ .Version }}
+      - -X github.com/cubis/zro/pkg/version.Commit={{ .ShortCommit }}
+      - -X github.com/cubis/zro/pkg/version.Date={{ .Date }}
+
+# zro_<version>_<os>_<arch>.tar.gz (zip on Windows); the installers and `zro update` rely on this name.
+archives:
+  - id: zro
+    formats: [tar.gz]
+    format_overrides:
+      - {goos: windows, formats: [zip]}
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: [README.md, zro.example.yaml]
+
+checksum:
+  name_template: checksums.txt
+
+sboms:
+  - artifacts: archive
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^chore:", "^test:", "Merge pull request"]
+
+release:
+  github:
+    owner: sombochea
+    name: zro
+  prerelease: auto

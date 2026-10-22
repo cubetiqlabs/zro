@@ -143,7 +143,7 @@ docker run -d \
   -e ZRO_CONTROL_PLANE_REQUIRE_AUTH=true \
   -e ZRO_CONTROL_PLANE_EDGE_API_KEY="$EDGE_API_KEY" \
   -e ZRO_CONTROL_PLANE_ADMIN_API_KEY="$ADMIN_API_KEY" \
-  cubis/zro:latest plane
+  ghcr.io/sombochea/zro:latest plane
 ```
 Terminate TLS at the load balancer (or in front of the plane); every credential above travels in headers.
 
@@ -169,7 +169,7 @@ docker run -d \
   -e ZRO_EDGE_STATE_DIR=/var/lib/zro \
   -e ZRO_EDGE_EDGE_API_KEY="$EDGE_API_KEY" \
   -e ZRO_EDGE_PLANE_ENDPOINT="https://zro-plane.cubis.tech:443" \
-  cubis/zro:latest edge
+  ghcr.io/sombochea/zro:latest edge
 ```
 > **Tip:** `ZRO_EDGE_PUBLIC_ENDPOINT=auto` discovers the public IPv4 via STUN. The relay (DERP) listens on the same port number over **TCP**, so open `51820/tcp` as well as `51820/udp` if you want UDP-blocked clients to fall back to it.
 >
@@ -201,7 +201,7 @@ docker run -d \
   -e ZRO_GATEWAY_AUTO_TLS="true" \
   -e ZRO_GATEWAY_DOMAIN="example.com" \
   -e ZRO_GATEWAY_CERT_DIR="/certs" \
-  cubis/zro:latest gw
+  ghcr.io/sombochea/zro:latest gw
 ```
 Without an enrollment token the gateway never joins the mesh and serves only its static routes. A gateway routes to **its own network** only.
 

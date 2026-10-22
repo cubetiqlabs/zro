@@ -38,7 +38,7 @@ proto: ## Regenerate the gRPC stubs (needs protoc, protoc-gen-go, protoc-gen-go-
 	cd api/proto/v1 && protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative control.proto
 
 docker: ## Build the container image
-	docker build --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) -t cubis/zro:$(VERSION) .
+	docker build --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) -t ghcr.io/sombochea/zro:$(VERSION) .
 
 clean: ## Remove build output
 	rm -rf bin
