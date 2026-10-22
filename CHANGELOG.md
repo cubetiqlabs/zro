@@ -2,6 +2,10 @@
 
 ## v0.1.0 - 2026-10-22
 
+- fix(release): install syft so GoReleaser can generate SBOMs (f467b85)
+
+## v0.1.0 - 2026-10-22
+
 - feat: release script (changelog, commit, tag, push) with dry-run and force (7ef1b03)
 - fix(ci): go 1.27.3 for GO-2026-6809, valid OpenAPI lint (b540475)
 - fixed pkg name (5dd2ea4)
