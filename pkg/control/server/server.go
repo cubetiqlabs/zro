@@ -15,6 +15,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cubetiqlabs/zro/api/openapi"
@@ -24,6 +25,7 @@ import (
 	controlauth "github.com/cubetiqlabs/zro/pkg/control/auth"
 	controlevents "github.com/cubetiqlabs/zro/pkg/control/events"
 	controlgrpc "github.com/cubetiqlabs/zro/pkg/control/grpc"
+	"github.com/cubetiqlabs/zro/pkg/control/ipam"
 	"github.com/cubetiqlabs/zro/pkg/control/service"
 	"github.com/cubetiqlabs/zro/pkg/control/ws"
 	"github.com/cubetiqlabs/zro/pkg/core"
@@ -49,6 +51,8 @@ type Server struct {
 	httpServer   *http.Server
 	mux          *http.ServeMux
 	gatewayProxy *proxy.Engine
+	secretGuard  secretGuard
+	popAddrMu    sync.Mutex // serializes PoP address allocation
 
 	// High-performance Realtime Communication
 	grpcServer *grpc.Server
@@ -571,6 +575,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/networks", s.tenantAuthMiddleware(s.handleCreateNetwork))
 	s.mux.HandleFunc("GET /api/v1/networks", s.tenantAuthMiddleware(s.handleListNetworks))
 	s.mux.HandleFunc("POST /api/v1/networks/{id}/tokens", s.tenantAuthMiddleware(s.handleCreateEnrollmentToken))
+	s.mux.HandleFunc("POST /api/v1/tokens", s.handleMintTokenWithSecret)
+	s.mux.HandleFunc("GET /ui/tokens", s.handleTokenPage)
+	s.mux.HandleFunc("GET /ui/tokens.js", s.handleTokenScript)
 
 	// Tenant administration (bootstrap admin key; disabled when admin_api_key is empty)
 	s.mux.HandleFunc("POST /api/v1/tenants", s.adminAuthMiddleware(s.handleCreateTenant))
@@ -778,6 +785,10 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 	var pop core.EdgePoP
 	if existing != nil {
 		pop = *existing
+		if err := s.assignPoPAddress(r.Context(), &pop); err != nil {
+			apiError(w, "failed to assign PoP mesh address", http.StatusInternalServerError)
+			return
+		}
 		if keyHash != "" {
 			pop.KeyHash = keyHash
 		}
@@ -806,6 +817,10 @@ func (s *Server) handleRegisterEdgePoP(w http.ResponseWriter, r *http.Request) {
 			LastSeenAt:     time.Now(),
 			CreatedAt:      time.Now(),
 			UpdatedAt:      time.Now(),
+		}
+		if err := s.assignPoPAddress(r.Context(), &pop); err != nil {
+			apiError(w, "failed to assign PoP mesh address", http.StatusInternalServerError)
+			return
 		}
 		if err := s.db.EdgePoPs.Create(r.Context(), &pop); err != nil {
 			apiError(w, "failed to register PoP", http.StatusInternalServerError)
@@ -958,29 +973,53 @@ func (s *Server) popWatchWorker(ctx context.Context) {
 	}
 }
 
+// assignPoPAddress gives pop a stable mesh address from the reserved block at
+// the top of the default overlay CIDR. PoPs keep their address once set.
+// ponytail: a process-local lock; replicas registering the same new PoP code at
+// the same instant could pick one index; add a unique index if that matters.
+func (s *Server) assignPoPAddress(ctx context.Context, pop *core.EdgePoP) error {
+	if pop.OverlayIPv4 != "" {
+		return nil
+	}
+	s.popAddrMu.Lock()
+	defer s.popAddrMu.Unlock()
+	pops, err := s.db.EdgePoPs.ListAll(ctx)
+	if err != nil {
+		return err
+	}
+	prefixes := core.OverlayPrefixes(s.cfg.DefaultCIDRv4, s.cfg.DefaultCIDRv6)
+	used := make(map[string]bool, len(pops))
+	for _, p := range pops {
+		used[p.OverlayIPv4] = true
+	}
+	for i := 1; i <= ipam.PoPReserve; i++ {
+		v4, err := ipam.PoPAddress(prefixes[0], i)
+		if err != nil {
+			return err
+		}
+		if used[v4] {
+			continue
+		}
+		v6, err := ipam.DeriveIPv6(prefixes[1], v4)
+		if err != nil {
+			return err
+		}
+		pop.OverlayIPv4, pop.OverlayIPv6 = v4, v6
+		return nil
+	}
+	return errors.New("no free PoP mesh address")
+}
+
 // EdgeSyncResponse is the mesh state returned to edge PoPs.
 type EdgeSyncResponse = service.EdgeSnapshot
 
 func (s *Server) handleEdgeSync(w http.ResponseWriter, r *http.Request) {
-	pops, _ := s.db.EdgePoPs.ListHealthy(r.Context())
-	var allNodes []core.Node
-
-	// Edge PoPs are global infrastructure: synchronize nodes from every tenant
-	// and network, not just the first tenant returned by the database.
-	tenants, _ := s.db.Tenants.List(r.Context())
-	for _, t := range tenants {
-		nets, _ := s.db.Networks.ListByTenantID(r.Context(), t.ID)
-		for _, n := range nets {
-			nodes, _ := s.db.Nodes.ListByNetworkID(r.Context(), n.ID)
-			allNodes = append(allNodes, nodes...)
-		}
+	snap, err := s.svc.EdgeSync(r.Context())
+	if err != nil {
+		writeServiceError(w, err)
+		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(EdgeSyncResponse{
-		PoPs:  pops,
-		Nodes: allNodes,
-	})
+	writeJSON(w, http.StatusOK, snap)
 }
 
 // Wire types shared with clients; defined in the service layer.

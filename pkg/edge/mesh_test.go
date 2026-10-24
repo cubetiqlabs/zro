@@ -112,3 +112,18 @@ func TestRelayAuthorizationFailsClosedAndKnowsTheMesh(t *testing.T) {
 		t.Fatal("an unknown key must be refused")
 	}
 }
+
+func TestPlanPeersRoutesPoPAddressThroughThatPoP(t *testing.T) {
+	st := &meshState{PoPs: []core.EdgePoP{
+		{PoPCode: "KH", PublicKey: "a", OverlayIPv4: "100.64.255.254", OverlayIPv6: "fd00::fe"},
+		{PoPCode: "SG", PublicKey: "b", OverlayIPv4: "100.64.255.253"},
+	}}
+	for _, p := range planPeers("KH", st) {
+		if p.PublicKey == "b" && (len(p.AllowedIPs) != 1 || p.AllowedIPs[0] != "100.64.255.253/32") {
+			t.Fatalf("allowed ips = %v", p.AllowedIPs)
+		}
+		if p.PublicKey == "a" {
+			t.Fatal("self must not be a peer")
+		}
+	}
+}

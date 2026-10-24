@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/cubetiqlabs/zro/pkg/config"
@@ -116,7 +119,7 @@ func NewPoPDaemon(cfg *config.EdgeConfig) (*PoPDaemon, error) {
 	}
 	e.httpClient = &http.Client{
 		Timeout:   10 * time.Second,
-		Transport: controlauth.NewBearerTransport(nil, cfg.PlaneEndpoint, e.credential),
+		Transport: controlauth.NewBearerTransport(newPlaneTransport(), cfg.PlaneEndpoint, e.credential),
 	}
 
 	// Without a kernel TUN (no privileges) nothing would route between peers, so
@@ -144,6 +147,9 @@ func NewPoPDaemon(cfg *config.EdgeConfig) (*PoPDaemon, error) {
 	// outbound tunnel.
 	if err := netcfg.EnableForwarding(); err != nil {
 		slog.Warn("Could not enable IP forwarding on edge (relay may fail)", "error", err)
+	}
+	if err := netcfg.EnsureForwardAccept(iface); err != nil {
+		slog.Warn("Could not allow overlay forwarding in the host firewall (relay may fail)", "error", err)
 	}
 	// Resolve public or private endpoint dynamically (auto discovery, env override, or internal mode)
 	resolvedEndpoint := netutil.ResolveEndpoint(cfg.PublicEndpoint, cfg.ListenPort, cfg.UsePrivateIP)
@@ -296,9 +302,19 @@ func (e *PoPDaemon) registerWithControlPlane(ctx context.Context) bool {
 	// The first registration claims the PoP and returns its own credential, which
 	// replaces the shared registration key from then on.
 	var reg struct {
-		PopKey string `json:"pop_key"`
+		PopKey      string `json:"pop_key"`
+		OverlayIPv4 string `json:"overlay_ipv4"`
+		OverlayIPv6 string `json:"overlay_ipv6"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&reg); err == nil && reg.PopKey != "" {
+	_ = json.NewDecoder(resp.Body).Decode(&reg)
+	if reg.OverlayIPv4 != "" {
+		if err := netcfg.ConfigureOverlay(e.cfg.InterfaceName, reg.OverlayIPv4, reg.OverlayIPv6, e.cfg.MTU); err != nil {
+			slog.Warn("Could not assign the PoP mesh address", "address", reg.OverlayIPv4, "error", err)
+		} else {
+			slog.Info("PoP mesh address assigned", "ipv4", reg.OverlayIPv4, "ipv6", reg.OverlayIPv6)
+		}
+	}
+	if reg.PopKey != "" {
 		e.popKey.Set(reg.PopKey)
 		if e.cfg.StateDir != "" {
 			if err := identity.WriteSecret(e.cfg.StateDir, popKeyFile, reg.PopKey); err != nil {
@@ -435,4 +451,39 @@ func (e *PoPDaemon) realtimeListener(ctx context.Context) {
 		slog.Debug("Mesh change received", "pop_code", e.cfg.PoPCode, "events", evs)
 		e.syncMeshTopology(ctx)
 	})
+}
+
+// planeTransport talks to the plane, often through a CDN or load balancer that
+// closes idle connections without notice. Idle connections are dropped early,
+// and a request that hits a connection the peer already reset is replayed once
+// on a fresh one (every edge call to the plane is safe to repeat).
+type planeTransport struct{ base *http.Transport }
+
+func newPlaneTransport() http.RoundTripper {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.IdleConnTimeout = 30 * time.Second
+	return &planeTransport{base: t}
+}
+
+func (p *planeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := p.base.RoundTrip(req)
+	if err == nil || !isConnReset(err) || req.Context().Err() != nil {
+		return resp, err
+	}
+	if req.Body != nil && req.GetBody != nil {
+		body, gerr := req.GetBody()
+		if gerr != nil {
+			return nil, err
+		}
+		req = req.Clone(req.Context())
+		req.Body = body
+	} else if req.Body != nil {
+		return nil, err
+	}
+	p.base.CloseIdleConnections()
+	return p.base.RoundTrip(req)
+}
+
+func isConnReset(err error) bool {
+	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }

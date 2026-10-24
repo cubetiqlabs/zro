@@ -13,6 +13,11 @@ var (
 	ErrInvalidCIDR = errors.New("invalid CIDR specification")
 )
 
+// PoPReserve is how many addresses at the top of a large subnet are kept for
+// edge PoPs (index 1 is the last usable address). Subnets of 1024 addresses or
+// fewer reserve nothing, so small networks keep their whole range.
+const PoPReserve = 250
+
 // IPAM manages overlay IP allocation for virtual networks.
 type IPAM struct {
 	mu            sync.Mutex
@@ -20,6 +25,7 @@ type IPAM struct {
 	baseIP        uint32
 	netmask       uint32
 	broadcastIP   uint32
+	limit         uint32 // first address AllocateNext may not hand out
 	allocatedIPv4 map[uint32]bool
 }
 
@@ -47,6 +53,11 @@ func NewIPAM(cidr string, existingAllocations []string) (*IPAM, error) {
 		allocatedIPv4: make(map[uint32]bool),
 	}
 
+	allocator.limit = broadcast
+	if broadcast-base > 4*PoPReserve {
+		allocator.limit = broadcast - PoPReserve
+	}
+
 	// Reserve network address (.0) and broadcast address
 	allocator.allocatedIPv4[base] = true
 	allocator.allocatedIPv4[broadcast] = true
@@ -72,7 +83,7 @@ func (i *IPAM) AllocateNext() (string, error) {
 
 	// Start searching from base + 2 (.2 onwards)
 	current := i.baseIP + 2
-	for current < i.broadcastIP {
+	for current < i.limit {
 		if !i.allocatedIPv4[current] {
 			i.allocatedIPv4[current] = true
 			return uint32ToIP(current).String(), nil
@@ -119,4 +130,19 @@ func uint32ToIP(n uint32) net.IP {
 	ip := make(net.IP, 4)
 	binary.BigEndian.PutUint32(ip, n)
 	return ip
+}
+
+// PoPAddress is the overlay address of the edge PoP with the given index
+// (1..PoPReserve), counted down from the top of cidr.
+func PoPAddress(cidr string, index int) (string, error) {
+	ip, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil || ip.To4() == nil {
+		return "", fmt.Errorf("%w: %s", ErrInvalidCIDR, cidr)
+	}
+	if index < 1 || index > PoPReserve {
+		return "", fmt.Errorf("pop index %d out of range 1..%d", index, PoPReserve)
+	}
+	mask := binary.BigEndian.Uint32(ipNet.Mask)
+	top := binary.BigEndian.Uint32(ipNet.IP.To4()) | ^mask
+	return uint32ToIP(top - uint32(index)).String(), nil
 }

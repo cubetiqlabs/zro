@@ -60,6 +60,7 @@ type Daemon struct {
 	httpClient      *http.Client
 	token           controlauth.TokenHolder // bearer token issued at enrollment
 	popLink         *agent.PoPLink
+	endpoints       []string // reflexive addresses peers can reach us at; set before workers start
 	overlayPrefixes []string // routed into the interface; reported by the plane at enrollment
 	grpcClient      *controlgrpc.Client
 
@@ -196,6 +197,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if d.cfg.NetworkID != "" && !strings.EqualFold(d.cfg.NetworkID, enrollResp.NetworkID) {
 		return fmt.Errorf("enrolled into network %s but network_id is configured as %s; check the enrollment token", enrollResp.NetworkID, d.cfg.NetworkID)
 	}
+	d.endpoints = endpoints
 	d.token.Set(enrollResp.NodeToken)
 	agent.SaveToken(d.cfg.StateDir, "node.token", enrollResp.NodeToken)
 	d.policy.setRules(enrollResp.ACLRules)
@@ -531,9 +533,11 @@ func (d *Daemon) connectToEdgePoP(pop core.EdgePoP) error {
 // 4. If blocked by Symmetric NAT -> Falls back to Edge Backbone Mesh relay transit
 func (d *Daemon) DiscoverAndConnectPeer(ctx context.Context, targetOverlayIP string) (*router.RouteTarget, error) {
 	// 1. Request P2P discovery from Control Plane
-	var endpoints []string
-	if d.udpConn != nil {
-		endpoints = append(endpoints, d.udpConn.LocalAddr().String())
+	// Peers can only punch toward an address that is reachable from outside: the
+	// reflexive one, not the wildcard local socket address.
+	endpoints := d.endpoints
+	if len(endpoints) == 0 && d.udpConn != nil {
+		endpoints = []string{d.udpConn.LocalAddr().String()}
 	}
 
 	discResp, err := d.discoverPeer(ctx, server.P2PDiscoverRequest{

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZRO join token</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fff; --fg:#14181f; --muted:#5b6472; --line:#d5dae1; --accent:#1d5fd1; --field:#f5f7fa; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#12151b; --fg:#e8ebf0; --muted:#9aa4b2; --line:#2a303a; --accent:#6aa3ff; --field:#1a1f27; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, sans-serif; }
+  main { max-width:34rem; margin:0 auto; padding:2rem 16px; }
+  h1 { font-size:1.4rem; margin:0 0 .25rem; }
+  p.lead { color:var(--muted); margin:0 0 1.5rem; }
+  label { display:block; font-weight:600; margin:1rem 0 .25rem; }
+  input, select { width:100%; box-sizing:border-box; padding:.55rem .6rem; background:var(--field); color:var(--fg); border:1px solid var(--line); border-radius:6px; font:inherit; }
+  small { color:var(--muted); }
+  button { margin-top:1.25rem; padding:.6rem 1.1rem; background:var(--accent); color:#fff; border:0; border-radius:6px; font:inherit; font-weight:600; cursor:pointer; }
+  pre { background:var(--field); border:1px solid var(--line); border-radius:6px; padding:.75rem; overflow-x:auto; white-space:pre-wrap; word-break:break-all; }
+  #err { color:#c0392b; margin-top:1rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Create a join token</h1>
+  <p class="lead">Mint a single-use enrollment token with this plane's cluster secret. Nothing is stored in the browser.</p>
+  <form id="f" autocomplete="off">
+    <label for="secret">Cluster secret</label>
+    <input id="secret" type="password" required>
+    <label for="network">Network ID</label>
+    <input id="network" required pattern="[0-9a-fA-F]{16}" placeholder="8056c2e21c000001">
+    <label for="hostname">Hostname <small>(optional, locks the token to one machine)</small></label>
+    <input id="hostname" placeholder="web-1">
+    <label for="type">Role</label>
+    <select id="type"><option value="peer">peer</option><option value="gateway">gateway</option></select>
+    <label for="hours">Valid for (hours)</label>
+    <input id="hours" type="number" min="1" max="720" value="24">
+    <button type="submit">Create token</button>
+  </form>
+  <p id="err" role="alert"></p>
+  <div id="out" hidden>
+    <h2>Run on the new machine</h2>
+    <pre id="cmd"></pre>
+    <small id="exp"></small>
+  </div>
+</main>
+<script src="/ui/tokens.js"></script>
+</body>
+</html>

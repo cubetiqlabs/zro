@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -106,7 +107,11 @@ func NewManager(interfaceName string, opts ...Option) (*Manager, error) {
 		if m.sharedBind != nil {
 			bind = m.sharedBind
 		}
-		logger := device.NewLogger(device.LogLevelSilent, fmt.Sprintf("[%s] ", interfaceName))
+		level := device.LogLevelSilent
+		if os.Getenv("ZRO_WG_LOG") == "verbose" { // protocol-level tracing for diagnosing handshakes
+			level = device.LogLevelVerbose
+		}
+		logger := device.NewLogger(level, fmt.Sprintf("[%s] ", interfaceName))
 		userDev := device.NewDevice(m.tunDevice, bind, logger)
 		m.userDevice = userDev
 		m.isUserspace = true

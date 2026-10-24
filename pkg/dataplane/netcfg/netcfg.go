@@ -126,6 +126,36 @@ func EnableForwarding() error {
 	return enableForwarding(forwardingPaths)
 }
 
+// EnsureForwardAccept lets the host firewall pass relayed overlay traffic that
+// enters and leaves through the same interface. Docker sets the FORWARD policy
+// to DROP, which silently kills edge relaying. It is a no-op when no firewall
+// tool exists or the chain is not restrictive.
+func EnsureForwardAccept(name string) error {
+	if err := ValidateInterfaceName(name); err != nil {
+		return err
+	}
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	var errs []string
+	for _, bin := range []string{"iptables", "ip6tables"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			continue
+		}
+		rule := []string{"FORWARD", "-i", name, "-o", name, "-j", "ACCEPT"}
+		if exec.Command(bin, append([]string{"-C"}, rule...)...).Run() == nil {
+			continue // already present
+		}
+		if err := run(bin, append([]string{"-I"}, rule...)...); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("could not allow overlay forwarding: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
 var forwardingPaths = []string{
 	"/proc/sys/net/ipv4/ip_forward",
 	"/proc/sys/net/ipv6/conf/all/forwarding",

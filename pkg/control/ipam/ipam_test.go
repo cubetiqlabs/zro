@@ -47,3 +47,24 @@ func TestIPAMAllocations(t *testing.T) {
 		t.Fatalf("expected non-empty derived IPv6")
 	}
 }
+
+func TestPoPReserve(t *testing.T) {
+	a, err := PoPAddress("100.64.0.0/16", 1)
+	if err != nil || a != "100.64.255.254" {
+		t.Fatalf("PoPAddress = %q, %v", a, err)
+	}
+	if _, err := PoPAddress("100.64.0.0/16", PoPReserve+1); err == nil {
+		t.Fatal("want error beyond the reserved block")
+	}
+	mgr, _ := NewIPAM("100.64.0.0/22", nil)
+	for {
+		ip, err := mgr.AllocateNext()
+		if err != nil {
+			break
+		}
+		last, _ := PoPAddress("100.64.0.0/22", PoPReserve)
+		if ip == last {
+			t.Fatalf("node allocator handed out reserved address %s", ip)
+		}
+	}
+}

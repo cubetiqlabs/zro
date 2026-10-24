@@ -106,7 +106,9 @@ type EdgePoP struct {
 	Region         string    `gorm:"size:100;not null" json:"region"`
 	PublicEndpoint string    `gorm:"size:100;not null" json:"public_endpoint"` // e.g. "173.1.1.1:51820"
 	PublicKey      string    `gorm:"size:64;not null" json:"public_key"`
-	KeyHash        string    `gorm:"size:64" json:"-"` // SHA-256 of the per-PoP credential issued at first registration
+	KeyHash        string    `gorm:"size:64" json:"-"`                      // SHA-256 of the per-PoP credential issued at first registration
+	OverlayIPv4    string    `gorm:"size:45" json:"overlay_ipv4,omitempty"` // the PoP's own mesh address
+	OverlayIPv6    string    `gorm:"size:45" json:"overlay_ipv6,omitempty"`
 	IsAnycast      bool      `gorm:"default:false" json:"is_anycast"`
 	Weight         int       `gorm:"default:100" json:"weight"`
 	IsHealthy      bool      `gorm:"default:true" json:"is_healthy"`

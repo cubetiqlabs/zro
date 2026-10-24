@@ -52,22 +52,29 @@ export KEY=zro_key_...            # the api_key from the reply
 curl -s -X POST $PLANE/api/v1/networks -H "Authorization: Bearer $KEY" \
   -H 'Content-Type: application/json' -d '{"name":"Production"}'
 NET=...                           # the id from the reply
-
-# Mint a join token (run inside the plane container, which already holds the secret).
-docker compose -f docker-compose.prod.yml exec plane zro token --network-id $NET --hours 24
 ```
 
-Or mint one remotely with just your tenant API key (no cluster secret, nothing to exec into):
+Now mint a token. Each token is **single use** (one per machine) and expires; pick whichever
+way fits. All three produce the same `zro_tok_…` token.
 
-```sh
-curl -sX POST https://zro.example.com/api/v1/networks/$NET/tokens \
-  -H "X-API-Key: $TENANT_KEY" -d '{"hostname":"web-1","hours":24}'   # body optional
-# -> {"token":"zro_tok_…","join_command":"zro join --plane … --token …","expires_at":"…"}
-# or: zro token --plane https://zro.example.com --api-key $TENANT_KEY --network-id $NET
+| You have | Do this |
+|---|---|
+| shell access to the plane | `docker compose -f docker-compose.prod.yml exec plane zro token --network-id $NET --hostname web-1` |
+| your tenant API key | `curl -sX POST $PLANE/api/v1/networks/$NET/tokens -H "X-API-Key: $KEY" -d '{"hostname":"web-1","hours":24}'` |
+| the cluster secret only | open `$PLANE/ui/tokens`, or `curl -sX POST $PLANE/api/v1/tokens -H "X-Cluster-Secret: $CLUSTER_SECRET" -d '{"network_id":"'$NET'","hostname":"web-1"}'` |
+
+The last two answer with the token and a ready-made command:
+
+```json
+{"token":"zro_tok_eyJuZXQi…","network_id":"a5b8112bcd5cdbd1","node_type":"peer",
+ "expires_at":"2026-10-25T09:33:11Z",
+ "join_command":"zro join --plane https://zro.example.com --token zro_tok_eyJuZXQi…"}
 ```
 
-Copy the `zro_tok_…` token. Each token is **single use**: mint one per machine.
-`--hostname NAME` locks a token to one machine name.
+`zro token --plane $PLANE --api-key $KEY --network-id $NET` does the tenant-key call for you.
+`hostname` (optional) locks the token to one machine name; `node_type` is `peer` (default) or `gateway`.
+The secret form refuses to work until `CLUSTER_SECRET` is changed from the shipped placeholder, and
+pauses for a minute after 10 wrong secrets.
 
 ## 3. Join a machine
 
@@ -116,7 +123,12 @@ Join a second machine with a second token, then from the first:
 
 ```bash
 ping 100.64.0.3                       # the second machine's overlay address
+ping 100.127.255.254                  # an edge PoP's own mesh address (see "Edge PoP" below)
 ```
+
+`ping` (ICMP) is always allowed between mesh members: the inbound policy below applies to TCP ports.
+It needs the default kernel interface; a `--netstack` machine speaks TCP only and cannot answer ping.
+Traffic goes straight between machines when their NATs allow and through the nearest edge PoP otherwise.
 
 By default machines **deny all inbound traffic**. Open what you need with an ACL rule
 ([api.md §4](api.md)) or, for one machine, `allowed_inbound_ports` in its config file
@@ -147,7 +159,10 @@ volumes: {edge-state: {}}
 ```
 
 With `network_mode: host`, run `sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1` on the host instead.
-The edge logs `Edge mesh synchronized` once it has the node list.
+The edge logs `Edge mesh synchronized` once it has the node list, and `PoP mesh address assigned` with its own
+address on the network (allocated from the top of the default overlay range, e.g. `100.127.255.254`; it appears
+on the `zro-edge` interface). Networks created with a custom CIDR should sit inside the default range
+(`100.64.0.0/10`) for nodes to reach the PoP addresses.
 
 Nodes probe every PoP every 15s, follow the plane's choice of nearest PoP, and fail over by themselves when their
 PoP stops answering; they also keep retrying enrollment while the plane is down.
@@ -161,6 +176,9 @@ PoP stops answering; they also keep retrying enrollment while the plane is down.
 | `hostname does not match token` | the token is locked to a name; pass `--hostname NAME` |
 | `connection refused` / TLS errors | check `--plane` is the HTTPS URL and the proxy forwards to port 8443 |
 | `operation not permitted` creating interface | run with `sudo`, or use `--netstack` |
+| `Heartbeat … connection reset by peer` (edge behind Cloudflare/a proxy) | a proxy closed an idle connection; the edge retries on a fresh one automatically, so a single warning is harmless |
+| edge works but machines cannot reach each other | the edge needs forwarding: set the two `sysctls` above; on a host with a firewall the edge adds its own `FORWARD` rule (needs `iptables`) |
+| `ping` works to the edge but not to a machine | check both machines are enrolled in the **same network** and that UDP/TCP 51821 is open on the edge |
 | plane exits at start | a required `.env` value is missing or weak (`CLUSTER_SECRET`) |
 
 More: [deployment.md](deployment.md) (edges, gateways, HA), [api.md](api.md) (REST API).
