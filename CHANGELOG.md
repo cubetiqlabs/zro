@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.2 - 2026-10-24
+
+- docs: three ways to mint a token, verify the mesh, edge address, troubleshooting (fe7a410)
+- feat(control): mint enrollment tokens with the cluster secret (818e1f5)
+- docs(api): quote overlay_ipv4 description (b1c3332)
+- fix(mesh): edge routes via REST sync, reachable P2P endpoints, mesh smoke test (29a83b8)
+- style: gofmt models (c781efc)
+- feat(mesh): give each edge PoP a stable mesh address (0fd484c)
+- fix(edge): retry plane calls reset by CDN and allow overlay FORWARD (2e89b72)
+
 ## v0.1.1 - 2026-10-22
 
 - fix(edge,node): reliable PoP failover, edge re-register, and token API (97acade)
