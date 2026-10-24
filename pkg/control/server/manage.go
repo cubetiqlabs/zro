@@ -1,11 +1,14 @@
 package server
 
 import (
+	"crypto/subtle"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	controlevents "github.com/cubetiqlabs/zro/pkg/control/events"
@@ -231,17 +234,34 @@ func (s *Server) handleCreateEnrollmentToken(w http.ResponseWriter, r *http.Requ
 		apiError(w, "network not found", http.StatusNotFound)
 		return
 	}
-	var req struct {
-		Hostname string `json:"hostname"`
-		NodeType string `json:"node_type"`
-		Hours    int    `json:"hours"`
-		PubKey   string `json:"pubkey"`
-	}
-	// An empty body means "all defaults".
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
-		apiError(w, "invalid request body", http.StatusBadRequest)
+	req, ok := decodeTokenRequest(w, r)
+	if !ok {
 		return
 	}
+	s.mintEnrollmentToken(w, network, req)
+}
+
+// tokenRequest is the body of both token endpoints.
+type tokenRequest struct {
+	NetworkID string `json:"network_id"` // only read by POST /api/v1/tokens
+	Hostname  string `json:"hostname"`
+	NodeType  string `json:"node_type"`
+	Hours     int    `json:"hours"`
+	PubKey    string `json:"pubkey"`
+}
+
+// decodeTokenRequest reads the request body; an empty body means "all defaults".
+func decodeTokenRequest(w http.ResponseWriter, r *http.Request) (tokenRequest, bool) {
+	var req tokenRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil && err != io.EOF {
+		apiError(w, "invalid request body", http.StatusBadRequest)
+		return req, false
+	}
+	return req, true
+}
+
+// mintEnrollmentToken validates req and answers with a signed token for network.
+func (s *Server) mintEnrollmentToken(w http.ResponseWriter, network *core.Network, req tokenRequest) {
 	if req.Hours == 0 {
 		req.Hours = defaultTokenHours
 	}
@@ -284,4 +304,91 @@ func (s *Server) handleCreateEnrollmentToken(w http.ResponseWriter, r *http.Requ
 		"token": token, "network_id": network.ID, "node_type": req.NodeType,
 		"expires_at": expires.UTC(), "join_command": join,
 	})
+}
+
+// secretGuard throttles failed cluster-secret attempts: after maxFails misses
+// in a window every attempt is refused until it ends, which makes online
+// guessing impractical. The cost is that an attacker can pause this one
+// endpoint, never the rest of the API.
+type secretGuard struct {
+	mu    sync.Mutex
+	start time.Time
+	fails int
+}
+
+const (
+	secretMaxFails = 10
+	secretWindow   = time.Minute
+)
+
+func (g *secretGuard) blocked() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return time.Since(g.start) < secretWindow && g.fails >= secretMaxFails
+}
+
+func (g *secretGuard) fail() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if time.Since(g.start) >= secretWindow {
+		g.start, g.fails = time.Now(), 0
+	}
+	g.fails++
+}
+
+// handleMintTokenWithSecret mints a token for any network when the caller
+// proves knowledge of the cluster secret, the same capability `zro token
+// --secret` has offline.
+func (s *Server) handleMintTokenWithSecret(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if s.cfg.SecretKey == "" || s.cfg.SecretKey == crypto.DefaultSecretKey {
+		apiError(w, "token minting by secret is disabled until control_plane.secret_key is set", http.StatusForbidden)
+		return
+	}
+	if s.secretGuard.blocked() {
+		w.Header().Set("Retry-After", "60")
+		apiError(w, "too many failed attempts; retry later", http.StatusTooManyRequests)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Cluster-Secret")), []byte(s.cfg.SecretKey)) != 1 {
+		s.secretGuard.fail()
+		apiError(w, "invalid cluster secret", http.StatusUnauthorized)
+		return
+	}
+	req, ok := decodeTokenRequest(w, r)
+	if !ok {
+		return
+	}
+	network, err := s.db.Networks.GetByID(r.Context(), req.NetworkID)
+	if err != nil || network == nil {
+		apiError(w, "network not found", http.StatusNotFound)
+		return
+	}
+	s.mintEnrollmentToken(w, network, req)
+}
+
+//go:embed ui/tokens.html ui/tokens.js
+var tokenUI embed.FS
+
+// handleTokenPage serves the join-token form. The script is a separate file so
+// the page can run under a CSP that forbids inline script.
+func (s *Server) handleTokenPage(w http.ResponseWriter, r *http.Request) {
+	serveUI(w, "ui/tokens.html", "text/html; charset=utf-8")
+}
+
+func (s *Server) handleTokenScript(w http.ResponseWriter, r *http.Request) {
+	serveUI(w, "ui/tokens.js", "text/javascript; charset=utf-8")
+}
+
+func serveUI(w http.ResponseWriter, name, contentType string) {
+	b, err := tokenUI.ReadFile(name)
+	if err != nil {
+		http.NotFound(w, nil)
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_, _ = w.Write(b)
 }

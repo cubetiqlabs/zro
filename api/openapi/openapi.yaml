@@ -224,6 +224,60 @@ paths:
           content: {application/json: {schema: {$ref: "#/components/schemas/EnrollmentToken"}}}
         "400": {$ref: "#/components/responses/BadRequest"}
         "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/tokens:
+    post:
+      tags: [Networks]
+      operationId: createEnrollmentTokenWithSecret
+      summary: Mint a node enrollment token with the cluster secret
+      description: >
+        For operators who hold the plane's `secret_key` but no tenant key (the online twin of
+        `zro token --secret`). Refused while the secret is empty or the shipped placeholder.
+        After 10 wrong secrets in a minute every attempt gets `429` until the minute ends.
+      security: [{ClusterSecret: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - {$ref: "#/components/schemas/CreateTokenRequest"}
+                - type: object
+                  required: [network_id]
+                  properties:
+                    network_id: {$ref: "#/components/schemas/NetworkID"}
+            example: {network_id: 8056c2e21c000001, hostname: web-1, hours: 24}
+      responses:
+        "201":
+          description: The token.
+          content: {application/json: {schema: {$ref: "#/components/schemas/EnrollmentToken"}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "429":
+          description: Too many failed secret attempts; see `Retry-After`.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+  /ui/tokens:
+    get:
+      tags: [Networks]
+      operationId: tokenForm
+      summary: Join-token form
+      description: A small HTML page that calls `POST /api/v1/tokens`. The secret is typed per use and never stored.
+      security: []
+      responses:
+        "200":
+          description: The form.
+          content: {text/html: {schema: {type: string}}}
+  /ui/tokens.js:
+    get:
+      tags: [Networks]
+      operationId: tokenFormScript
+      summary: Script for the join-token form
+      security: []
+      responses:
+        "200":
+          description: The script.
+          content: {text/javascript: {schema: {type: string}}}
   /api/v1/networks/{id}:
     parameters: [{$ref: "#/components/parameters/NetworkID"}]
     get:
@@ -707,6 +761,11 @@ components:
       in: header
       name: X-Admin-Key
       description: The plane's `admin_api_key` (also accepted as a bearer token).
+    ClusterSecret:
+      type: apiKey
+      in: header
+      name: X-Cluster-Secret
+      description: The plane's `secret_key`, the same value that signs enrollment tokens.
     NodeToken:
       type: http
       scheme: bearer

@@ -51,6 +51,7 @@ type Server struct {
 	httpServer   *http.Server
 	mux          *http.ServeMux
 	gatewayProxy *proxy.Engine
+	secretGuard  secretGuard
 	popAddrMu    sync.Mutex // serializes PoP address allocation
 
 	// High-performance Realtime Communication
@@ -574,6 +575,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/networks", s.tenantAuthMiddleware(s.handleCreateNetwork))
 	s.mux.HandleFunc("GET /api/v1/networks", s.tenantAuthMiddleware(s.handleListNetworks))
 	s.mux.HandleFunc("POST /api/v1/networks/{id}/tokens", s.tenantAuthMiddleware(s.handleCreateEnrollmentToken))
+	s.mux.HandleFunc("POST /api/v1/tokens", s.handleMintTokenWithSecret)
+	s.mux.HandleFunc("GET /ui/tokens", s.handleTokenPage)
+	s.mux.HandleFunc("GET /ui/tokens.js", s.handleTokenScript)
 
 	// Tenant administration (bootstrap admin key; disabled when admin_api_key is empty)
 	s.mux.HandleFunc("POST /api/v1/tenants", s.adminAuthMiddleware(s.handleCreateTenant))
