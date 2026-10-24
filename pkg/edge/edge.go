@@ -302,9 +302,19 @@ func (e *PoPDaemon) registerWithControlPlane(ctx context.Context) bool {
 	// The first registration claims the PoP and returns its own credential, which
 	// replaces the shared registration key from then on.
 	var reg struct {
-		PopKey string `json:"pop_key"`
+		PopKey      string `json:"pop_key"`
+		OverlayIPv4 string `json:"overlay_ipv4"`
+		OverlayIPv6 string `json:"overlay_ipv6"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&reg); err == nil && reg.PopKey != "" {
+	_ = json.NewDecoder(resp.Body).Decode(&reg)
+	if reg.OverlayIPv4 != "" {
+		if err := netcfg.ConfigureOverlay(e.cfg.InterfaceName, reg.OverlayIPv4, reg.OverlayIPv6, e.cfg.MTU); err != nil {
+			slog.Warn("Could not assign the PoP mesh address", "address", reg.OverlayIPv4, "error", err)
+		} else {
+			slog.Info("PoP mesh address assigned", "ipv4", reg.OverlayIPv4, "ipv6", reg.OverlayIPv6)
+		}
+	}
+	if reg.PopKey != "" {
 		e.popKey.Set(reg.PopKey)
 		if e.cfg.StateDir != "" {
 			if err := identity.WriteSecret(e.cfg.StateDir, popKeyFile, reg.PopKey); err != nil {

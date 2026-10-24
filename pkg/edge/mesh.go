@@ -42,7 +42,8 @@ func planPeers(self string, st *meshState) []wireguard.PeerConfig {
 	pops := make(map[string]*wireguard.PeerConfig)
 	for _, p := range st.PoPs {
 		if p.PoPCode != self && p.PublicKey != "" {
-			cfg := &wireguard.PeerConfig{PublicKey: p.PublicKey, Endpoint: p.PublicEndpoint}
+			// A PoP's own address is reached through that PoP.
+			cfg := &wireguard.PeerConfig{PublicKey: p.PublicKey, Endpoint: p.PublicEndpoint, AllowedIPs: overlayCIDRs(p.OverlayIPv4, p.OverlayIPv6)}
 			if self < p.PoPCode { // the lower code initiates
 				cfg.PersistentKeepalive = popKeepalive
 			}
@@ -55,10 +56,7 @@ func planPeers(self string, st *meshState) []wireguard.PeerConfig {
 		if n.PublicKey == "" || n.OverlayIPv4 == "" {
 			continue
 		}
-		ips := []string{n.OverlayIPv4 + "/32"}
-		if n.OverlayIPv6 != "" {
-			ips = append(ips, n.OverlayIPv6+"/128")
-		}
+		ips := overlayCIDRs(n.OverlayIPv4, n.OverlayIPv6)
 
 		if home := homeOf(n); home != "" && home != self && pops[home] != nil {
 			pops[home].AllowedIPs = append(pops[home].AllowedIPs, ips...)
@@ -86,6 +84,19 @@ func planPeers(self string, st *meshState) []wireguard.PeerConfig {
 	return peers
 }
 
+// overlayCIDRs turns host addresses into the /32 and /128 prefixes WireGuard
+// routes; empty addresses are skipped.
+func overlayCIDRs(v4, v6 string) []string {
+	var out []string
+	if v4 != "" {
+		out = append(out, v4+"/32")
+	}
+	if v6 != "" {
+		out = append(out, v6+"/128")
+	}
+	return out
+}
+
 func homeOf(n core.Node) string {
 	if n.AssignedPoP != nil {
 		return n.AssignedPoP.PoPCode
@@ -102,7 +113,7 @@ func (e *PoPDaemon) fetchMesh(ctx context.Context) (*meshState, error) {
 		}
 		st := &meshState{Prefixes: g.Prefixes}
 		for _, p := range g.Pops {
-			st.PoPs = append(st.PoPs, core.EdgePoP{PoPCode: p.PopCode, Region: p.Region, PublicEndpoint: p.PublicEndpoint, PublicKey: p.PublicKey})
+			st.PoPs = append(st.PoPs, core.EdgePoP{PoPCode: p.PopCode, Region: p.Region, PublicEndpoint: p.PublicEndpoint, PublicKey: p.PublicKey, OverlayIPv4: p.OverlayIpv4, OverlayIPv6: p.OverlayIpv6})
 		}
 		for _, n := range g.Nodes {
 			node := core.Node{

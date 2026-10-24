@@ -100,6 +100,8 @@ func toProtoPoP(p *core.EdgePoP) *v1.EdgePoP {
 		PublicKey:      p.PublicKey,
 		IsAnycast:      p.IsAnycast,
 		Weight:         int32(p.Weight),
+		OverlayIpv4:    p.OverlayIPv4,
+		OverlayIpv6:    p.OverlayIPv6,
 	}
 }
 

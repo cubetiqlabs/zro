@@ -65,6 +65,8 @@ message EdgePoP {
   string public_key = 5;
   bool is_anycast = 6;
   int32 weight = 7;
+  string overlay_ipv4 = 8;
+  string overlay_ipv6 = 9;
 }
 
 message Node {

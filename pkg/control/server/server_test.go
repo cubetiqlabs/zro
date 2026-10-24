@@ -1120,3 +1120,37 @@ func TestAPIContract(t *testing.T) {
 		t.Fatalf("missing tenant: %d %s", resp.StatusCode, body)
 	}
 }
+
+func TestEdgeRegistrationAssignsStableMeshAddress(t *testing.T) {
+	db, err := store.NewDB("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(&config.ControlPlaneConfig{SecretKey: "k", DefaultCIDRv4: "100.64.0.0/16", DefaultCIDRv6: "fd00:cafe::/64"}, db)
+	register := func(code, key, cred string) (core.EdgePoP, string) {
+		body, _ := json.Marshal(RegisterEdgePoPRequest{PoPCode: code, Region: "r", PublicEndpoint: "203.0.113.1:51820", PublicKey: key})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/api/v1/edge/register", bytes.NewReader(body))
+		if cred != "" {
+			req.Header.Set("Authorization", "Bearer "+cred)
+		}
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("register %s: %s", code, rec.Body.String())
+		}
+		var out struct {
+			core.EdgePoP
+			PopKey string `json:"pop_key"`
+		}
+		_ = json.NewDecoder(rec.Body).Decode(&out)
+		return out.EdgePoP, out.PopKey
+	}
+	kh, khKey := register("KH", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", "")
+	sg, _ := register("SG", "AQECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", "")
+	if kh.OverlayIPv4 != "100.64.255.254" || sg.OverlayIPv4 != "100.64.255.253" || kh.OverlayIPv6 == "" {
+		t.Fatalf("addresses: kh=%q sg=%q v6=%q", kh.OverlayIPv4, sg.OverlayIPv4, kh.OverlayIPv6)
+	}
+	if again, _ := register("KH", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", khKey); again.OverlayIPv4 != kh.OverlayIPv4 {
+		t.Fatalf("address changed on re-register: %q", again.OverlayIPv4)
+	}
+}
