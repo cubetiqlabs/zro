@@ -1010,25 +1010,12 @@ func (s *Server) assignPoPAddress(ctx context.Context, pop *core.EdgePoP) error 
 type EdgeSyncResponse = service.EdgeSnapshot
 
 func (s *Server) handleEdgeSync(w http.ResponseWriter, r *http.Request) {
-	pops, _ := s.db.EdgePoPs.ListHealthy(r.Context())
-	var allNodes []core.Node
-
-	// Edge PoPs are global infrastructure: synchronize nodes from every tenant
-	// and network, not just the first tenant returned by the database.
-	tenants, _ := s.db.Tenants.List(r.Context())
-	for _, t := range tenants {
-		nets, _ := s.db.Networks.ListByTenantID(r.Context(), t.ID)
-		for _, n := range nets {
-			nodes, _ := s.db.Nodes.ListByNetworkID(r.Context(), n.ID)
-			allNodes = append(allNodes, nodes...)
-		}
+	snap, err := s.svc.EdgeSync(r.Context())
+	if err != nil {
+		writeServiceError(w, err)
+		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(EdgeSyncResponse{
-		PoPs:  pops,
-		Nodes: allNodes,
-	})
+	writeJSON(w, http.StatusOK, snap)
 }
 
 // Wire types shared with clients; defined in the service layer.
