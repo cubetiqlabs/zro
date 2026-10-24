@@ -34,11 +34,12 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
 FROM alpine:3.23
 
 # Runtime utilities: `ip` programs overlay addresses/routes, curl serves health checks.
-# (No iptables: ZRO relies on WireGuard AllowedIPs and kernel routing, not NAT rules.)
+# iptables only opens FORWARD for relayed overlay traffic (Docker defaults it to DROP); ZRO adds no NAT rules.
 RUN apk add --no-cache \
     ca-certificates \
     tzdata \
     iproute2 \
+    iptables \
     curl
 
 # Copy compiled binary from builder
