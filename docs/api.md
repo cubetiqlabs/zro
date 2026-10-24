@@ -86,10 +86,26 @@ CIDRs are fixed at creation; `PATCH /api/v1/networks/{id}` changes only `name`,
 
 ### 3. Mint an enrollment token and enroll a node
 
+Three equivalent ways to get a token (single use, expires):
+
 ```bash
-zro keygen                                   # prints a private and a public key
+# a) offline, on any machine that knows the cluster secret
 zro token --secret "$SECRET_KEY" --network-id a5b8112bcd5cdbd1 --hostname app-01 --hours 24
+
+# b) with your tenant key (only networks you own)
+curl -s -X POST $PLANE/api/v1/networks/a5b8112bcd5cdbd1/tokens -H "X-API-Key: $KEY" \
+  -d '{"hostname":"app-01","hours":24}'
+
+# c) with the cluster secret, directly from the plane (any network; also a form at /ui/tokens)
+curl -s -X POST $PLANE/api/v1/tokens -H "X-Cluster-Secret: $SECRET_KEY" \
+  -d '{"network_id":"a5b8112bcd5cdbd1","hostname":"app-01","hours":24}'
 ```
+```json
+{"token":"zro_tok_eyJuZXQi…","network_id":"a5b8112bcd5cdbd1","node_type":"peer",
+ "expires_at":"2026-10-25T09:33:11Z","join_command":"zro join --plane … --token zro_tok_eyJuZXQi…"}
+```
+
+On the machine itself, `zro join --plane $PLANE --token zro_tok_…` generates the key, enrolls and runs.
 
 `zro node` does the next call for you; by hand it is:
 
@@ -136,6 +152,9 @@ Rules apply in ascending `priority` and reach nodes immediately. To change a rul
 the new one, then `DELETE /api/v1/acl/rules/{id}` the old one.
 
 ### 5. Inspect
+
+`GET /api/v1/pops` lists the edge PoPs; each carries `overlay_ipv4` / `overlay_ipv6`, its own address on the
+mesh, which any member can ping.
 
 ```bash
 curl -s "$PLANE/api/v1/nodes?network_id=a5b8112bcd5cdbd1" -H "Authorization: Bearer $KEY"
