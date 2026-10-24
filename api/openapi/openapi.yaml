@@ -870,7 +870,7 @@ components:
         public_key: {type: string}
         is_anycast: {type: boolean}
         weight: {type: integer, example: 100}
-        overlay_ipv4: {type: string, example: 100.64.255.5, description: The PoP's own mesh address, allocated at registration from the top of the default overlay CIDR.}
+        overlay_ipv4: {type: string, example: 100.64.255.5, description: "The PoP's own mesh address, allocated at registration from the top of the default overlay CIDR."}
         overlay_ipv6: {type: string}
         is_healthy: {type: boolean}
         last_seen_at: {type: string, format: date-time}
