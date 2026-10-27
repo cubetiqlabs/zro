@@ -69,7 +69,9 @@ go build -o bin/zro ./cmd/zro
 - [Getting started](docs/getting-started.md): run the plane, create a network, `zro join` a machine.
 - [Install and update](docs/install.md): installers for Linux/macOS/Windows, `zro update`, services.
 - [Deployment](docs/deployment.md): standalone and cluster setups, security model, operations.
-- [API guide](docs/api.md) and [OpenAPI spec](api/openapi/openapi.yaml): REST contract with worked examples.
+- [Access policy](docs/policy.md): per-packet zero trust, `zro allow`, shorthand rules, policy files, `zro acl`.
+- [SSH over the mesh](docs/ssh.md): opt-in built-in SSH server, `zro ssh`, audited logins.
+- [API guide](docs/api.md) and [OpenAPI spec](api/openapi/openapi.yaml): REST contract with worked examples, scoped keys, audit log.
 - [Availability and failover](docs/ha-and-failover.md): rejoining, PoP re-homing, relay limits.
 
 ---

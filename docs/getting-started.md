@@ -100,7 +100,13 @@ fully in userspace with no host interface:
 zro join --plane https://zro.example.com --token zro_tok_... --netstack
 ```
 
-Options (all optional): `--hostname NAME` (default: the machine's hostname).
+Options (all optional):
+
+| Flag | What it does |
+|---|---|
+| `--hostname NAME` | name on the network (default: the machine's hostname; a duplicate becomes `NAME-2`) |
+| `--allow ssh,5432/tcp` | services or ports other machines may reach (see step 5) |
+| `--ssh-user ubuntu` | turn on the built-in SSH server and let peers log in as `ubuntu` (see step 6) |
 
 ### What happens on restart
 
@@ -119,20 +125,64 @@ docker run -d --restart always --cap-add NET_ADMIN --device /dev/net/tun \
 
 ## 4. Check it works
 
-Join a second machine with a second token, then from the first:
+Join a second machine, then on the first:
 
-```bash
-ping 100.64.0.3                       # the second machine's overlay address
-ping 100.127.255.254                  # an edge PoP's own mesh address (see "Edge PoP" below)
+```console
+$ sudo zro status
+web-1  100.64.0.2  network a5b8112bcd5cdbd1
+PoP KH (203.0.113.10:51821), handshake 12s ago
+
+PEER   IP          PATH    ENDPOINT             HANDSHAKE
+db-1   100.64.0.3  direct  198.51.100.7:41641   9s ago
+
+$ sudo zro ping db-1
+pong from db-1 (100.64.0.3) via direct in 2.31ms
+$ ping db-1.zro.internal               # MagicDNS: every peer by name (Linux with systemd-resolved)
+$ ping 100.127.255.254                 # an edge PoP's own mesh address (see "Edge PoP" below)
 ```
 
-`ping` (ICMP) is always allowed between mesh members: the inbound policy below applies to TCP ports.
-It needs the default kernel interface; a `--netstack` machine speaks TCP only and cannot answer ping.
-Traffic goes straight between machines when their NATs allow and through the nearest edge PoP otherwise.
+`PATH` is `direct` when the two NATs let the machines talk peer to peer, and `relay` through
+the nearest edge PoP otherwise. A direct path that stops working falls back to the relay by
+itself within about a minute, and P2P is retried later.
 
-By default machines **deny all inbound traffic**. Open what you need with an ACL rule
-([api.md §4](api.md)) or, for one machine, `allowed_inbound_ports` in its config file
-(`zro.example.yaml` lists every option).
+## 5. Open access (zero trust)
+
+A machine answers **ping** and replies to connections it opened, and **drops everything else**
+until you allow it. Two places decide, and either is enough:
+
+```bash
+# On the machine itself, live (kept across restarts):
+sudo zro allow ssh postgres 8080/tcp
+sudo zro deny 8080/tcp
+sudo zro policy                         # default: deny   ping: true   allowed: 22/tcp 5432/tcp
+
+# Network-wide, from anywhere with the tenant key (a DENY rule here beats any local allow):
+export ZRO_PLANE=https://zro.example.com ZRO_API_KEY=zro_key_... ZRO_NETWORK=a5b8112bcd5cdbd1
+zro acl add --name "web to db" --from tag:web --to db-1 --ports postgres
+zro acl test web-1 db-1 postgres        # ALLOW (rule "web to db", priority 100)
+```
+
+Services are `ssh http https dns ping rdp postgres mysql redis`; ports look like `5432/tcp`,
+`80,443/tcp`, `8000-8100/udp`. The whole model, policy files and tags: [policy.md](policy.md).
+
+## 6. SSH into a machine
+
+Turn on the built-in SSH server where you want to log in, naming the local users peers may use:
+
+```bash
+sudo zro join --plane https://zro.example.com --token zro_tok_... --ssh-user ubuntu
+```
+
+Then from any other machine on the network:
+
+```bash
+sudo zro ssh ubuntu@db-1
+sudo zro ssh db-1 -- uptime
+```
+
+There are no keys to copy and no host key to accept: both sides prove who they are with
+their mesh identity, the network policy must let you reach the port, and every login is in
+the audit log. Details and per-tag grants: [ssh.md](ssh.md).
 
 ## Running an edge PoP on a public host
 
@@ -178,7 +228,14 @@ PoP stops answering; they also keep retrying enrollment while the plane is down.
 | `operation not permitted` creating interface | run with `sudo`, or use `--netstack` |
 | `Heartbeat … connection reset by peer` (edge behind Cloudflare/a proxy) | a proxy closed an idle connection; the edge retries on a fresh one automatically, so a single warning is harmless |
 | edge works but machines cannot reach each other | the edge needs forwarding: set the two `sysctls` above; on a host with a firewall the edge adds its own `FORWARD` rule (needs `iptables`) |
-| `ping` works to the edge but not to a machine | check both machines are enrolled in the **same network** and that UDP/TCP 51821 is open on the edge |
+| `ping` works to the edge but not to a machine | check both machines are enrolled in the **same network** and that UDP/TCP 51821 is open on the edge; `zro status` shows the path to each peer |
+| ping works but a port does not | the machine drops ports nobody allowed: `zro allow 8080/tcp` on it, or a network rule; `zro acl test A B 8080/tcp` shows which rule decides |
+| `Direct path to peer has no live handshake; relaying through the PoP` | the NATs stopped passing P2P traffic; traffic now goes through the edge, nothing to do |
+| `node key expired; re-join with a new enrollment token` | the network has `key_expiry_hours`; mint a token and run `zro join` again |
+| `this node was disabled by the network owner` | `zro nodes enable <host>` on the plane side |
+| a new machine joins but sees no peers | the network has `approval_required`: `zro nodes approve <host>` |
+| `zro status`: `no running node` | run it as the same user as `zro join` (usually `sudo`) |
+| `Built-in SSH server could not listen` | the host's own sshd holds port 22: set `ssh.port: 2222` in its config; `zro ssh` follows the advertised port |
 | plane exits at start | a required `.env` value is missing or weak (`CLUSTER_SECRET`) |
 
-More: [deployment.md](deployment.md) (edges, gateways, HA), [api.md](api.md) (REST API).
+More: [policy.md](policy.md) (access control), [ssh.md](ssh.md), [deployment.md](deployment.md) (edges, gateways, HA), [api.md](api.md) (REST API, keys, audit).

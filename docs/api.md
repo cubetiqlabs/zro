@@ -23,7 +23,7 @@ export ADMIN_KEY=...     # control_plane.admin_api_key
 | Audience | Credential | Header | Typical calls |
 |---|---|---|---|
 | Operator | `admin_api_key` | `X-Admin-Key` | create tenants, remove PoPs |
-| Tenant (web UI, scripts) | `zro_key_…` | `Authorization: Bearer` or `X-API-Key` | networks, nodes, ACLs, topology |
+| Tenant (web UI, scripts) | `zro_key_…`: the tenant key, or a scoped key (§7) | `Authorization: Bearer` or `X-API-Key` | networks, nodes, ACLs, topology, audit |
 | Node / gateway | `zro_node_…` | `Authorization: Bearer` or `X-Node-Token` | enroll, probes, tunnels |
 | Edge PoP | `zro_pop_…` | `X-Edge-Key` | register, heartbeat, sync |
 
@@ -138,18 +138,36 @@ curl -s -X POST $PLANE/api/v1/enroll -H "Authorization: Bearer $NODE_TOKEN" \
 Without the node token the same call is `401`; with an enrollment token but no node token for
 a key that is already enrolled it is `409` (so a leaked token cannot take a node over).
 
-### 4. Allow traffic with an ACL rule
+### 4. Control access
 
-Nodes default to deny. Allow `tag:web` to reach `tag:db` on 5432:
+Machines drop inbound traffic nobody allowed (ping and replies always pass). Network rules take
+shorthand: `from`/`to` are `*`, an IP, a CIDR, a tag (anything with a colon) or a node hostname, and
+`ports` is a service (`ssh`, `postgres`, `https`, `ping`…) or `80,443/tcp`. The model is in [policy.md](policy.md).
 
 ```bash
+# one rule
 curl -s -X POST $PLANE/api/v1/acl/rules -H "Authorization: Bearer $KEY" -d '{
-  "network_id":"a5b8112bcd5cdbd1","priority":10,
-  "source_tag":"tag:web","dest_tag":"tag:db","protocol":"tcp","ports":"5432","action":"ALLOW"}'
+  "network_id":"a5b8112bcd5cdbd1","name":"web to db","from":"tag:web","to":"db-1","ports":"postgres"}'
+# {"id":"6f0c…","source_tag":"tag:web","dest_ip":"100.64.0.3","protocol":"tcp","ports":"5432","action":"ALLOW","priority":100,…}
+
+# change only some fields
+curl -s -X PATCH $PLANE/api/v1/acl/rules/6f0c… -H "Authorization: Bearer $KEY" -d '{"ports":"https"}'
+
+# the whole policy at once: validated as a whole, swapped in one transaction
+curl -s -X PUT $PLANE/api/v1/networks/a5b8112bcd5cdbd1/policy -H "Authorization: Bearer $KEY" -d '{"rules":[
+  {"name":"admins","from":"tag:admin","priority":10},
+  {"name":"no contractor ssh","from":"tag:contractor","ports":"ssh","action":"DENY","priority":5},
+  {"name":"web to db","from":"tag:web","to":"tag:db","ports":"postgres"}]}'
+curl -s $PLANE/api/v1/networks/a5b8112bcd5cdbd1/policy -H "Authorization: Bearer $KEY"     # export
+
+# would web-1 reach db-1 on postgres?
+curl -s -X POST $PLANE/api/v1/networks/a5b8112bcd5cdbd1/policy/test -H "Authorization: Bearer $KEY" \
+  -d '{"from":"web-1","to":"db-1","port":"postgres"}'
+# {"verdict":"allow","rule":{"name":"web to db",…}}   — "node-policy" when no rule matches
 ```
 
-Rules apply in ascending `priority` and reach nodes immediately. To change a rule, create
-the new one, then `DELETE /api/v1/acl/rules/{id}` the old one.
+Rules apply in ascending `priority`, with a DENY winning a tie, and nodes pick them up immediately.
+The same from a shell: `zro acl list|add|rm|test|export|apply -f policy.yaml`.
 
 ### 5. Inspect
 
@@ -162,6 +180,59 @@ curl -s "$PLANE/api/v1/nodes/1eb43e8c-…"                    -H "Authorization:
 curl -s "$PLANE/api/v1/mesh/graph?network_id=a5b8112bcd5cdbd1" -H "Authorization: Bearer $KEY"
 curl -N "$PLANE/api/v1/events"                              -H "Authorization: Bearer $KEY"   # live changes (SSE)
 ```
+
+### 6. Node lifecycle
+
+```bash
+# hold new nodes until approved, and make keys expire after 30 days
+curl -s -X PATCH $PLANE/api/v1/networks/a5b8112bcd5cdbd1 -H "Authorization: Bearer $KEY" \
+  -d '{"approval_required":true,"key_expiry_hours":720}'
+
+curl -s -X POST  $PLANE/api/v1/nodes/1eb43e8c-…/approve -H "Authorization: Bearer $KEY"        # admit a pending node
+curl -s -X PATCH $PLANE/api/v1/nodes/1eb43e8c-… -H "Authorization: Bearer $KEY" -d '{"tags":["tag:db"]}'
+curl -s -X PATCH $PLANE/api/v1/nodes/1eb43e8c-… -H "Authorization: Bearer $KEY" -d '{"disabled":true}'
+```
+
+- **Pending** nodes get their address but no peers, and nobody routes to them.
+- **Disabled** nodes cannot authenticate, and peers and edges drop them at once.
+- **Expired** nodes must run `zro join` again with a new token.
+- Tags set here win over the node's own configuration from then on.
+
+Shell: `zro nodes list|approve|tag|disable|enable|rm <host|ip|id>`.
+
+### 7. Scoped API keys
+
+The tenant key can do everything. Give scripts and dashboards their own keys:
+
+```bash
+curl -s -X POST $PLANE/api/v1/keys -H "Authorization: Bearer $KEY" \
+  -d '{"name":"grafana","scope":"read","expires_in_hours":2160}'
+# {"id":"…","name":"grafana","scope":"read","expires_at":"…","key":"zro_key_…"}   — shown once
+curl -s $PLANE/api/v1/keys -H "Authorization: Bearer $KEY"
+curl -s -X DELETE $PLANE/api/v1/keys/<id> -H "Authorization: Bearer $KEY"
+```
+
+| Scope | May |
+|---|---|
+| `read` | every `GET`, and event streams |
+| `write` | also change networks, rules, policies, tokens and nodes |
+| `admin` | also manage keys and approve nodes (the tenant key acts as `admin`) |
+
+Shell: `zro key create --name ci --scope write --hours 720 | list | rm <id>`.
+
+### 8. Audit log
+
+Every change made through the API is recorded: who made it (`tenant:acme`,
+`tenant:acme/key:ci`, `admin`, `node:db-1` for SSH logins), what changed, and from where.
+Tokens and secrets are never stored. Events are kept 90 days.
+
+```bash
+curl -s "$PLANE/api/v1/audit?network_id=a5b8112bcd5cdbd1&limit=50" -H "Authorization: Bearer $KEY"
+# [{"actor":"tenant:acme/key:ci","action":"acl.replace","target":"a5b8112bcd5cdbd1","detail":"3 rules",…}, …]
+# older: &before=<created_at of the last event>
+```
+
+Shell: `zro audit [--network ID | --all] [-n 50]`.
 
 ## Live updates (for a web UI)
 
