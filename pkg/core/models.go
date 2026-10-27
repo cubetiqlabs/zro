@@ -92,8 +92,13 @@ type Network struct {
 	DNSDomain string    `gorm:"size:255;default:'zro.internal'" json:"dns_domain"`
 	MTU       int       `gorm:"default:1420" json:"mtu"`
 	IsActive  bool      `gorm:"default:true" json:"is_active"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	// ApprovalRequired holds new nodes as pending until an operator approves them.
+	ApprovalRequired bool `json:"approval_required"`
+	// KeyExpiryHours makes a node re-join with a new enrollment token after
+	// this long (0 = never).
+	KeyExpiryHours int       `json:"key_expiry_hours"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 
 	Nodes    []Node    `gorm:"foreignKey:NetworkID" json:"nodes,omitempty"`
 	ACLRules []ACLRule `gorm:"foreignKey:NetworkID" json:"acl_rules,omitempty"`
@@ -140,14 +145,74 @@ type Node struct {
 	AllowedIPs    StringList `gorm:"type:text" json:"allowed_ips"`
 	AllowedPorts  StringList `gorm:"type:text" json:"allowed_ports"` // e.g. ["5432/tcp", "80/tcp"]
 	DefaultDeny   bool       `gorm:"default:true" json:"default_deny"`
-	Endpoints     StringList `gorm:"type:text" json:"endpoints"` // reflexive/STUN public addresses
-	IsActive      bool       `gorm:"default:true" json:"is_active"`
-	LastSeenAt    time.Time  `json:"last_seen_at"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	// Pending nodes wait for approval; Disabled ones were switched off by an
+	// operator; both stay out of the mesh. TagsManaged means the plane set the
+	// tags, so a re-join keeps them instead of the node's own.
+	Pending     bool       `json:"pending"`
+	Disabled    bool       `json:"disabled"`
+	TagsManaged bool       `json:"tags_managed"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	// SSHKey is the node's SSH public key (authorized_keys format): its host
+	// key when it serves SSH and its identity when it connects. SSHPort is
+	// where its built-in SSH server listens on the mesh; 0 = SSH off.
+	SSHKey     string     `gorm:"size:255" json:"ssh_key,omitempty"`
+	SSHPort    int        `json:"ssh_port,omitempty"`
+	Endpoints  StringList `gorm:"type:text" json:"endpoints"` // reflexive/STUN public addresses
+	IsActive   bool       `gorm:"default:true" json:"is_active"`
+	LastSeenAt time.Time  `json:"last_seen_at"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 
 	AssignedPoP *EdgePoP `gorm:"foreignKey:AssignedPoPID" json:"assigned_pop,omitempty"`
 	Tunnels     []Tunnel `gorm:"foreignKey:NodeID" json:"tunnels,omitempty"`
+}
+
+// Expired reports whether the node's key has expired.
+func (n *Node) Expired(now time.Time) bool { return n.ExpiresAt != nil && now.After(*n.ExpiresAt) }
+
+// Admitted reports whether the node takes part in the mesh: peers and edges
+// route to it only then.
+func (n *Node) Admitted(now time.Time) bool {
+	return n.IsActive && !n.Pending && !n.Disabled && !n.Expired(now)
+}
+
+// API key scopes, each including the ones before it.
+const (
+	ScopeRead  = "read"  // GET only
+	ScopeWrite = "write" // change networks, rules, tokens, nodes
+	ScopeAdmin = "admin" // also manage API keys and approve nodes
+)
+
+// ScopeAllows reports whether a key with scope have may act with need.
+func ScopeAllows(have, need string) bool {
+	rank := map[string]int{ScopeRead: 1, ScopeWrite: 2, ScopeAdmin: 3}
+	return rank[have] >= rank[need] && rank[need] > 0
+}
+
+// APIKey is an extra tenant key with a scope and an optional expiry. The
+// tenant's own key (Tenant.APIKey) acts with admin scope.
+type APIKey struct {
+	ID         uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
+	TenantID   uuid.UUID  `gorm:"type:uuid;not null;index" json:"tenant_id"`
+	Name       string     `gorm:"size:100;not null" json:"name"`
+	KeyHash    string     `gorm:"size:64;uniqueIndex;not null" json:"-"`
+	Scope      string     `gorm:"size:10;not null" json:"scope"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+}
+
+// AuditEvent records one change made through the API.
+type AuditEvent struct {
+	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	TenantID  uuid.UUID `gorm:"type:uuid;index" json:"tenant_id"`
+	NetworkID string    `gorm:"size:16;index" json:"network_id,omitempty"`
+	Actor     string    `gorm:"size:255" json:"actor"`  // "tenant:acme", "admin", "node:web-1", "edge:KH"
+	Action    string    `gorm:"size:64" json:"action"`  // "acl.create", "node.approve", "ssh.session"
+	Target    string    `gorm:"size:255" json:"target"` // what was acted on (id, hostname)
+	Detail    string    `gorm:"size:1024" json:"detail,omitempty"`
+	SourceIP  string    `gorm:"size:64" json:"source_ip"`
+	CreatedAt time.Time `gorm:"index" json:"created_at"`
 }
 
 // ACLAction represents whether to allow or drop traffic.
@@ -160,18 +225,20 @@ const (
 
 // ACLRule defines microsegmentation and access control within a network.
 type ACLRule struct {
-	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
-	NetworkID string    `gorm:"size:16;not null;index" json:"network_id"`
-	Priority  int       `gorm:"default:100;not null" json:"priority"`
-	SourceIP  string    `gorm:"size:50;default:'*'" json:"source_ip"` // e.g. "100.64.0.11" or "*"
-	DestIP    string    `gorm:"size:50;default:'*'" json:"dest_ip"`   // e.g. "100.64.0.10" or "*"
-	SourceTag string    `gorm:"size:100;not null" json:"source_tag"`  // e.g. "tag:web" or "*"
-	DestTag   string    `gorm:"size:100;not null" json:"dest_tag"`    // e.g. "tag:db" or "*"
-	Protocol  string    `gorm:"size:20;default:'*'" json:"protocol"`  // "tcp", "udp", "icmp", "*"
-	Ports     string    `gorm:"size:100;default:'*'" json:"ports"`    // "80,443", "5432", "*"
-	Action    ACLAction `gorm:"size:20;default:'ALLOW'" json:"action"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID          uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	NetworkID   string    `gorm:"size:16;not null;index" json:"network_id"`
+	Name        string    `gorm:"size:100" json:"name,omitempty"`
+	Description string    `gorm:"size:255" json:"description,omitempty"`
+	Priority    int       `gorm:"default:100;not null" json:"priority"`
+	SourceIP    string    `gorm:"size:50;default:'*'" json:"source_ip"` // e.g. "100.64.0.11" or "*"
+	DestIP      string    `gorm:"size:50;default:'*'" json:"dest_ip"`   // e.g. "100.64.0.10" or "*"
+	SourceTag   string    `gorm:"size:100;not null" json:"source_tag"`  // e.g. "tag:web" or "*"
+	DestTag     string    `gorm:"size:100;not null" json:"dest_tag"`    // e.g. "tag:db" or "*"
+	Protocol    string    `gorm:"size:20;default:'*'" json:"protocol"`  // "tcp", "udp", "icmp", "*"
+	Ports       string    `gorm:"size:100;default:'*'" json:"ports"`    // "80,443", "5432", "*"
+	Action      ACLAction `gorm:"size:20;default:'ALLOW'" json:"action"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // Tunnel defines a Cloudflared-style exposed service from a node to the mesh or gateway.

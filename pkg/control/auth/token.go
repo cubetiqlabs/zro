@@ -29,6 +29,10 @@ type Subject struct {
 	Kind   Kind
 	Node   *core.Node
 	Tenant *core.Tenant
+	// Scope limits a tenant principal ("read", "write" or "admin"); KeyName
+	// names the scoped key used, empty for the tenant's own key.
+	Scope   string
+	KeyName string
 	// PoPCode is set for an edge authenticated with its own per-PoP credential.
 	// An edge using only the shared registration key has no PoPCode and may
 	// only claim PoPs.

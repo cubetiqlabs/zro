@@ -287,6 +287,64 @@ func (m *Manager) applyLocked(cfg PeerConfig) error {
 	return nil
 }
 
+// PeerStats is the live state of one peer on the userspace device.
+type PeerStats struct {
+	Endpoint      string
+	LastHandshake time.Time // zero means never
+	RxBytes       uint64
+	TxBytes       uint64
+}
+
+// Stats returns the live state of every peer, keyed by base64 public key.
+func (m *Manager) Stats() (map[string]PeerStats, error) {
+	m.mu.Lock()
+	dev := m.userDevice
+	m.mu.Unlock()
+	if dev == nil {
+		return nil, errors.New("peer stats need a userspace device")
+	}
+	dump, err := dev.IpcGet()
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]PeerStats)
+	var key string
+	var cur PeerStats
+	var sec, nsec int64
+	flush := func() {
+		if key != "" {
+			if sec != 0 || nsec != 0 {
+				cur.LastHandshake = time.Unix(sec, nsec)
+			}
+			out[key] = cur
+		}
+	}
+	for _, line := range strings.Split(dump, "\n") {
+		k, val, _ := strings.Cut(line, "=")
+		switch k {
+		case "public_key":
+			flush()
+			key, cur, sec, nsec = "", PeerStats{}, 0, 0
+			if raw, err := hex.DecodeString(val); err == nil {
+				key = base64.StdEncoding.EncodeToString(raw)
+			}
+		case "endpoint":
+			cur.Endpoint = val
+		case "last_handshake_time_sec":
+			sec, _ = strconv.ParseInt(val, 10, 64)
+		case "last_handshake_time_nsec":
+			nsec, _ = strconv.ParseInt(val, 10, 64)
+		case "rx_bytes":
+			cur.RxBytes, _ = strconv.ParseUint(val, 10, 64)
+		case "tx_bytes":
+			cur.TxBytes, _ = strconv.ParseUint(val, 10, 64)
+		}
+	}
+	flush()
+	return out, nil
+}
+
 // LastHandshake returns when the userspace device last completed a handshake
 // with the peer; the zero time means never.
 func (m *Manager) LastHandshake(publicKeyBase64 string) (time.Time, error) {
@@ -294,39 +352,11 @@ func (m *Manager) LastHandshake(publicKeyBase64 string) (time.Time, error) {
 	if err != nil || len(raw) != 32 {
 		return time.Time{}, fmt.Errorf("invalid base64 public key: %w", err)
 	}
-	m.mu.Lock()
-	dev := m.userDevice
-	m.mu.Unlock()
-	if dev == nil {
-		return time.Time{}, errors.New("handshake state needs a userspace device")
-	}
-	dump, err := dev.IpcGet()
+	stats, err := m.Stats()
 	if err != nil {
 		return time.Time{}, err
 	}
-
-	want := hex.EncodeToString(raw)
-	var inPeer bool
-	var sec, nsec int64
-	for _, line := range strings.Split(dump, "\n") {
-		key, val, _ := strings.Cut(line, "=")
-		switch key {
-		case "public_key":
-			inPeer = val == want
-		case "last_handshake_time_sec":
-			if inPeer {
-				sec, _ = strconv.ParseInt(val, 10, 64)
-			}
-		case "last_handshake_time_nsec":
-			if inPeer {
-				nsec, _ = strconv.ParseInt(val, 10, 64)
-			}
-		}
-	}
-	if sec == 0 && nsec == 0 {
-		return time.Time{}, nil
-	}
-	return time.Unix(sec, nsec), nil
+	return stats[publicKeyBase64].LastHandshake, nil
 }
 
 // Nudge makes WireGuard start a handshake with the peer now instead of waiting

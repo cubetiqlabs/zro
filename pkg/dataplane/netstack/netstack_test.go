@@ -109,3 +109,26 @@ func TestCloseIsIdempotentAndUnblocksRead(t *testing.T) {
 		t.Fatal("Read was not unblocked by Close")
 	}
 }
+
+func TestPingBetweenTwoStacks(t *testing.T) {
+	devA, a, err := New(1420)
+	if err != nil {
+		t.Fatal(err)
+	}
+	devB, b, err := New(1420)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	defer func() { close(done); devA.Close(); devB.Close() }()
+	go pump(devA, devB, done)
+	go pump(devB, devA, done)
+	_ = a.AddAddress(netip.MustParseAddr("100.64.0.1"))
+	_ = b.AddAddress(netip.MustParseAddr("100.64.0.2"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := a.Ping(ctx, netip.MustParseAddr("100.64.0.2")); err != nil {
+		t.Fatalf("ping across stacks: %v", err)
+	}
+}

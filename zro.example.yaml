@@ -87,12 +87,23 @@ node:
   listen_port: 0 # Shared WireGuard/STUN UDP port; 0 = ephemeral
   mtu: 1420
   enable_p2p: true
-  default_deny: true # Zero-Trust default deny all inbound traffic
-  allowed_inbound_ports:
-    - "5432/tcp" # e.g. expose Postgres service to mesh peers
+  default_deny: true # Zero-Trust default deny all inbound traffic (enforced per packet, tun and netstack)
+  allow_ping: true # answer ICMP echo unless a network rule denies it
+  allow: # services or ports peers may reach; change live with `zro allow` / `zro deny`
+    - "ssh"
+    - "5432/tcp" # services: ssh http https dns ping rdp postgres mysql redis; ports: 80,443/tcp 8000-8100/udp
   tags:
     - "tag:web"
     - "env:prod"
+  magic_dns: true # resolve <peer>.<network dns_domain> (e.g. web-1.zro.internal); uses systemd-resolved when present
+  ssh: # built-in SSH server, reachable only on the mesh (zro ssh user@host)
+    enabled: false
+    port: 22 # on the overlay address; use e.g. 2222 if the host's sshd holds 22
+    allow: # which peers may log in as which local users; root only when listed
+      - from: "tag:admin" # "*", a tag, a node hostname or an overlay IP
+        users: ["ubuntu"]
+    idle_timeout: 30m
+    max_sessions: 10
   # Cloudflared-style exposed local services (IPless ingress)
   tunnels:
     - name: "internal-api"

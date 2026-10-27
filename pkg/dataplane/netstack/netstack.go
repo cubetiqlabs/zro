@@ -12,6 +12,7 @@
 package netstack
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.zx2c4.com/wireguard/tun"
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -29,7 +31,10 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 const nicID = 1
@@ -56,7 +61,7 @@ func New(mtu int) (*Device, *Net, error) {
 		ep: channel.New(1024, uint32(mtu), ""),
 		stack: stack.New(stack.Options{
 			NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
-			TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+			TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
 			HandleLocal:        true,
 		}),
 		events:   make(chan tun.Event, 4),
@@ -148,6 +153,50 @@ func (n *Net) DialContext(ctx context.Context, network, address string) (net.Con
 	return gonet.DialContextTCP(ctx, n.stack, tcpip.FullAddress{
 		NIC: nicID, Addr: tcpip.AddrFromSlice(ap.Addr().AsSlice()), Port: ap.Port(),
 	}, proto)
+}
+
+// Ping sends one ICMP echo to an overlay IPv4 address and waits for the reply.
+func (n *Net) Ping(ctx context.Context, ip netip.Addr) (time.Duration, error) {
+	if !ip.Is4() {
+		return 0, fmt.Errorf("netstack: ping supports IPv4 only")
+	}
+	var wq waiter.Queue
+	ep, terr := n.stack.NewEndpoint(icmp.ProtocolNumber4, ipv4.ProtocolNumber, &wq)
+	if terr != nil {
+		return 0, fmt.Errorf("netstack: ping endpoint: %v", terr)
+	}
+	defer ep.Close()
+	if terr := ep.Connect(tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFromSlice(ip.AsSlice())}); terr != nil {
+		return 0, fmt.Errorf("netstack: ping connect: %v", terr)
+	}
+
+	we, ready := waiter.NewChannelEntry(waiter.ReadableEvents)
+	wq.EventRegister(&we)
+	defer wq.EventUnregister(&we)
+
+	req := header.ICMPv4(make([]byte, header.ICMPv4MinimumSize+8))
+	req.SetType(header.ICMPv4Echo)
+	req.SetSequence(1)
+	start := time.Now()
+	if _, terr := ep.Write(bytes.NewReader(req), tcpip.WriteOptions{}); terr != nil {
+		return 0, fmt.Errorf("netstack: ping write: %v", terr)
+	}
+	for {
+		var buf bytes.Buffer
+		if _, terr := ep.Read(&buf, tcpip.ReadOptions{}); terr == nil {
+			if reply := header.ICMPv4(buf.Bytes()); len(reply) >= header.ICMPv4MinimumSize && reply.Type() == header.ICMPv4EchoReply {
+				return time.Since(start), nil
+			}
+			continue
+		} else if _, wait := terr.(*tcpip.ErrWouldBlock); !wait {
+			return 0, fmt.Errorf("netstack: ping read: %v", terr)
+		}
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
 }
 
 // WriteNotify is called by the link endpoint when the stack has a packet for

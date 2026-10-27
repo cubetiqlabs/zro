@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/netip"
 	"strconv"
 	"sync"
 	"time"
@@ -16,9 +15,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// ListenMesh accepts overlay TCP connections on port. Connections the
-// zero-trust inbound policy does not allow are closed before the caller sees
-// them.
+// ListenMesh accepts overlay TCP connections on port. The packet filter has
+// already applied the inbound policy, so a disallowed peer never connects.
 func (d *Daemon) ListenMesh(ctx context.Context, network string, port int) (net.Listener, error) {
 	if network != "tcp" {
 		return nil, fmt.Errorf("unsupported mesh network %q (only tcp)", network)
@@ -28,37 +26,7 @@ func (d *Daemon) ListenMesh(ctx context.Context, network string, port int) (net.
 		return nil, err
 	}
 	slog.Info("Bound zero-trust mesh listener", "port", port)
-	return &policyListener{Listener: ln, d: d, port: port}, nil
-}
-
-type policyListener struct {
-	net.Listener
-	d    *Daemon
-	port int
-}
-
-func (l *policyListener) Accept() (net.Conn, error) {
-	for {
-		conn, err := l.Listener.Accept()
-		if err != nil {
-			return nil, err
-		}
-		src := remoteIP(conn.RemoteAddr())
-		if !l.d.IsTrafficAllowed(src, "tcp", l.port) {
-			slog.Warn("Zero-trust inbound firewall rejected connection", "src", src, "port", l.port)
-			_ = conn.Close()
-			continue
-		}
-		return conn, nil
-	}
-}
-
-func remoteIP(a net.Addr) string {
-	if ap, err := netip.ParseAddrPort(a.String()); err == nil {
-		return ap.Addr().Unmap().String()
-	}
-	host, _, _ := net.SplitHostPort(a.String())
-	return host
+	return ln, nil
 }
 
 // DialMesh connects to a peer's overlay address, first looking for a direct

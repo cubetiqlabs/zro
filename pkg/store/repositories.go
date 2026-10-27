@@ -225,6 +225,12 @@ func (r *nodeRepo) ListStale(ctx context.Context, before time.Time, limit int) (
 	return nodes, err
 }
 
+func (r *nodeRepo) ListExpiredBetween(ctx context.Context, from, to time.Time) ([]core.Node, error) {
+	var nodes []core.Node
+	err := r.db.WithContext(ctx).Where("expires_at > ? AND expires_at <= ?", from, to).Find(&nodes).Error
+	return nodes, err
+}
+
 func (r *nodeRepo) GetByTokenHash(ctx context.Context, tokenHash string) (*core.Node, error) {
 	if tokenHash == "" {
 		return nil, gorm.ErrRecordNotFound
@@ -296,6 +302,22 @@ func (r *aclRepo) ListByNetworkID(ctx context.Context, networkID string) ([]core
 	var rules []core.ACLRule
 	err := r.db.WithContext(ctx).Where("network_id = ?", networkID).Order("priority asc").Find(&rules).Error
 	return rules, err
+}
+
+func (r *aclRepo) Update(ctx context.Context, rule *core.ACLRule) error {
+	return r.db.WithContext(ctx).Save(rule).Error
+}
+
+func (r *aclRepo) Replace(ctx context.Context, networkID string, rules []core.ACLRule) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("network_id = ?", networkID).Delete(&core.ACLRule{}).Error; err != nil {
+			return err
+		}
+		if len(rules) == 0 {
+			return nil
+		}
+		return tx.Create(&rules).Error
+	})
 }
 
 func (r *aclRepo) Delete(ctx context.Context, id uuid.UUID) error {
@@ -397,4 +419,61 @@ func (r *enrollmentRepo) Redeem(ctx context.Context, nonce, pubKey string, expir
 
 func (r *enrollmentRepo) PurgeExpired(ctx context.Context) error {
 	return r.db.WithContext(ctx).Delete(&core.EnrollmentRedemption{}, "expires_at < ?", time.Now()).Error
+}
+
+// --- Audit Repository ---
+
+type auditRepo struct{ db *gorm.DB }
+
+func (r auditRepo) Create(ctx context.Context, ev *core.AuditEvent) error {
+	return r.db.WithContext(ctx).Create(ev).Error
+}
+
+func (r auditRepo) List(ctx context.Context, tenantID uuid.UUID, networkID string, before time.Time, limit int) ([]core.AuditEvent, error) {
+	q := r.db.WithContext(ctx).Where("tenant_id = ?", tenantID)
+	if networkID != "" {
+		q = q.Where("network_id = ?", networkID)
+	}
+	if !before.IsZero() {
+		q = q.Where("created_at < ?", before)
+	}
+	var out []core.AuditEvent
+	return out, q.Order("created_at desc").Limit(limit).Find(&out).Error
+}
+
+func (r auditRepo) Purge(ctx context.Context, cutoff time.Time) error {
+	return r.db.WithContext(ctx).Where("created_at < ?", cutoff).Delete(&core.AuditEvent{}).Error
+}
+
+// --- API Key Repository ---
+
+type apiKeyRepo struct{ db *gorm.DB }
+
+func (r apiKeyRepo) Create(ctx context.Context, key *core.APIKey) error {
+	return r.db.WithContext(ctx).Create(key).Error
+}
+
+func (r apiKeyRepo) GetByHash(ctx context.Context, hash string) (*core.APIKey, error) {
+	var k core.APIKey
+	if err := r.db.WithContext(ctx).First(&k, "key_hash = ?", hash).Error; err != nil {
+		return nil, err
+	}
+	return &k, nil
+}
+
+func (r apiKeyRepo) ListByTenant(ctx context.Context, tenantID uuid.UUID) ([]core.APIKey, error) {
+	var keys []core.APIKey
+	return keys, r.db.WithContext(ctx).Where("tenant_id = ?", tenantID).Order("created_at").Find(&keys).Error
+}
+
+func (r apiKeyRepo) Delete(ctx context.Context, tenantID, id uuid.UUID) error {
+	res := r.db.WithContext(ctx).Where("tenant_id = ? AND id = ?", tenantID, id).Delete(&core.APIKey{})
+	if res.Error == nil && res.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return res.Error
+}
+
+func (r apiKeyRepo) Touch(ctx context.Context, id uuid.UUID, at time.Time) error {
+	return r.db.WithContext(ctx).Model(&core.APIKey{}).Where("id = ?", id).Update("last_used_at", at).Error
 }

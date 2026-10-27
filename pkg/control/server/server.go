@@ -21,7 +21,6 @@ import (
 	"github.com/cubetiqlabs/zro/api/openapi"
 	v1 "github.com/cubetiqlabs/zro/api/proto/v1"
 	"github.com/cubetiqlabs/zro/pkg/config"
-	controlacl "github.com/cubetiqlabs/zro/pkg/control/acl"
 	controlauth "github.com/cubetiqlabs/zro/pkg/control/auth"
 	controlevents "github.com/cubetiqlabs/zro/pkg/control/events"
 	controlgrpc "github.com/cubetiqlabs/zro/pkg/control/grpc"
@@ -247,7 +246,12 @@ func NodeFromContext(ctx context.Context) *core.Node {
 }
 
 func withTenant(ctx context.Context, tenant *core.Tenant) context.Context {
-	ctx = controlauth.WithSubject(ctx, &controlauth.Subject{Kind: controlauth.KindTenant, Tenant: tenant})
+	return withTenantKey(ctx, tenant, core.ScopeAdmin, "")
+}
+
+// withTenantKey binds a tenant principal acting with a key's scope.
+func withTenantKey(ctx context.Context, tenant *core.Tenant, scope, keyName string) context.Context {
+	ctx = controlauth.WithSubject(ctx, &controlauth.Subject{Kind: controlauth.KindTenant, Tenant: tenant, Scope: scope, KeyName: keyName})
 	return context.WithValue(ctx, tenantContextKey, tenant)
 }
 
@@ -304,12 +308,16 @@ func (s *Server) tenantAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		apiKey := controlauth.TenantKey(r)
 		if apiKey != "" {
-			tenant, err := s.db.Tenants.GetByAPIKey(r.Context(), apiKey)
-			if err != nil || tenant == nil || !tenant.IsActive {
-				apiError(w, "unauthorized: invalid or inactive API key", http.StatusUnauthorized)
+			tenant, scope, keyName, ok := s.tenantByKey(r.Context(), apiKey)
+			if !ok {
+				apiError(w, "unauthorized: invalid, expired or inactive API key", http.StatusUnauthorized)
 				return
 			}
-			next(w, r.WithContext(withTenant(r.Context(), tenant)))
+			if need := methodScope(r); !core.ScopeAllows(scope, need) {
+				apiError(w, "forbidden: this API key has "+scope+" scope; this needs "+need, http.StatusForbidden)
+				return
+			}
+			next(w, r.WithContext(withTenantKey(r.Context(), tenant, scope, keyName)))
 			return
 		}
 
@@ -338,14 +346,29 @@ func (s *Server) nodeAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			apiError(w, "unauthorized: node token required", http.StatusUnauthorized)
 			return
 		}
-		node, err := s.db.Nodes.GetByTokenHash(r.Context(), controlauth.HashToken(token))
-		if err != nil || node == nil || !node.IsActive {
-			apiError(w, "unauthorized: invalid or inactive node token", http.StatusUnauthorized)
+		node, msg := s.nodeByToken(r.Context(), token)
+		if node == nil {
+			apiError(w, msg, http.StatusUnauthorized)
 			return
 		}
 		s.svc.Touch(r.Context(), node)
 		next(w, r.WithContext(withNode(r.Context(), node)))
 	}
+}
+
+// nodeByToken resolves a node bearer token. Disabled nodes and expired keys
+// are refused; pending nodes may authenticate (they get no peers).
+func (s *Server) nodeByToken(ctx context.Context, token string) (*core.Node, string) {
+	node, err := s.db.Nodes.GetByTokenHash(ctx, controlauth.HashToken(token))
+	switch {
+	case err != nil || node == nil || !node.IsActive:
+		return nil, "unauthorized: invalid or inactive node token"
+	case node.Disabled:
+		return nil, "unauthorized: this node was disabled by the network owner"
+	case node.Expired(time.Now()):
+		return nil, "unauthorized: node key expired; re-join with a new enrollment token"
+	}
+	return node, ""
 }
 
 // authenticateStream resolves the principal of a streaming request (node
@@ -358,18 +381,17 @@ func (s *Server) authenticateStream(r *http.Request) (context.Context, string) {
 	// Node tokens are deliberately prefixed so we do not hash tenant/edge
 	// keys against the node table.
 	if strings.HasPrefix(rawToken, "zro_node_") {
-		node, err := s.db.Nodes.GetByTokenHash(ctx, controlauth.HashToken(rawToken))
-		if err != nil || node == nil || !node.IsActive {
-			return nil, "unauthorized: invalid or inactive node token"
+		node, msg := s.nodeByToken(ctx, rawToken)
+		if node == nil {
+			return nil, msg
 		}
 		return withNode(ctx, node), ""
 	}
 
 	tenantKey := controlauth.TenantKey(r)
 	if tenantKey != "" {
-		tenant, err := s.db.Tenants.GetByAPIKey(ctx, tenantKey)
-		if err == nil && tenant != nil && tenant.IsActive {
-			return withTenant(ctx, tenant), ""
+		if tenant, scope, keyName, ok := s.tenantByKey(ctx, tenantKey); ok {
+			return withTenantKey(ctx, tenant, scope, keyName), "" // streams only read
 		}
 		// The same header may carry an edge key; fall through to edge
 		// authentication before rejecting it.
@@ -571,6 +593,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/v1/networks/{id}", s.tenantAuthMiddleware(s.handleDeleteNetwork))
 	s.mux.HandleFunc("GET /api/v1/nodes", s.tenantAuthMiddleware(s.handleListNodes))
 	s.mux.HandleFunc("DELETE /api/v1/nodes/{id}", s.tenantAuthMiddleware(s.handleDeleteNode))
+	s.mux.HandleFunc("PATCH /api/v1/nodes/{id}", s.tenantAuthMiddleware(s.handleUpdateNode))
+	s.mux.HandleFunc("POST /api/v1/nodes/{id}/approve", s.tenantAuthMiddleware(requireAdminScope(s.handleApproveNode)))
+	s.mux.HandleFunc("POST /api/v1/keys", s.tenantAuthMiddleware(requireAdminScope(s.handleCreateAPIKey)))
+	s.mux.HandleFunc("GET /api/v1/keys", s.tenantAuthMiddleware(requireAdminScope(s.handleListAPIKeys)))
+	s.mux.HandleFunc("DELETE /api/v1/keys/{id}", s.tenantAuthMiddleware(requireAdminScope(s.handleDeleteAPIKey)))
+	s.mux.HandleFunc("GET /api/v1/audit", s.tenantAuthMiddleware(s.handleListAudit))
 	s.mux.HandleFunc("DELETE /api/v1/pops/{code}", s.adminAuthMiddleware(s.handleDeletePoP))
 	s.mux.HandleFunc("POST /api/v1/networks", s.tenantAuthMiddleware(s.handleCreateNetwork))
 	s.mux.HandleFunc("GET /api/v1/networks", s.tenantAuthMiddleware(s.handleListNetworks))
@@ -601,6 +629,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/acl/rules", s.tenantAuthMiddleware(s.handleCreateACLRule))
 	s.mux.HandleFunc("GET /api/v1/acl/rules", s.tenantAuthMiddleware(s.handleListACLRules))
 	s.mux.HandleFunc("DELETE /api/v1/acl/rules/{id}", s.tenantAuthMiddleware(s.handleDeleteACLRule))
+	s.mux.HandleFunc("PATCH /api/v1/acl/rules/{id}", s.tenantAuthMiddleware(s.handleUpdateACLRule))
+	s.mux.HandleFunc("GET /api/v1/networks/{id}/policy", s.tenantAuthMiddleware(s.handleGetPolicy))
+	s.mux.HandleFunc("PUT /api/v1/networks/{id}/policy", s.tenantAuthMiddleware(s.handlePutPolicy))
+	s.mux.HandleFunc("POST /api/v1/networks/{id}/policy/test", s.tenantAuthMiddleware(s.handleTestPolicy))
 
 	// Node Enrollment & Mesh Coordination
 	s.mux.HandleFunc("POST /api/v1/enroll", s.handleEnrollNode)
@@ -611,6 +643,7 @@ func (s *Server) registerRoutes() {
 	// Ingress & Tunneling
 	s.mux.HandleFunc("GET /api/v1/acl/policy", s.nodeAuthMiddleware(s.handleACLPolicy))
 	s.mux.HandleFunc("DELETE /api/v1/node", s.nodeAuthMiddleware(s.handleDeregister))
+	s.mux.HandleFunc("POST /api/v1/node/audit", s.nodeAuthMiddleware(s.handleNodeAudit))
 	s.mux.HandleFunc("POST /api/v1/tunnels", s.nodeAuthMiddleware(s.handleRegisterTunnel))
 	s.mux.HandleFunc("GET /api/v1/tunnels", s.nodeAuthMiddleware(s.handleListTunnels))
 	s.mux.HandleFunc("DELETE /api/v1/tunnels/{id}", s.nodeAuthMiddleware(s.handleDeleteTunnel))
@@ -695,6 +728,7 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Created new overlay network", "id", network.ID, "name", network.Name, "cidr", network.IPv4CIDR)
 
 	w.Header().Set("Content-Type", "application/json")
+	s.auditNetwork(r, network, "network.create", network.ID, network.Name)
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(network)
 }
@@ -859,6 +893,7 @@ func (s *Server) handleResetPoPKey(w http.ResponseWriter, r *http.Request) {
 		apiError(w, "failed to reset pop credential", http.StatusInternalServerError)
 		return
 	}
+	s.audit(r, uuid.Nil, "", "pop.reset_key", pop.PoPCode, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1172,6 +1207,11 @@ func (s *Server) handleDeleteTunnel(w http.ResponseWriter, r *http.Request) {
 	if err := s.svc.DeleteTunnel(r.Context(), NodeFromContext(r.Context()), id); err != nil {
 		writeServiceError(w, err)
 		return
+	}
+	if n := NodeFromContext(r.Context()); n != nil {
+		if network, err := s.db.Networks.GetByID(r.Context(), n.NetworkID); err == nil && network != nil {
+			s.auditNetwork(r, network, "tunnel.delete", id.String(), "")
+		}
 	}
 	if s.cfg.EnableGateway {
 		_ = s.syncInternalGateway(r.Context())
@@ -1494,180 +1534,6 @@ func (s *Server) handleGetMeshGraph(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// CreateACLRuleRequest defines parameters for a new microsegmentation rule.
-type CreateACLRuleRequest struct {
-	NetworkID string         `json:"network_id"`
-	Priority  int            `json:"priority"`
-	SourceIP  string         `json:"source_ip"`
-	DestIP    string         `json:"dest_ip"`
-	SourceTag string         `json:"source_tag"`
-	DestTag   string         `json:"dest_tag"`
-	Protocol  string         `json:"protocol"`
-	Ports     string         `json:"ports"`
-	Action    core.ACLAction `json:"action"`
-}
-
-func (s *Server) handleCreateACLRule(w http.ResponseWriter, r *http.Request) {
-	var req CreateACLRuleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		apiError(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	if req.NetworkID == "" {
-		apiError(w, "network_id is required", http.StatusBadRequest)
-		return
-	}
-
-	tenant := TenantFromContext(r.Context())
-	if tenant != nil {
-		net, err := s.db.Networks.GetByID(r.Context(), req.NetworkID)
-		if err != nil || net == nil {
-			apiError(w, "network not found", http.StatusNotFound)
-			return
-		}
-		if net.TenantID != tenant.ID {
-			apiError(w, "forbidden: network does not belong to tenant", http.StatusForbidden)
-			return
-		}
-	}
-
-	if req.Priority <= 0 {
-		req.Priority = 100
-	}
-	if req.Action == "" {
-		req.Action = core.ACLActionAllow
-	}
-	if req.Protocol == "" {
-		req.Protocol = "*"
-	}
-	if req.Ports == "" {
-		req.Ports = "*"
-	}
-	if req.SourceIP == "" {
-		req.SourceIP = "*"
-	}
-	if req.DestIP == "" {
-		req.DestIP = "*"
-	}
-	if req.SourceTag == "" {
-		req.SourceTag = "*"
-	}
-	if req.DestTag == "" {
-		req.DestTag = "*"
-	}
-
-	rule := &core.ACLRule{
-		ID:        uuid.New(),
-		NetworkID: req.NetworkID,
-		Priority:  req.Priority,
-		SourceIP:  req.SourceIP,
-		DestIP:    req.DestIP,
-		SourceTag: req.SourceTag,
-		DestTag:   req.DestTag,
-		Protocol:  req.Protocol,
-		Ports:     req.Ports,
-		Action:    req.Action,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-
-	if err := controlacl.ValidateRule(rule); err != nil {
-		apiError(w, "invalid ACL rule: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	if err := s.db.ACLs.Create(r.Context(), rule); err != nil {
-		apiError(w, fmt.Sprintf("failed to create ACL rule: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	slog.Info("Created new ACL rule", "id", rule.ID, "network_id", rule.NetworkID, "action", rule.Action, "ports", rule.Ports)
-
-	// Broadcast ACL and graph update
-	s.broadcastDelta(s.scopeForNetwork(r.Context(), rule.NetworkID), map[string]any{
-		"event":      "acl_rules_updated",
-		"network_id": rule.NetworkID,
-		"rule_id":    rule.ID,
-	})
-	s.broadcastDelta(s.scopeForNetwork(r.Context(), rule.NetworkID), map[string]any{
-		"event": "mesh_graph_updated",
-	})
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(rule)
-}
-
-func (s *Server) handleListACLRules(w http.ResponseWriter, r *http.Request) {
-	netID := r.URL.Query().Get("network_id")
-	if netID == "" {
-		apiError(w, "network_id query parameter is required", http.StatusBadRequest)
-		return
-	}
-
-	tenant := TenantFromContext(r.Context())
-	if tenant != nil {
-		net, err := s.db.Networks.GetByID(r.Context(), netID)
-		if err != nil || net == nil {
-			apiError(w, "network not found", http.StatusNotFound)
-			return
-		}
-		if net.TenantID != tenant.ID {
-			apiError(w, "forbidden: network does not belong to tenant", http.StatusForbidden)
-			return
-		}
-	}
-
-	rules, err := s.db.ACLs.ListByNetworkID(r.Context(), netID)
-	if err != nil {
-		apiError(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	writePage(w, r, rules)
-}
-
-func (s *Server) handleDeleteACLRule(w http.ResponseWriter, r *http.Request) {
-	idStr := r.PathValue("id")
-	id, err := uuid.Parse(idStr)
-	if err != nil {
-		apiError(w, "invalid rule id", http.StatusBadRequest)
-		return
-	}
-
-	rule, err := s.db.ACLs.GetByID(r.Context(), id)
-	if err != nil || rule == nil {
-		apiError(w, "rule not found", http.StatusNotFound)
-		return
-	}
-	network, ok := s.authorizeNetwork(r.Context(), rule.NetworkID)
-	if !ok {
-		// Same response as a missing rule so rule IDs cannot be probed across tenants.
-		apiError(w, "rule not found", http.StatusNotFound)
-		return
-	}
-
-	if err := s.db.ACLs.Delete(r.Context(), id); err != nil {
-		apiError(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	scope := networkScope(network)
-	s.broadcastDelta(scope, map[string]any{
-		"event":      "acl_rules_updated",
-		"network_id": rule.NetworkID,
-		"rule_id":    idStr,
-	})
-	s.broadcastDelta(scope, map[string]any{
-		"event":      "mesh_graph_updated",
-		"network_id": rule.NetworkID,
-	})
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
-}
-
 // adminAuthMiddleware guards tenant administration with the bootstrap admin key.
 func (s *Server) adminAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -1727,6 +1593,7 @@ func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 		apiError(w, "failed to create tenant (slug may be taken)", http.StatusConflict)
 		return
 	}
+	s.audit(r, tenant.ID, "", "tenant.create", tenant.Slug, "")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(toTenantResponse(tenant, true))
@@ -1764,6 +1631,7 @@ func (s *Server) handleDeleteTenant(w http.ResponseWriter, r *http.Request) {
 		apiError(w, "failed to delete tenant", http.StatusInternalServerError)
 		return
 	}
+	s.audit(r, id, "", "tenant.delete", id.String(), "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1788,6 +1656,7 @@ func (s *Server) handleRotateTenantKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenant.APIKey = key
+	s.audit(r, tenant.ID, "", "tenant.rotate_key", tenant.Slug, "")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(toTenantResponse(tenant, true))
 }

@@ -55,6 +55,8 @@ message EnrollRequest {
   repeated LatencyProbe probes = 7;
   repeated string allowed_ports = 8;
   optional bool default_deny = 9;
+  string ssh_key = 10;  // authorized_keys format
+  int32 ssh_port = 11;  // 0 = no SSH server
 }
 
 message EdgePoP {
@@ -80,6 +82,8 @@ message Node {
   repeated string allowed_ips = 8;
   repeated string endpoints = 9;
   string assigned_pop_code = 10; // the PoP that homes this node
+  string ssh_key = 11;
+  int32 ssh_port = 12;
 }
 
 message EnrollResponse {

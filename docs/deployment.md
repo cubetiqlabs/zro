@@ -270,8 +270,9 @@ node:
   interface_name: "zro0"
   enable_p2p: true
   default_deny: true                 # drops all incoming connections by default
-  allowed_inbound_ports:
-    - "5432/tcp"
+  allow_ping: true                   # ping is answered unless a network DENY rule matches
+  allow:                             # services or ports peers may reach (zro allow / zro deny change it live)
+    - "postgres"
   tags:
     - "role:db"
 ```
@@ -329,7 +330,9 @@ curl -s -X POST https://zro-plane.cubis.tech:443/api/v1/acl/rules \
 curl -s -H "Authorization: Bearer $TENANT_KEY" \
   "https://zro-plane.cubis.tech:443/api/v1/acl/rules?network_id=c85e3068ac0cb812"
 ```
-Rules are validated on create (CIDRs, port lists such as `80,443,8000-8080`, protocol, action). Evaluation order: lowest `priority` number first, and a DENY wins a tie. For inbound traffic a node applies the network rules first: a matching **DENY** closes a port the node opened locally, a matching **ALLOW** opens one its `default_deny` would close, and traffic no rule matches falls back to the node's own `allowed_inbound_ports` / `default_deny`. Source tags come from the peer list, destination tags from the node's own `tags`. Nodes pick up changes live and keep the last good policy if the plane is unreachable.
+Rules are validated on create (CIDRs, port lists such as `80,443,8000-8080`, protocol, action). Evaluation order: lowest `priority` number first, and a DENY wins a tie. For inbound traffic a node applies the network rules first: a matching **DENY** closes a port the node opened locally, a matching **ALLOW** opens one its `default_deny` would close, and traffic no rule matches falls back to the node's own `allow` list / `default_deny`. Source tags come from the peer list, destination tags from the node's own `tags`. Nodes pick up changes live and keep the last good policy if the plane is unreachable. Full model, shorthand rules and policy files: [policy.md](policy.md); built-in SSH: [ssh.md](ssh.md).
+
+The policy is enforced per packet by the node itself, in both `tun` and `netstack` mode, so no OS firewall is needed. Replies to connections the node opened always get back in. Ping (ICMP echo) is answered unless a network rule denies it or the node sets `allow_ping: false`. Since this release a kernel-mode node with `default_deny: true` really drops unlisted ports. To keep a node fully open, set `default_deny: false` or add a network ALLOW rule.
 
 ---
 

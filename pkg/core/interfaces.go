@@ -59,6 +59,8 @@ type NodeRepository interface {
 	TouchLastSeen(ctx context.Context, id uuid.UUID, at time.Time) error
 	// ListStale returns nodes not seen since before, oldest first.
 	ListStale(ctx context.Context, before time.Time, limit int) ([]Node, error)
+	// ListExpiredBetween returns nodes whose key expired in (from, to].
+	ListExpiredBetween(ctx context.Context, from, to time.Time) ([]Node, error)
 }
 
 // ACLRepository defines operations for Access Control Rules.
@@ -66,6 +68,9 @@ type ACLRepository interface {
 	Create(ctx context.Context, rule *ACLRule) error
 	GetByID(ctx context.Context, id uuid.UUID) (*ACLRule, error)
 	ListByNetworkID(ctx context.Context, networkID string) ([]ACLRule, error)
+	Update(ctx context.Context, rule *ACLRule) error
+	// Replace makes rules the network's whole policy, atomically.
+	Replace(ctx context.Context, networkID string, rules []ACLRule) error
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 
@@ -86,6 +91,25 @@ type TunnelRepository interface {
 var ErrDuplicate = errors.New("duplicate record")
 
 var ErrTokenReused = errors.New("enrollment token already used")
+
+// APIKeyRepository stores scoped tenant keys (hashed).
+type APIKeyRepository interface {
+	Create(ctx context.Context, key *APIKey) error
+	GetByHash(ctx context.Context, hash string) (*APIKey, error)
+	ListByTenant(ctx context.Context, tenantID uuid.UUID) ([]APIKey, error)
+	Delete(ctx context.Context, tenantID, id uuid.UUID) error
+	Touch(ctx context.Context, id uuid.UUID, at time.Time) error
+}
+
+// AuditRepository stores the audit trail.
+type AuditRepository interface {
+	Create(ctx context.Context, ev *AuditEvent) error
+	// List returns a tenant's events newest first, optionally for one network,
+	// created before before (zero = now), at most limit.
+	List(ctx context.Context, tenantID uuid.UUID, networkID string, before time.Time, limit int) ([]AuditEvent, error)
+	// Purge deletes events older than cutoff.
+	Purge(ctx context.Context, cutoff time.Time) error
+}
 
 // EnrollmentRepository tracks redeemed enrollment-token nonces.
 type EnrollmentRepository interface {

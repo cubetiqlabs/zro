@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	v1 "github.com/cubetiqlabs/zro/api/proto/v1"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -61,11 +62,7 @@ func (d *Daemon) fetchPeers(ctx context.Context) ([]core.Node, error) {
 		}
 		peers := make([]core.Node, 0, len(g.Peers))
 		for _, p := range g.Peers {
-			peers = append(peers, core.Node{
-				Hostname: p.Hostname, PublicKey: p.PublicKey,
-				OverlayIPv4: p.OverlayIpv4, OverlayIPv6: p.OverlayIpv6,
-				Endpoints: core.StringList(p.Endpoints), Tags: core.StringList(p.Tags),
-			})
+			peers = append(peers, nodeFromProto(p))
 		}
 		return peers, nil
 	}
@@ -86,6 +83,16 @@ func (d *Daemon) fetchPeers(ctx context.Context) ([]core.Node, error) {
 	return peers, json.NewDecoder(resp.Body).Decode(&peers)
 }
 
+// nodeFromProto is a peer as the gRPC transport carries it.
+func nodeFromProto(p *v1.Node) core.Node {
+	return core.Node{
+		Hostname: p.Hostname, PublicKey: p.PublicKey,
+		OverlayIPv4: p.OverlayIpv4, OverlayIPv6: p.OverlayIpv6,
+		Endpoints: core.StringList(p.Endpoints), Tags: core.StringList(p.Tags),
+		SSHKey: p.SshKey, SSHPort: int(p.SshPort),
+	}
+}
+
 // syncPeers reconciles the node's peers with the plane: new members are
 // connected (P2P first), departed ones are dropped.
 func (d *Daemon) syncPeers(ctx context.Context) {
@@ -102,7 +109,7 @@ func (d *Daemon) syncPeers(ctx context.Context) {
 		}
 	}
 
-	d.peersMu.RLock()
+	d.peersMu.Lock()
 	var gone []core.Node
 	var fresh []core.Node
 	for key, p := range d.peers {
@@ -111,11 +118,13 @@ func (d *Daemon) syncPeers(ctx context.Context) {
 		}
 	}
 	for key, p := range current {
-		if _, ok := d.peers[key]; !ok {
+		if _, ok := d.peers[key]; ok {
+			d.peers[key] = p // known peer: refresh its tags and endpoints for policy
+		} else {
 			fresh = append(fresh, p)
 		}
 	}
-	d.peersMu.RUnlock()
+	d.peersMu.Unlock()
 
 	for _, p := range gone {
 		d.dropPeer(p)
@@ -140,6 +149,7 @@ func (d *Daemon) dropPeer(p core.Node) {
 	d.peersMu.Lock()
 	delete(d.peers, p.PublicKey)
 	d.peersMu.Unlock()
+	d.direct.forget(p.PublicKey)
 	_ = d.wgManager.RemovePeer(p.PublicKey)
 	slog.Info("Peer left the mesh", "peer", p.Hostname, "overlay_ipv4", p.OverlayIPv4)
 }
@@ -173,6 +183,7 @@ func (d *Daemon) answerPunchRequest(ctx context.Context, data json.RawMessage) {
 			if err := d.wgManager.ApplyPeer(peer); err != nil {
 				return
 			}
+			d.direct.up(req.InitiatorPubKey, req.InitiatorOverlay, time.Now())
 			slog.Info("Direct P2P path opened at the request of a peer", "endpoint", ep, "rtt", rtt)
 			time.AfterFunc(responderKeepaliveDelay, func() {
 				peer.PersistentKeepalive = p2pKeepalive

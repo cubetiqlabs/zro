@@ -34,6 +34,8 @@ tags:
   - {name: ACL, description: "Zero-trust access rules."}
   - {name: PoPs, description: "Edge points of presence."}
   - {name: Topology, description: "Live mesh graph."}
+  - {name: Audit, description: "Who changed what, kept 90 days."}
+  - {name: API keys, description: "Extra tenant keys with a scope (read, write, admin) and an optional expiry."}
   - {name: Events, description: "Real-time change feed (SSE and WebSocket)."}
   - {name: Enrollment, description: "Joining a network. Used by `zro node`."}
   - {name: Node API, description: "Calls a node makes with its node token."}
@@ -293,13 +295,15 @@ paths:
       tags: [Networks]
       operationId: updateNetwork
       summary: Update a network
-      description: Only `name`, `dns_domain` and `is_active` can change; addressing is immutable.
+      description: |
+        Changes `name`, `dns_domain`, `is_active`, `approval_required` or `key_expiry_hours`. Addressing is immutable.
+        `approval_required` holds new nodes as pending until approved. `key_expiry_hours` applies to nodes that join from then on.
       requestBody:
         required: true
         content:
           application/json:
             schema: {$ref: "#/components/schemas/UpdateNetworkRequest"}
-            example: {name: prod-eu}
+            example: {approval_required: true, key_expiry_hours: 720}
       responses:
         "200":
           description: The updated network.
@@ -349,6 +353,108 @@ paths:
       responses:
         "204": {description: Removed.}
         "404": {$ref: "#/components/responses/NotFound"}
+    patch:
+      tags: [Nodes]
+      operationId: updateNode
+      summary: Tag, disable or enable a node
+      description: |
+        `tags` replaces the node's tags; from then on a re-join keeps the plane's tags instead of the node's own.
+        `disabled: true` cuts the node off: it can no longer authenticate and peers and edges drop it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tags: {type: array, items: {type: string, maxLength: 100}, example: ["tag:db", "env:prod"]}
+                disabled: {type: boolean}
+      responses:
+        "200":
+          description: The updated node.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Node"}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/nodes/{id}/approve:
+    parameters: [{$ref: "#/components/parameters/NodeID"}]
+    post:
+      tags: [Nodes]
+      operationId: approveNode
+      summary: Approve a pending node
+      description: Admits a node that joined a network with `approval_required`. Approving an admitted node changes nothing.
+      responses:
+        "200":
+          description: The node.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Node"}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /api/v1/keys:
+    get:
+      tags: [API keys]
+      operationId: listAPIKeys
+      summary: List the tenant's scoped keys
+      description: Needs an admin-scoped key or the tenant key. Key material is never returned.
+      responses:
+        "200":
+          description: Keys.
+          content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/APIKey"}}}}
+        "403": {$ref: "#/components/responses/Forbidden"}
+    post:
+      tags: [API keys]
+      operationId: createAPIKey
+      summary: Create a scoped key
+      description: |
+        `read` keys may only GET; `write` keys may also change networks, rules, tokens and nodes; `admin` keys may
+        also manage keys and approve nodes. The tenant's own key acts as `admin`. The key is shown once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, scope]
+              properties:
+                name: {type: string, maxLength: 100, example: ci-deploy}
+                scope: {type: string, enum: [read, write, admin]}
+                expires_in_hours: {type: integer, minimum: 0, maximum: 8784, default: 0, description: 0 = never.}
+      responses:
+        "201":
+          description: The key, with its plaintext `key` this once.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/APIKey"
+                  - {type: object, properties: {key: {type: string, example: zro_key_3f9c…}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /api/v1/keys/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    delete:
+      tags: [API keys]
+      operationId: deleteAPIKey
+      summary: Revoke a scoped key
+      responses:
+        "204": {description: Revoked; the key stops working at once.}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /api/v1/audit:
+    get:
+      tags: [Audit]
+      operationId: listAudit
+      summary: The tenant's audit trail, newest first
+      description: Every successful change made through the API, by whom and from where. Secrets and tokens are never recorded.
+      parameters:
+        - {name: network_id, in: query, description: Only this network's events., schema: {$ref: "#/components/schemas/NetworkID"}}
+        - {name: before, in: query, description: "Page backwards: the `created_at` of the last event seen.", schema: {type: string, format: date-time}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 1000, default: 100}}
+      responses:
+        "200":
+          description: Events.
+          content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/AuditEvent"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
 
   /api/v1/acl/rules:
     get:
@@ -368,13 +474,19 @@ paths:
       tags: [ACL]
       operationId: createACLRule
       summary: Create an ACL rule
-      description: Omitted match fields default to `*`; `priority` defaults to 100; `action` to `ALLOW`. Nodes receive the change live.
+      description: |
+        Write the rule in shorthand with `from`, `to` and `ports`, or with the explicit `source_*`/`dest_*` fields.
+        Omitted match fields default to `*`, `priority` defaults to 100 and `action` to `ALLOW`. Nodes receive the change live.
       requestBody:
         required: true
         content:
           application/json:
             schema: {$ref: "#/components/schemas/CreateACLRuleRequest"}
-            example: {network_id: 8056c2e21c000001, priority: 10, source_tag: "tag:web", dest_tag: "tag:db", protocol: tcp, ports: "5432", action: ALLOW}
+            examples:
+              shorthand:
+                value: {network_id: 8056c2e21c000001, name: web to db, from: "tag:web", to: db-1, ports: postgres}
+              explicit:
+                value: {network_id: 8056c2e21c000001, priority: 10, source_tag: "tag:web", dest_tag: "tag:db", protocol: tcp, ports: "5432", action: ALLOW}
       responses:
         "201":
           description: Rule created.
@@ -393,13 +505,89 @@ paths:
           description: The rule.
           content: {application/json: {schema: {$ref: "#/components/schemas/ACLRule"}}}
         "404": {$ref: "#/components/responses/NotFound"}
+    patch:
+      tags: [ACL]
+      operationId: updateACLRule
+      summary: Change an ACL rule
+      description: Only the fields in the body change. New `ports` bring their own protocol unless `protocol` is also given.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateACLRuleRequest"}
+            example: {ports: "ssh", action: DENY}
+      responses:
+        "200":
+          description: The updated rule.
+          content: {application/json: {schema: {$ref: "#/components/schemas/ACLRule"}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
     delete:
       tags: [ACL]
       operationId: deleteACLRule
       summary: Delete an ACL rule
-      description: To change a rule, create the new one first, then delete the old one.
       responses:
-        "204": {description: Deleted.}
+        "200": {description: Deleted.}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /api/v1/networks/{id}/policy:
+    parameters: [{name: id, in: path, required: true, schema: {$ref: "#/components/schemas/NetworkID"}}]
+    get:
+      tags: [ACL]
+      operationId: getPolicy
+      summary: Get a network's whole policy
+      description: The rules in the same form `PUT` accepts, so a policy can be exported, edited and applied back.
+      responses:
+        "200":
+          description: The policy.
+          content: {application/json: {schema: {$ref: "#/components/schemas/PolicyDocument"}}}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [ACL]
+      operationId: putPolicy
+      summary: Replace a network's whole policy
+      description: |
+        Validates every rule, then replaces the network's rules in one transaction: if any rule is invalid, nothing changes.
+        At most 1000 rules. An empty list removes the network policy, so each node's own allow list and `default_deny` decide.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PolicyDocument"}
+            example:
+              rules:
+                - {name: admins anywhere, from: "tag:admin", to: "*", priority: 10}
+                - {name: web to db, from: "tag:web", to: "tag:db", ports: postgres}
+                - {name: no ssh from contractors, from: "tag:contractor", ports: ssh, action: DENY, priority: 5}
+      responses:
+        "200":
+          description: The rules now in force.
+          content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/ACLRule"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/networks/{id}/policy/test:
+    parameters: [{name: id, in: path, required: true, schema: {$ref: "#/components/schemas/NetworkID"}}]
+    post:
+      tags: [ACL]
+      operationId: testPolicy
+      summary: Ask whether one flow is allowed
+      description: |
+        Evaluates the network rules for `from` → `to` on `port`. `verdict` is `allow` or `deny` when a rule matches.
+        It is `node-policy` when none does: the destination node's own allow list and `default_deny` decide then.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PolicyTestRequest"}
+            example: {from: web-1, to: db-1, port: postgres}
+      responses:
+        "200":
+          description: The verdict.
+          content: {application/json: {schema: {$ref: "#/components/schemas/PolicyTestResult"}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
         "404": {$ref: "#/components/responses/NotFound"}
 
   /api/v1/mesh/graph:
@@ -616,6 +804,27 @@ paths:
       security: [{NodeToken: []}]
       responses:
         "204": {description: Removed.}
+  /api/v1/node/audit:
+    post:
+      tags: [Node API]
+      operationId: reportNodeAudit
+      summary: Report an SSH event for the audit log
+      description: Nodes report logins to their built-in SSH server. Only `ssh.*` actions are accepted.
+      security: [{NodeToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: {type: string, pattern: "^ssh\\.", maxLength: 64, example: ssh.login}
+                target: {type: string, maxLength: 255, description: The local user., example: ubuntu}
+                detail: {type: string, maxLength: 1024, example: "from web-1 (100.64.0.2)"}
+      responses:
+        "201": {description: Recorded.}
+        "400": {$ref: "#/components/responses/BadRequest"}
   /api/v1/tunnels:
     get:
       tags: [Node API]
@@ -755,7 +964,10 @@ components:
     TenantKey:
       type: http
       scheme: bearer
-      description: Tenant API key (`zro_key_…`). Also accepted as `X-API-Key`. With `require_auth=false`, requests without a key act as a built-in dev tenant until a real tenant exists.
+      description: |
+        Tenant API key (`zro_key_…`): the tenant's own key, or a scoped key from `POST /api/v1/keys`. Also accepted as `X-API-Key`.
+        A `read` key may only GET; `write` may change networks, rules, tokens and nodes; `admin` (and the tenant key) may also manage keys and approve nodes.
+        With `require_auth=false`, requests without a key act as a built-in dev tenant until a real tenant exists.
     AdminKey:
       type: apiKey
       in: header
@@ -889,6 +1101,8 @@ components:
         name: {type: string}
         dns_domain: {type: string}
         is_active: {type: boolean}
+        approval_required: {type: boolean}
+        key_expiry_hours: {type: integer, minimum: 0, maximum: 8760}
     Network:
       type: object
       properties:
@@ -901,6 +1115,8 @@ components:
         dns_domain: {type: string}
         mtu: {type: integer, example: 1420}
         is_active: {type: boolean}
+        approval_required: {type: boolean, description: New nodes wait for approval.}
+        key_expiry_hours: {type: integer, description: "Nodes re-join with a new enrollment token after this long; 0 = never."}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
       example:
@@ -953,7 +1169,35 @@ components:
         default_deny: {type: boolean}
         endpoints: {type: array, items: {type: string}}
         is_active: {type: boolean}
+        pending: {type: boolean, description: Waiting for approval; not part of the mesh.}
+        disabled: {type: boolean, description: Switched off by the network owner; cannot authenticate.}
+        tags_managed: {type: boolean, description: The plane set the tags; a re-join keeps them.}
+        expires_at: {type: string, format: date-time, description: When the node must re-join. Absent means never.}
+        ssh_key: {type: string, description: "The node's SSH public key (authorized_keys format): host key of its SSH server and its identity as a client."}
+        ssh_port: {type: integer, description: Port of the node's built-in SSH server on the mesh; absent when SSH is off.}
         last_seen_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+    APIKey:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        name: {type: string}
+        scope: {type: string, enum: [read, write, admin]}
+        expires_at: {type: string, format: date-time}
+        last_used_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+    AuditEvent:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        network_id: {$ref: "#/components/schemas/NetworkID"}
+        actor: {type: string, example: "tenant:acme", description: "tenant:<slug>, admin, cluster-secret, node:<hostname> or edge:<code>."}
+        action: {type: string, example: acl.create}
+        target: {type: string}
+        detail: {type: string}
+        source_ip: {type: string}
         created_at: {type: string, format: date-time}
     NodePage:
       allOf:
@@ -961,17 +1205,44 @@ components:
         - properties: {items: {type: array, items: {$ref: "#/components/schemas/Node"}}}
     CreateACLRuleRequest:
       type: object
-      required: [network_id]
       properties:
         network_id: {$ref: "#/components/schemas/NetworkID"}
-        priority: {type: integer, default: 100, description: Lower is evaluated first.}
+        name: {type: string, maxLength: 100, example: web to db}
+        description: {type: string, maxLength: 255}
+        priority: {type: integer, default: 100, description: Lower is evaluated first; a DENY wins a tie.}
+        from:
+          type: string
+          description: "Shorthand source: `*`, an IP, a CIDR, a tag (anything with a colon, such as `tag:web` or `role:db`) or a node hostname. Overrides `source_ip`/`source_tag`."
+          example: "tag:web"
+        to: {type: string, description: "Shorthand destination, same forms as `from`.", example: db-1}
         source_ip: {type: string, default: "*", description: "IP, CIDR or `*`."}
         dest_ip: {type: string, default: "*"}
         source_tag: {type: string, default: "*", example: "tag:web"}
         dest_tag: {type: string, default: "*", example: "tag:db"}
         protocol: {type: string, enum: [tcp, udp, icmp, "*"], default: "*"}
-        ports: {type: string, default: "*", example: "80,443"}
+        ports:
+          type: string
+          default: "*"
+          description: "A service (ssh, http, https, dns, ping, rdp, postgres, mysql, redis) or ports with an optional protocol: `80,443/tcp`, `8000-8100`."
+          example: "80,443/tcp"
         action: {type: string, enum: [ALLOW, DENY], default: ALLOW}
+    PolicyDocument:
+      type: object
+      required: [rules]
+      properties:
+        rules: {type: array, maxItems: 1000, items: {$ref: "#/components/schemas/CreateACLRuleRequest"}}
+    PolicyTestRequest:
+      type: object
+      required: [from, to]
+      properties:
+        from: {type: string, example: web-1}
+        to: {type: string, example: db-1}
+        port: {type: string, default: "*", example: postgres}
+    PolicyTestResult:
+      type: object
+      properties:
+        verdict: {type: string, enum: [allow, deny, node-policy]}
+        rule: {$ref: "#/components/schemas/ACLRule"}
     ACLRule:
       allOf:
         - $ref: "#/components/schemas/CreateACLRuleRequest"

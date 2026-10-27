@@ -30,6 +30,7 @@ var (
 	cfgFile string
 	rootCmd = &cobra.Command{
 		Use:              "zro",
+		SilenceErrors:    true, // main prints the error once
 		PersistentPreRun: func(cmd *cobra.Command, args []string) { notifyIfOutdated(cmd) },
 		Short:            "ZRO: High-Performance Global Networking & Ether-Switch Mesh",
 		Long: `ZRO is an enterprise-grade global networking fabric with userspace WireGuard,
@@ -61,6 +62,7 @@ smart routing, IPless nodes, zero-trust ACLs, and cloud-native load balancing.`,
 )
 
 func init() {
+	cobra.EnableTraverseRunHooks = true // the root's update notice and a group's own checks both run
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "Path to configuration file (default: ./zro.yaml)")
 
 	rootCmd.AddCommand(newVersionCmd())
@@ -73,6 +75,16 @@ func init() {
 	rootCmd.AddCommand(newNetworkCmd())
 	rootCmd.AddCommand(newP2PCmd())
 	rootCmd.AddCommand(newUpdateCmd())
+	rootCmd.AddCommand(newStatusCmd())
+	rootCmd.AddCommand(newPingCmd())
+	rootCmd.AddCommand(newAllowCmd(false))
+	rootCmd.AddCommand(newAllowCmd(true))
+	rootCmd.AddCommand(newPolicyCmd())
+	rootCmd.AddCommand(newACLCmd())
+	rootCmd.AddCommand(newNodesCmd())
+	rootCmd.AddCommand(newAuditCmd())
+	rootCmd.AddCommand(newSSHCmd())
+	rootCmd.AddCommand(newKeyCmd())
 }
 
 func main() {
@@ -239,6 +251,7 @@ func newEdgeCmd() *cobra.Command {
 func newNodeCmd() *cobra.Command {
 	var planeFlag, tokenFlag, hostnameFlag string
 	var netstack bool
+	var allowFlag, sshUsers []string
 
 	cmd := &cobra.Command{
 		Use:     "node",
@@ -261,6 +274,11 @@ func newNodeCmd() *cobra.Command {
 			if netstack {
 				cfg.Node.InterfaceMode = "netstack"
 			}
+			cfg.Node.Allow = append(cfg.Node.Allow, allowFlag...)
+			if len(sshUsers) > 0 {
+				cfg.Node.SSH.Enabled = true
+				cfg.Node.SSH.Allow = append(cfg.Node.SSH.Allow, config.SSHGrant{From: "*", Users: sshUsers})
+			}
 			if cfg.Node.Hostname == "" {
 				cfg.Node.Hostname, _ = os.Hostname()
 			}
@@ -272,6 +290,8 @@ func newNodeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&tokenFlag, "token", "", "Enrollment token (from the operator)")
 	cmd.Flags().StringVar(&hostnameFlag, "hostname", "", "Node name (default: this machine's hostname)")
 	cmd.Flags().BoolVar(&netstack, "netstack", false, "Run unprivileged: no TUN device or root needed")
+	cmd.Flags().StringSliceVar(&allowFlag, "allow", nil, "Services or ports peers may reach, e.g. ssh,5432/tcp (ping is on by default)")
+	cmd.Flags().StringSliceVar(&sshUsers, "ssh-user", nil, "Turn on the built-in SSH server and let peers the network policy allows log in as these local users")
 	return cmd
 }
 
@@ -397,15 +417,14 @@ func mintViaPlane(plane, apiKey, networkID, hostname, nodeType, pubKey string, h
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return planeError(resp)
+	}
 	var out struct {
 		JoinCommand string `json:"join_command"`
 		Token       string `json:"token"`
-		Error       string `json:"error"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&out)
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("control plane refused (%d): %s", resp.StatusCode, out.Error)
-	}
 	fmt.Printf("Enrollment Token:\n%s\n\nRun on the new machine:\n  %s\n", out.Token, out.JoinCommand)
 	return nil
 }

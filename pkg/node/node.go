@@ -3,13 +3,14 @@ package node
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
-	"strconv"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -17,11 +18,13 @@ import (
 	v1 "github.com/cubetiqlabs/zro/api/proto/v1"
 	"github.com/cubetiqlabs/zro/pkg/agent"
 	"github.com/cubetiqlabs/zro/pkg/config"
+	"github.com/cubetiqlabs/zro/pkg/control/acl"
 	controlauth "github.com/cubetiqlabs/zro/pkg/control/auth"
 	controlgrpc "github.com/cubetiqlabs/zro/pkg/control/grpc"
 	"github.com/cubetiqlabs/zro/pkg/control/server"
 	"github.com/cubetiqlabs/zro/pkg/core"
 	"github.com/cubetiqlabs/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/filter"
 	"github.com/cubetiqlabs/zro/pkg/dataplane/router"
 	"github.com/cubetiqlabs/zro/pkg/dataplane/tun"
 	"github.com/cubetiqlabs/zro/pkg/dataplane/wireguard"
@@ -37,10 +40,12 @@ import (
 type Daemon struct {
 	cfg          *config.NodeConfig
 	keyPair      *crypto.KeyPair
+	sshKey       ed25519.PrivateKey // SSH host key and identity
 	nodeID       uuid.UUID
 	networkID    string // ZeroTier-style 16-hex network ID
 	overlayIPv4  string
 	overlayIPv6  string
+	dnsDomain    string // MagicDNS domain of the network
 	primaryPoP   core.EdgePoP
 	secondaryPoP *core.EdgePoP
 	popMu        sync.RWMutex
@@ -48,6 +53,7 @@ type Daemon struct {
 	popKick      chan struct{}        // wakes popWorker for an immediate refresh
 	peers        map[string]core.Node // pubKey -> node
 	peersMu      sync.RWMutex
+	direct       directPaths // liveness of direct P2P paths
 
 	tunDev          tun.Device
 	dev             *agent.Device
@@ -67,8 +73,11 @@ type Daemon struct {
 	// Zero-Trust Inbound Firewall & Mesh Listeners
 	policy       networkPolicy // network-wide rules from the plane
 	policyMu     sync.RWMutex
-	allowedPorts []string // e.g. ["5432/tcp"]
+	allowedPorts []string // effective "ports/proto" entries, e.g. ["5432/tcp"]
+	configAllow  []string // the part of allowedPorts from the config file
+	runtimeAllow []string // opened with `zro allow`, persisted in policy.json
 	defaultDeny  bool     // default true for zero-trust
+	allowPing    bool
 	allowedPeers []string
 
 	// Control-plane datagram correlation on the shared WireGuard socket.
@@ -86,6 +95,10 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 	kp, err := identity.LoadOrCreateKey(cfg.StateDir, "node.key")
 	if err != nil {
 		return nil, fmt.Errorf("failed to load WireGuard identity: %w", err)
+	}
+	sshKey, err := identity.LoadOrCreateSSHKey(cfg.StateDir, "ssh.key")
+	if err != nil {
+		return nil, fmt.Errorf("failed to load SSH identity: %w", err)
 	}
 
 	dev, err := agent.OpenDevice(cfg.InterfaceMode, cfg.InterfaceName, cfg.MTU)
@@ -105,17 +118,24 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 	d := &Daemon{
 		cfg:          cfg,
 		keyPair:      kp,
+		sshKey:       sshKey,
 		peers:        make(map[string]core.Node),
 		tunDev:       tunDev,
 		dev:          dev,
 		udpConn:      udpConn,
 		tunnelClient: tunnel.NewClient(),
-		allowedPorts: cfg.AllowedInboundPorts,
 		defaultDeny:  cfg.DefaultDeny,
+		allowPing:    cfg.AllowPing,
 		stunWaiters:  make(map[[12]byte]chan *stun.ReflexiveAddress),
 		relay:        newRelayState(),
 		popKick:      make(chan struct{}, 1),
 		punchWaiters: make(map[string]chan struct{}),
+	}
+
+	if err := d.loadLocalPolicy(); err != nil {
+		_ = udpConn.Close()
+		_ = tunDev.Close()
+		return nil, err
 	}
 
 	agent.LoadToken(cfg.StateDir, "node.token", &d.token)
@@ -125,7 +145,8 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 	}
 
 	wgMgr, err := wireguard.NewManager(cfg.InterfaceName,
-		wireguard.WithTunDevice(tunDev),
+		// Every packet WireGuard delivers passes the inbound policy first.
+		wireguard.WithTunDevice(filter.Wrap(tunDev, d.allowInbound)),
 		wireguard.WithPrivateKey(kp.PrivateKey),
 		wireguard.WithSharedSocket(udpConn, d.handleControlPacket),
 	)
@@ -206,6 +227,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.networkID = enrollResp.NetworkID
 	d.overlayIPv4 = enrollResp.OverlayIPv4
 	d.overlayIPv6 = enrollResp.OverlayIPv6
+	d.dnsDomain = strings.ToLower(strings.TrimSuffix(enrollResp.DNSDomain, "."))
 
 	// Give the overlay interface its addresses: the kernel TUN gets OS addresses,
 	// netstack mode adds them to the userspace stack.
@@ -243,7 +265,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}
 
-	d.wg.Add(4)
+	d.startSSH(ctx)
+	d.startDNS(ctx)
+	d.wg.Add(6)
+	go d.serveAdmin(ctx)
+	go d.directWorker(ctx)
 	go d.relayWorker(ctx)
 	go d.popWorker(ctx)
 	go d.tunnelWorker(ctx)
@@ -569,12 +595,15 @@ func (d *Daemon) DiscoverAndConnectPeer(ctx context.Context, targetOverlayIP str
 	var routeTarget router.RouteTarget
 	if directEndpoint != "" {
 		// Direct WireGuard P2P
-		_ = d.wgManager.ApplyPeer(wireguard.PeerConfig{
+		if err := d.wgManager.ApplyPeer(wireguard.PeerConfig{
 			PublicKey:           discResp.TargetPublicKey,
 			Endpoint:            directEndpoint,
 			AllowedIPs:          []string{discResp.TargetOverlayIPv4 + "/32"},
-			PersistentKeepalive: 20 * time.Second,
-		})
+			PersistentKeepalive: p2pKeepalive,
+		}); err != nil {
+			return nil, err
+		}
+		d.direct.up(discResp.TargetPublicKey, discResp.TargetOverlayIPv4, time.Now())
 		agent.NudgeUntilHandshake(d.wgManager, discResp.TargetPublicKey, func() bool { return true })
 
 		routeTarget = router.RouteTarget{
@@ -602,6 +631,9 @@ func (d *Daemon) DiscoverAndConnectPeer(ctx context.Context, targetOverlayIP str
 		// relays through it. A direct peer with the PoP as endpoint would only
 		// attempt a handshake the PoP cannot complete on the target's behalf.
 		_ = d.wgManager.RemovePeer(discResp.TargetPublicKey)
+		if d.cfg.EnableP2P {
+			d.direct.down(discResp.TargetPublicKey, discResp.TargetOverlayIPv4, time.Now())
+		}
 
 		routeTarget = router.RouteTarget{
 			PublicKey:   discResp.TargetPublicKey,
@@ -620,6 +652,11 @@ func (d *Daemon) connectPeer(ctx context.Context, peer core.Node) {
 	d.peers[peer.PublicKey] = peer
 	d.peersMu.Unlock()
 
+	// The PoP relays until a direct path exists. Only one side opens it; the
+	// other answers the punch request the plane forwards.
+	if !d.cfg.EnableP2P || !d.initiates(peer.PublicKey) {
+		return
+	}
 	_, _ = d.DiscoverAndConnectPeer(ctx, peer.OverlayIPv4)
 }
 
@@ -781,61 +818,32 @@ func (d *Daemon) AllowPort(portProto string) {
 	slog.Info("Allowed inbound port", "hostname", d.cfg.Hostname, "port", portProto)
 }
 
-// IsTrafficAllowed evaluates if incoming traffic from srcIP to localPort on protocol is permitted.
-// If defaultDeny is enabled, all ports are denied unless explicitly allowed.
+// allowInbound is the packet filter's policy for a new inbound flow.
+func (d *Daemon) allowInbound(p filter.Packet) bool {
+	return d.IsTrafficAllowed(p.Src.String(), p.Protocol(), int(p.DstPort))
+}
+
+// IsTrafficAllowed evaluates if incoming traffic from srcIP to destPort on
+// protocol is permitted. Network rules decide first: a matching DENY closes a
+// port the node itself opens, and a matching ALLOW opens one the node's
+// default-deny would close. Ping is answered unless a rule denies it.
 func (d *Daemon) IsTrafficAllowed(srcIP string, protocol string, destPort int) bool {
-	// Network rules first: a matching DENY closes a port the node itself opens,
-	// and a matching ALLOW opens one the node's default-deny would close.
 	if allow, matched := d.centralDecision(srcIP, protocol, destPort); matched {
 		return allow
 	}
 
 	d.policyMu.RLock()
-	allowedPorts := d.allowedPorts
-	defaultDeny := d.defaultDeny
-	allowedPeers := d.allowedPeers
+	allowedPorts, defaultDeny, allowedPeers, allowPing := d.allowedPorts, d.defaultDeny, d.allowedPeers, d.allowPing
 	d.policyMu.RUnlock()
 
-	// 1. If allowedPeers is specified, verify srcIP
-	if len(allowedPeers) > 0 {
-		peerAllowed := false
-		for _, peer := range allowedPeers {
-			if peer == "*" || peer == srcIP {
-				peerAllowed = true
-				break
-			}
-		}
-		if !peerAllowed {
-			return false
-		}
-	}
-
-	// 2. Check if port & protocol is in allowedPorts list
-	for _, ap := range allowedPorts {
-		ap = strings.TrimSpace(ap)
-		if ap == "*" {
-			return true
-		}
-
-		parts := strings.Split(ap, "/")
-		portPart := parts[0]
-		protoPart := "*"
-		if len(parts) > 1 {
-			protoPart = parts[1]
-		}
-
-		if protoPart == "*" || strings.EqualFold(protoPart, protocol) {
-			p, err := strconv.Atoi(portPart)
-			if err == nil && p == destPort {
-				return true
-			}
-		}
-	}
-
-	// 3. If zero-trust default deny is active, deny any unlisted port
-	if defaultDeny {
+	if len(allowedPeers) > 0 && !slices.Contains(allowedPeers, "*") && !slices.Contains(allowedPeers, srcIP) {
 		return false
 	}
-
-	return true
+	if protocol == "icmp" && allowPing {
+		return true
+	}
+	if acl.PortAllowed(allowedPorts, protocol, destPort) {
+		return true
+	}
+	return !defaultDeny
 }

@@ -104,9 +104,30 @@ type NodeConfig struct {
 	// SOCKSListen, if set, runs a SOCKS5 proxy on this loopback address that reaches the overlay only.
 	SOCKSListen         string              `mapstructure:"socks_listen"`
 	Tags                []string            `mapstructure:"tags"`
-	AllowedInboundPorts []string            `mapstructure:"allowed_inbound_ports"` // e.g. ["5432/tcp"]
+	Allow               []string            `mapstructure:"allow"`                 // services or ports peers may reach: ["ssh", "5432/tcp", "ping"]
+	AllowedInboundPorts []string            `mapstructure:"allowed_inbound_ports"` // older name for allow; both are read
 	DefaultDeny         bool                `mapstructure:"default_deny"`          // zero-trust default deny all
+	AllowPing           bool                `mapstructure:"allow_ping"`            // answer ICMP echo unless a network rule denies it
 	Tunnels             []LocalTunnelConfig `mapstructure:"tunnels"`
+	SSH                 SSHConfig           `mapstructure:"ssh"`
+	MagicDNS            bool                `mapstructure:"magic_dns"` // resolve <peer>.<network dns_domain> on this machine
+}
+
+// SSHConfig runs the node's built-in SSH server, reachable only on the mesh.
+// A peer logs in when the network policy lets it reach the port, its SSH key
+// is the one the plane holds for it, and a grant names the local user.
+type SSHConfig struct {
+	Enabled     bool          `mapstructure:"enabled"`
+	Port        int           `mapstructure:"port"` // on the overlay address; set another if the host's sshd holds 22
+	Allow       []SSHGrant    `mapstructure:"allow"`
+	IdleTimeout time.Duration `mapstructure:"idle_timeout"`
+	MaxSessions int           `mapstructure:"max_sessions"`
+}
+
+// SSHGrant lets matching peers log in as the listed local users.
+type SSHGrant struct {
+	From  string   `mapstructure:"from"`  // "*", a tag ("tag:admin"), a node hostname or an overlay IP
+	Users []string `mapstructure:"users"` // local accounts; root only when listed
 }
 
 // StaticRouteConfig defines pre-configured upstream routes in zro.yaml.
@@ -187,6 +208,11 @@ func Load(cfgFile string) (*AppConfig, error) {
 	v.SetDefault("node.mtu", 1420)
 	v.SetDefault("node.enable_p2p", true)
 	v.SetDefault("node.default_deny", true)
+	v.SetDefault("node.allow_ping", true)
+	v.SetDefault("node.magic_dns", true)
+	v.SetDefault("node.ssh.port", 22)
+	v.SetDefault("node.ssh.idle_timeout", "30m")
+	v.SetDefault("node.ssh.max_sessions", 10)
 	v.SetDefault("node.plane_endpoint", "https://zro-plane.cubis.tech:443")
 
 	// Gateway defaults

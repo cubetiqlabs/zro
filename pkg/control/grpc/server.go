@@ -121,6 +121,8 @@ func toProtoNode(n *core.Node) *v1.Node {
 		Tags:            []string(n.Tags),
 		AllowedIps:      []string(n.AllowedIPs),
 		Endpoints:       []string(n.Endpoints),
+		SshKey:          n.SSHKey,
+		SshPort:         int32(n.SSHPort),
 	}
 }
 
@@ -161,6 +163,8 @@ func (s *Server) Enroll(ctx context.Context, req *v1.EnrollRequest) (*v1.EnrollR
 		AllowedPorts: req.AllowedPorts,
 		DefaultDeny:  req.DefaultDeny,
 		Probes:       probes,
+		SSHKey:       req.SshKey,
+		SSHPort:      int(req.SshPort),
 		CurrentToken: bearerFromContext(ctx),
 	})
 	if err != nil {

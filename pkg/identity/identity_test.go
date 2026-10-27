@@ -43,3 +43,15 @@ func TestRefusesLooseKeyPermissions(t *testing.T) {
 		t.Fatal("a group/world readable private key must be rejected")
 	}
 }
+
+func TestSSHKeyPersists(t *testing.T) {
+	dir := t.TempDir()
+	a, err := LoadOrCreateSSHKey(dir, "ssh.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := LoadOrCreateSSHKey(dir, "ssh.key")
+	if err != nil || !a.Equal(b) {
+		t.Fatalf("reloaded key differs: %v", err)
+	}
+}

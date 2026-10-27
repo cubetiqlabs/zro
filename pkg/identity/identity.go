@@ -3,8 +3,13 @@
 package identity
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
+
 	"errors"
 	"fmt"
+	"golang.org/x/crypto/ssh"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,4 +100,37 @@ func WriteSecret(dir, name, value string) error {
 		return err
 	}
 	return os.Rename(tmp.Name(), filepath.Join(dir, name))
+}
+
+// LoadOrCreateSSHKey returns the node's SSH key stored as dir/name, creating
+// an ed25519 key on first use. An empty dir gives an ephemeral key.
+func LoadOrCreateSSHKey(dir, name string) (ed25519.PrivateKey, error) {
+	if dir == "" {
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		return priv, err
+	}
+	raw, err := ReadSecret(dir, name)
+	if err == nil {
+		key, err := ssh.ParseRawPrivateKey([]byte(raw + "\n"))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", filepath.Join(dir, name), err)
+		}
+		priv, ok := key.(*ed25519.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("%s is not an ed25519 key", filepath.Join(dir, name))
+		}
+		return *priv, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	block, err := ssh.MarshalPrivateKey(priv, "zro node")
+	if err != nil {
+		return nil, err
+	}
+	return priv, WriteSecret(dir, name, strings.TrimSpace(string(pem.EncodeToMemory(block))))
 }
