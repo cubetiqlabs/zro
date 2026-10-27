@@ -9,7 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"strconv"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -17,11 +17,13 @@ import (
 	v1 "github.com/cubetiqlabs/zro/api/proto/v1"
 	"github.com/cubetiqlabs/zro/pkg/agent"
 	"github.com/cubetiqlabs/zro/pkg/config"
+	"github.com/cubetiqlabs/zro/pkg/control/acl"
 	controlauth "github.com/cubetiqlabs/zro/pkg/control/auth"
 	controlgrpc "github.com/cubetiqlabs/zro/pkg/control/grpc"
 	"github.com/cubetiqlabs/zro/pkg/control/server"
 	"github.com/cubetiqlabs/zro/pkg/core"
 	"github.com/cubetiqlabs/zro/pkg/crypto"
+	"github.com/cubetiqlabs/zro/pkg/dataplane/filter"
 	"github.com/cubetiqlabs/zro/pkg/dataplane/router"
 	"github.com/cubetiqlabs/zro/pkg/dataplane/tun"
 	"github.com/cubetiqlabs/zro/pkg/dataplane/wireguard"
@@ -70,6 +72,7 @@ type Daemon struct {
 	policyMu     sync.RWMutex
 	allowedPorts []string // e.g. ["5432/tcp"]
 	defaultDeny  bool     // default true for zero-trust
+	allowPing    bool
 	allowedPeers []string
 
 	// Control-plane datagram correlation on the shared WireGuard socket.
@@ -113,6 +116,7 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 		tunnelClient: tunnel.NewClient(),
 		allowedPorts: cfg.AllowedInboundPorts,
 		defaultDeny:  cfg.DefaultDeny,
+		allowPing:    cfg.AllowPing,
 		stunWaiters:  make(map[[12]byte]chan *stun.ReflexiveAddress),
 		relay:        newRelayState(),
 		popKick:      make(chan struct{}, 1),
@@ -126,7 +130,8 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 	}
 
 	wgMgr, err := wireguard.NewManager(cfg.InterfaceName,
-		wireguard.WithTunDevice(tunDev),
+		// Every packet WireGuard delivers passes the inbound policy first.
+		wireguard.WithTunDevice(filter.Wrap(tunDev, d.allowInbound)),
 		wireguard.WithPrivateKey(kp.PrivateKey),
 		wireguard.WithSharedSocket(udpConn, d.handleControlPacket),
 	)
@@ -795,61 +800,32 @@ func (d *Daemon) AllowPort(portProto string) {
 	slog.Info("Allowed inbound port", "hostname", d.cfg.Hostname, "port", portProto)
 }
 
-// IsTrafficAllowed evaluates if incoming traffic from srcIP to localPort on protocol is permitted.
-// If defaultDeny is enabled, all ports are denied unless explicitly allowed.
+// allowInbound is the packet filter's policy for a new inbound flow.
+func (d *Daemon) allowInbound(p filter.Packet) bool {
+	return d.IsTrafficAllowed(p.Src.String(), p.Protocol(), int(p.DstPort))
+}
+
+// IsTrafficAllowed evaluates if incoming traffic from srcIP to destPort on
+// protocol is permitted. Network rules decide first: a matching DENY closes a
+// port the node itself opens, and a matching ALLOW opens one the node's
+// default-deny would close. Ping is answered unless a rule denies it.
 func (d *Daemon) IsTrafficAllowed(srcIP string, protocol string, destPort int) bool {
-	// Network rules first: a matching DENY closes a port the node itself opens,
-	// and a matching ALLOW opens one the node's default-deny would close.
 	if allow, matched := d.centralDecision(srcIP, protocol, destPort); matched {
 		return allow
 	}
 
 	d.policyMu.RLock()
-	allowedPorts := d.allowedPorts
-	defaultDeny := d.defaultDeny
-	allowedPeers := d.allowedPeers
+	allowedPorts, defaultDeny, allowedPeers, allowPing := d.allowedPorts, d.defaultDeny, d.allowedPeers, d.allowPing
 	d.policyMu.RUnlock()
 
-	// 1. If allowedPeers is specified, verify srcIP
-	if len(allowedPeers) > 0 {
-		peerAllowed := false
-		for _, peer := range allowedPeers {
-			if peer == "*" || peer == srcIP {
-				peerAllowed = true
-				break
-			}
-		}
-		if !peerAllowed {
-			return false
-		}
-	}
-
-	// 2. Check if port & protocol is in allowedPorts list
-	for _, ap := range allowedPorts {
-		ap = strings.TrimSpace(ap)
-		if ap == "*" {
-			return true
-		}
-
-		parts := strings.Split(ap, "/")
-		portPart := parts[0]
-		protoPart := "*"
-		if len(parts) > 1 {
-			protoPart = parts[1]
-		}
-
-		if protoPart == "*" || strings.EqualFold(protoPart, protocol) {
-			p, err := strconv.Atoi(portPart)
-			if err == nil && p == destPort {
-				return true
-			}
-		}
-	}
-
-	// 3. If zero-trust default deny is active, deny any unlisted port
-	if defaultDeny {
+	if len(allowedPeers) > 0 && !slices.Contains(allowedPeers, "*") && !slices.Contains(allowedPeers, srcIP) {
 		return false
 	}
-
-	return true
+	if protocol == "icmp" && allowPing {
+		return true
+	}
+	if acl.PortAllowed(allowedPorts, protocol, destPort) {
+		return true
+	}
+	return !defaultDeny
 }

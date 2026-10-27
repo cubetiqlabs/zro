@@ -87,7 +87,8 @@ node:
   listen_port: 0 # Shared WireGuard/STUN UDP port; 0 = ephemeral
   mtu: 1420
   enable_p2p: true
-  default_deny: true # Zero-Trust default deny all inbound traffic
+  default_deny: true # Zero-Trust default deny all inbound traffic (enforced per packet, tun and netstack)
+  allow_ping: true # answer ICMP echo unless a network rule denies it
   allowed_inbound_ports:
     - "5432/tcp" # e.g. expose Postgres service to mesh peers
   tags:

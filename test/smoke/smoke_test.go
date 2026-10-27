@@ -756,7 +756,10 @@ func TestFullMeshSmoke(t *testing.T) {
 	}()
 
 	probe := func() bool {
-		c, err := node2.DialMesh(ctx, "tcp", "100.64.0.2:22")
+		// A filtered SYN is dropped, so a blocked dial ends at its deadline.
+		dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		c, err := node2.DialMesh(dialCtx, "tcp", "100.64.0.2:22")
 		if err != nil {
 			return false
 		}

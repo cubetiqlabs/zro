@@ -106,6 +106,7 @@ type NodeConfig struct {
 	Tags                []string            `mapstructure:"tags"`
 	AllowedInboundPorts []string            `mapstructure:"allowed_inbound_ports"` // e.g. ["5432/tcp"]
 	DefaultDeny         bool                `mapstructure:"default_deny"`          // zero-trust default deny all
+	AllowPing           bool                `mapstructure:"allow_ping"`            // answer ICMP echo unless a network rule denies it
 	Tunnels             []LocalTunnelConfig `mapstructure:"tunnels"`
 }
 
@@ -187,6 +188,7 @@ func Load(cfgFile string) (*AppConfig, error) {
 	v.SetDefault("node.mtu", 1420)
 	v.SetDefault("node.enable_p2p", true)
 	v.SetDefault("node.default_deny", true)
+	v.SetDefault("node.allow_ping", true)
 	v.SetDefault("node.plane_endpoint", "https://zro-plane.cubis.tech:443")
 
 	// Gateway defaults

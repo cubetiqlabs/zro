@@ -50,22 +50,22 @@ func TestACLEvaluator(t *testing.T) {
 	eval := NewEvaluator(rules)
 
 	// Case 1: Web -> DB on port 5432 (TCP) -> ALLOW
-	if !eval.CanAccess([]string{"tag:web"}, []string{"tag:db"}, "tcp", 5432) {
+	if !eval.CanAccessWithIP("", []string{"tag:web"}, "", []string{"tag:db"}, "tcp", 5432) {
 		t.Fatalf("expected web to access db on 5432 TCP")
 	}
 
 	// Case 2: Web -> DB on port 22 (SSH) -> DENY
-	if eval.CanAccess([]string{"tag:web"}, []string{"tag:db"}, "tcp", 22) {
+	if eval.CanAccessWithIP("", []string{"tag:web"}, "", []string{"tag:db"}, "tcp", 22) {
 		t.Fatalf("expected web NOT to access db on port 22")
 	}
 
 	// Case 3: Admin -> Any on any port -> ALLOW
-	if !eval.CanAccess([]string{"tag:admin"}, []string{"tag:db"}, "tcp", 22) {
+	if !eval.CanAccessWithIP("", []string{"tag:admin"}, "", []string{"tag:db"}, "tcp", 22) {
 		t.Fatalf("expected admin to access anything")
 	}
 
 	// Case 4: Stranger -> Any -> DENY (hits rule 100)
-	if eval.CanAccess([]string{"tag:guest"}, []string{"tag:web"}, "tcp", 80) {
+	if eval.CanAccessWithIP("", []string{"tag:guest"}, "", []string{"tag:web"}, "tcp", 80) {
 		t.Fatalf("expected guest to be denied")
 	}
 
@@ -80,26 +80,29 @@ func TestACLEvaluator(t *testing.T) {
 	}
 }
 
-func TestZeroTrustInboundFirewall(t *testing.T) {
-	eval := NewEvaluator(nil)
-
-	// Node 1 hosts Postgres server: allows port 5432/tcp, default deny all
-	allowedPorts := []string{"5432/tcp"}
-	defaultDeny := true
-
-	// Scenario: Node 2 (100.64.0.11) connects to Node 1 on port 5432/tcp -> ALLOW
-	if !eval.EvaluateInbound("100.64.0.11", []string{"tag:app"}, "tcp", 5432, allowedPorts, defaultDeny) {
-		t.Fatalf("expected node 2 to be allowed on port 5432 (postgres)")
+func TestPortAllowed(t *testing.T) {
+	allowed := []string{"5432/tcp", "8000-8100/tcp", "53"}
+	for _, c := range []struct {
+		proto string
+		port  int
+		want  bool
+	}{{"tcp", 5432, true}, {"udp", 5432, false}, {"tcp", 8050, true}, {"udp", 53, true}, {"tcp", 22, false}} {
+		if got := PortAllowed(allowed, c.proto, c.port); got != c.want {
+			t.Errorf("%s/%d: got %v", c.proto, c.port, got)
+		}
 	}
+}
 
-	// Scenario: Node 2 connects to Node 1 on port 22 (ssh) -> DENY (default deny all)
-	if eval.EvaluateInbound("100.64.0.11", []string{"tag:app"}, "tcp", 22, allowedPorts, defaultDeny) {
-		t.Fatalf("expected node 2 to be DENIED on port 22 under zero-trust default deny")
+func BenchmarkDecide(b *testing.B) {
+	rules := make([]core.ACLRule, 0, 20)
+	for i := 0; i < 19; i++ {
+		rules = append(rules, core.ACLRule{Priority: i, SourceIP: "10.0.0.0/8", SourceTag: "tag:x", DestTag: "*", Protocol: "tcp", Ports: "1000-2000", Action: core.ACLActionAllow})
 	}
-
-	// Scenario: Node 2 connects to Node 1 on port 80 (http) -> DENY (default deny all)
-	if eval.EvaluateInbound("100.64.0.11", []string{"tag:app"}, "tcp", 80, allowedPorts, defaultDeny) {
-		t.Fatalf("expected node 2 to be DENIED on port 80 under zero-trust default deny")
+	rules = append(rules, core.ACLRule{Priority: 100, SourceIP: "100.64.0.0/10", SourceTag: "*", DestTag: "*", Protocol: "tcp", Ports: "22,443", Action: core.ACLActionAllow})
+	eval := NewEvaluator(rules)
+	b.ReportAllocs()
+	for b.Loop() {
+		eval.Decide("100.64.0.9", nil, "100.64.0.2", nil, "tcp", 443)
 	}
 }
 

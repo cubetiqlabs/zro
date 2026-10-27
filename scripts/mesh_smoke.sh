@@ -62,6 +62,18 @@ ok "zro status lists peers"
 docker exec smoke-n1 zro ping -n 1 n2 || { echo "FAIL zro ping n2"; exit 1; }
 ok "zro ping n2"
 
+# Zero trust: an unlisted TCP port is filtered until a network rule opens it.
+docker exec -d smoke-n2 sh -c 'while true; do echo hi | nc -l -p 7000; done'
+sleep 1
+reach() { [ "$(docker exec smoke-n1 sh -c "nc -w 3 $N2 7000 </dev/null" 2>/dev/null)" = hi ]; }
+if reach; then echo "FAIL port 7000 reachable under default deny"; exit 1; fi
+ok "port 7000 filtered by default deny"
+api /api/v1/acl/rules "{\"network_id\":\"$NETID\",\"priority\":10,\"source_tag\":\"*\",\"dest_tag\":\"*\",\"protocol\":\"tcp\",\"ports\":\"7000\",\"action\":\"ALLOW\"}" -H "Authorization: Bearer $KEY" >/dev/null
+for _ in $(seq 1 10); do reach && break; sleep 1; done
+reach || { echo "FAIL port 7000 still filtered after an ALLOW rule"; exit 1; }
+ok "port 7000 open after a network ALLOW rule"
+ping_ok smoke-n1 "$N2" "ping still allowed with rules present"
+
 # A direct path that stops carrying traffic must fall back to the edge relay.
 if [ "$P2P" = true ]; then
   N2_LAN=$(docker inspect smoke-n2 -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')

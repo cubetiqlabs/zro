@@ -153,7 +153,10 @@ func TestNodeToNodeThroughEdge(t *testing.T) {
 	// Network-wide policy reaches the nodes live: a DENY rule created through the
 	// API cuts the path that was just working, and deleting it restores it.
 	reaches := func() bool {
-		conn, err := a.DialMesh(ctx, "tcp", target)
+		// The filter drops a denied SYN, so a blocked dial ends at its deadline.
+		dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		conn, err := a.DialMesh(dialCtx, "tcp", target)
 		if err != nil {
 			return false
 		}

@@ -91,7 +91,10 @@ func TestNodeZeroTrustInterconnection(t *testing.T) {
 	serve(22)
 
 	query := func(port int) (string, error) {
-		conn, err := node2.DialMesh(ctx, "tcp", fmt.Sprintf("100.64.0.10:%d", port))
+		// The filter drops a disallowed SYN, so a blocked dial ends at its deadline.
+		dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		conn, err := node2.DialMesh(dialCtx, "tcp", fmt.Sprintf("100.64.0.10:%d", port))
 		if err != nil {
 			return "", err
 		}
