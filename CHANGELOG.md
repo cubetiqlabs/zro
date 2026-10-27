@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.3 - 2026-10-27
+
+- docs: zero-trust policy, SSH, status/ping, MagicDNS, nodes, keys, audit (7ef95f4)
+- feat(node): MagicDNS for peer names, unique hostnames per network (8f2e152)
+- feat(control): scoped tenant API keys (read, write, admin) with expiry (6b8933c)
+- feat(node): built-in SSH over the mesh with zro ssh (9b9da4c)
+- feat(control): audit log, node approval, tags, disable and key expiry (0ccb39e)
+- feat(policy): services, shorthand rules, whole-policy apply and zro acl (e2cfcf6)
+- feat(node): enforce the zero-trust policy on every packet (8f364b9)
+- fix(node): fall back to the edge relay when a direct P2P path dies (6714799)
+
 ## v0.1.2 - 2026-10-24
 
 - docs: three ways to mint a token, verify the mesh, edge address, troubleshooting (fe7a410)
