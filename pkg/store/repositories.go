@@ -225,6 +225,12 @@ func (r *nodeRepo) ListStale(ctx context.Context, before time.Time, limit int) (
 	return nodes, err
 }
 
+func (r *nodeRepo) ListExpiredBetween(ctx context.Context, from, to time.Time) ([]core.Node, error) {
+	var nodes []core.Node
+	err := r.db.WithContext(ctx).Where("expires_at > ? AND expires_at <= ?", from, to).Find(&nodes).Error
+	return nodes, err
+}
+
 func (r *nodeRepo) GetByTokenHash(ctx context.Context, tokenHash string) (*core.Node, error) {
 	if tokenHash == "" {
 		return nil, gorm.ErrRecordNotFound
@@ -413,4 +419,28 @@ func (r *enrollmentRepo) Redeem(ctx context.Context, nonce, pubKey string, expir
 
 func (r *enrollmentRepo) PurgeExpired(ctx context.Context) error {
 	return r.db.WithContext(ctx).Delete(&core.EnrollmentRedemption{}, "expires_at < ?", time.Now()).Error
+}
+
+// --- Audit Repository ---
+
+type auditRepo struct{ db *gorm.DB }
+
+func (r auditRepo) Create(ctx context.Context, ev *core.AuditEvent) error {
+	return r.db.WithContext(ctx).Create(ev).Error
+}
+
+func (r auditRepo) List(ctx context.Context, tenantID uuid.UUID, networkID string, before time.Time, limit int) ([]core.AuditEvent, error) {
+	q := r.db.WithContext(ctx).Where("tenant_id = ?", tenantID)
+	if networkID != "" {
+		q = q.Where("network_id = ?", networkID)
+	}
+	if !before.IsZero() {
+		q = q.Where("created_at < ?", before)
+	}
+	var out []core.AuditEvent
+	return out, q.Order("created_at desc").Limit(limit).Find(&out).Error
+}
+
+func (r auditRepo) Purge(ctx context.Context, cutoff time.Time) error {
+	return r.db.WithContext(ctx).Where("created_at < ?", cutoff).Delete(&core.AuditEvent{}).Error
 }

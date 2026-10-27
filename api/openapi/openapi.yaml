@@ -34,6 +34,7 @@ tags:
   - {name: ACL, description: "Zero-trust access rules."}
   - {name: PoPs, description: "Edge points of presence."}
   - {name: Topology, description: "Live mesh graph."}
+  - {name: Audit, description: "Who changed what, kept 90 days."}
   - {name: Events, description: "Real-time change feed (SSE and WebSocket)."}
   - {name: Enrollment, description: "Joining a network. Used by `zro node`."}
   - {name: Node API, description: "Calls a node makes with its node token."}
@@ -293,13 +294,15 @@ paths:
       tags: [Networks]
       operationId: updateNetwork
       summary: Update a network
-      description: Only `name`, `dns_domain` and `is_active` can change; addressing is immutable.
+      description: |
+        Changes `name`, `dns_domain`, `is_active`, `approval_required` or `key_expiry_hours`. Addressing is immutable.
+        `approval_required` holds new nodes as pending until approved. `key_expiry_hours` applies to nodes that join from then on.
       requestBody:
         required: true
         content:
           application/json:
             schema: {$ref: "#/components/schemas/UpdateNetworkRequest"}
-            example: {name: prod-eu}
+            example: {approval_required: true, key_expiry_hours: 720}
       responses:
         "200":
           description: The updated network.
@@ -349,6 +352,57 @@ paths:
       responses:
         "204": {description: Removed.}
         "404": {$ref: "#/components/responses/NotFound"}
+    patch:
+      tags: [Nodes]
+      operationId: updateNode
+      summary: Tag, disable or enable a node
+      description: |
+        `tags` replaces the node's tags; from then on a re-join keeps the plane's tags instead of the node's own.
+        `disabled: true` cuts the node off: it can no longer authenticate and peers and edges drop it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tags: {type: array, items: {type: string, maxLength: 100}, example: ["tag:db", "env:prod"]}
+                disabled: {type: boolean}
+      responses:
+        "200":
+          description: The updated node.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Node"}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/nodes/{id}/approve:
+    parameters: [{$ref: "#/components/parameters/NodeID"}]
+    post:
+      tags: [Nodes]
+      operationId: approveNode
+      summary: Approve a pending node
+      description: Admits a node that joined a network with `approval_required`. Approving an admitted node changes nothing.
+      responses:
+        "200":
+          description: The node.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Node"}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /api/v1/audit:
+    get:
+      tags: [Audit]
+      operationId: listAudit
+      summary: The tenant's audit trail, newest first
+      description: Every successful change made through the API, by whom and from where. Secrets and tokens are never recorded.
+      parameters:
+        - {name: network_id, in: query, description: Only this network's events., schema: {$ref: "#/components/schemas/NetworkID"}}
+        - {name: before, in: query, description: "Page backwards: the `created_at` of the last event seen.", schema: {type: string, format: date-time}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 1000, default: 100}}
+      responses:
+        "200":
+          description: Events.
+          content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/AuditEvent"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
 
   /api/v1/acl/rules:
     get:
@@ -971,6 +1025,8 @@ components:
         name: {type: string}
         dns_domain: {type: string}
         is_active: {type: boolean}
+        approval_required: {type: boolean}
+        key_expiry_hours: {type: integer, minimum: 0, maximum: 8760}
     Network:
       type: object
       properties:
@@ -983,6 +1039,8 @@ components:
         dns_domain: {type: string}
         mtu: {type: integer, example: 1420}
         is_active: {type: boolean}
+        approval_required: {type: boolean, description: New nodes wait for approval.}
+        key_expiry_hours: {type: integer, description: "Nodes re-join with a new enrollment token after this long; 0 = never."}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
       example:
@@ -1035,7 +1093,23 @@ components:
         default_deny: {type: boolean}
         endpoints: {type: array, items: {type: string}}
         is_active: {type: boolean}
+        pending: {type: boolean, description: Waiting for approval; not part of the mesh.}
+        disabled: {type: boolean, description: Switched off by the network owner; cannot authenticate.}
+        tags_managed: {type: boolean, description: The plane set the tags; a re-join keeps them.}
+        expires_at: {type: string, format: date-time, description: When the node must re-join. Absent means never.}
         last_seen_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+    AuditEvent:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        network_id: {$ref: "#/components/schemas/NetworkID"}
+        actor: {type: string, example: "tenant:acme", description: "tenant:<slug>, admin, cluster-secret, node:<hostname> or edge:<code>."}
+        action: {type: string, example: acl.create}
+        target: {type: string}
+        detail: {type: string}
+        source_ip: {type: string}
         created_at: {type: string, format: date-time}
     NodePage:
       allOf:

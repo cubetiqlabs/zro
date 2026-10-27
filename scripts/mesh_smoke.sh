@@ -95,4 +95,15 @@ if [ "$P2P" = true ]; then
   ping_ok smoke-n1 "$N2" "after the direct path died"
   ping_ok smoke-n2 "$N1" "after the direct path died"
 fi
+# Lifecycle: a disabled node drops out of the mesh and comes back when enabled.
+zro_plane() { docker exec -e ZRO_PLANE=http://127.0.0.1:8443 -e ZRO_API_KEY="$KEY" -e ZRO_NETWORK="$NETID" smoke-plane zro "$@"; }
+zro_plane nodes list
+zro_plane nodes disable n2 >/dev/null
+for _ in $(seq 1 10); do docker exec smoke-n1 ping -c1 -W1 "$N2" >/dev/null 2>&1 || break; sleep 1; done
+if docker exec smoke-n1 ping -c1 -W2 "$N2" >/dev/null 2>&1; then echo "FAIL disabled n2 still reachable"; exit 1; fi
+ok "disabled n2 is cut off"
+zro_plane nodes enable n2 >/dev/null
+for _ in $(seq 1 30); do docker exec smoke-n1 ping -c1 -W1 "$N2" >/dev/null 2>&1 && break; sleep 1; done
+ping_ok smoke-n1 "$N2" "n2 back after enable"
+zro_plane audit -n 5
 echo "mesh smoke passed"

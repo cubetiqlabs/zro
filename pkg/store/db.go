@@ -23,6 +23,7 @@ type DB struct {
 	ACLs        core.ACLRepository
 	Tunnels     core.TunnelRepository
 	Enrollments core.EnrollmentRepository
+	Audit       core.AuditRepository
 }
 
 // NewDB opens a database connection (PostgreSQL or SQLite) and executes auto-migrations.
@@ -66,6 +67,7 @@ func NewDB(driverName, dsn string) (*DB, error) {
 		&core.ACLRule{},
 		&core.Tunnel{},
 		&core.EnrollmentRedemption{},
+		&core.AuditEvent{},
 	); err != nil {
 		return nil, fmt.Errorf("failed to auto-migrate database schema: %w", err)
 	}
@@ -101,6 +103,7 @@ func NewDB(driverName, dsn string) (*DB, error) {
 		ACLs:        newACLRepo(gormDB),
 		Tunnels:     newTunnelRepo(gormDB),
 		Enrollments: newEnrollmentRepo(gormDB),
+		Audit:       auditRepo{gormDB},
 	}
 
 	return dbInstance, nil

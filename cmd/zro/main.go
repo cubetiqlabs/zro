@@ -62,6 +62,7 @@ smart routing, IPless nodes, zero-trust ACLs, and cloud-native load balancing.`,
 )
 
 func init() {
+	cobra.EnableTraverseRunHooks = true // the root's update notice and a group's own checks both run
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "Path to configuration file (default: ./zro.yaml)")
 
 	rootCmd.AddCommand(newVersionCmd())
@@ -80,6 +81,8 @@ func init() {
 	rootCmd.AddCommand(newAllowCmd(true))
 	rootCmd.AddCommand(newPolicyCmd())
 	rootCmd.AddCommand(newACLCmd())
+	rootCmd.AddCommand(newNodesCmd())
+	rootCmd.AddCommand(newAuditCmd())
 }
 
 func main() {

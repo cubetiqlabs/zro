@@ -102,7 +102,7 @@ func (d *Daemon) syncPeers(ctx context.Context) {
 		}
 	}
 
-	d.peersMu.RLock()
+	d.peersMu.Lock()
 	var gone []core.Node
 	var fresh []core.Node
 	for key, p := range d.peers {
@@ -111,11 +111,13 @@ func (d *Daemon) syncPeers(ctx context.Context) {
 		}
 	}
 	for key, p := range current {
-		if _, ok := d.peers[key]; !ok {
+		if _, ok := d.peers[key]; ok {
+			d.peers[key] = p // known peer: refresh its tags and endpoints for policy
+		} else {
 			fresh = append(fresh, p)
 		}
 	}
-	d.peersMu.RUnlock()
+	d.peersMu.Unlock()
 
 	for _, p := range gone {
 		d.dropPeer(p)

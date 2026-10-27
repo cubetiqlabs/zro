@@ -137,6 +137,11 @@ func buildRule(networkID string, req CreateACLRuleRequest, resolve func(string) 
 	return rule, nil
 }
 
+// ruleSummary is a one-line description of a rule for the audit log.
+func ruleSummary(r *core.ACLRule) string {
+	return fmt.Sprintf("%s %s/%s -> %s/%s %s/%s p%d %q", r.Action, r.SourceIP, r.SourceTag, r.DestIP, r.DestTag, r.Ports, r.Protocol, r.Priority, r.Name)
+}
+
 func orAny(s string) string {
 	if s == "" {
 		return "*"
@@ -203,6 +208,7 @@ func (s *Server) handleCreateACLRule(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("Created ACL rule", "id", rule.ID, "network_id", rule.NetworkID, "action", rule.Action, "ports", rule.Ports)
 	s.policyChanged(network, rule.ID.String())
+	s.auditNetwork(r, network, "acl.create", rule.ID.String(), ruleSummary(rule))
 	writeJSON(w, http.StatusCreated, rule)
 }
 
@@ -270,6 +276,7 @@ func (s *Server) handleUpdateACLRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.policyChanged(network, updated.ID.String())
+	s.auditNetwork(r, network, "acl.update", updated.ID.String(), ruleSummary(updated))
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -300,6 +307,7 @@ func (s *Server) handleDeleteACLRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.policyChanged(network, rule.ID.String())
+	s.auditNetwork(r, network, "acl.delete", rule.ID.String(), ruleSummary(rule))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -354,6 +362,7 @@ func (s *Server) handlePutPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("Replaced network policy", "network_id", network.ID, "rules", len(rules))
 	s.policyChanged(network, "")
+	s.auditNetwork(r, network, "acl.replace", network.ID, fmt.Sprintf("%d rules", len(rules)))
 	writeJSON(w, http.StatusOK, rules)
 }
 

@@ -22,8 +22,8 @@ import (
 type planeAPI struct{ plane, key, network string }
 
 func (p planeAPI) do(method, path string, in, out any) error {
-	if p.plane == "" || p.key == "" || p.network == "" {
-		return fmt.Errorf("--plane, --api-key and --network are required (or $ZRO_PLANE, $ZRO_API_KEY, $ZRO_NETWORK)")
+	if p.plane == "" || p.key == "" {
+		return fmt.Errorf("--plane and --api-key are required (or $ZRO_PLANE, $ZRO_API_KEY)")
 	}
 	var body io.Reader
 	if in != nil {
@@ -84,9 +84,7 @@ hostname, and their ports with a service (ssh, https, postgres, ping…) or
 "80,443/tcp". The lowest priority number wins; a DENY wins a tie. When no rule
 matches, the destination node's own allow list and default_deny decide.`,
 	}
-	cmd.PersistentFlags().StringVar(&api.plane, "plane", os.Getenv("ZRO_PLANE"), "Control plane URL (default $ZRO_PLANE)")
-	cmd.PersistentFlags().StringVar(&api.key, "api-key", os.Getenv("ZRO_API_KEY"), "Tenant API key (default $ZRO_API_KEY)")
-	cmd.PersistentFlags().StringVar(&api.network, "network", os.Getenv("ZRO_NETWORK"), "Network ID (default $ZRO_NETWORK)")
+	planeFlags(cmd, &api, true)
 
 	cmd.AddCommand(&cobra.Command{
 		Use:   "list",

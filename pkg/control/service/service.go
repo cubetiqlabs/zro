@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +38,8 @@ type Service struct {
 	ipamCache map[string]*ipam.IPAM // network ID -> allocator
 
 	lastTouch sync.Map // node ID -> time.Time of the last liveness write
+
+	lastExpiryScan time.Time // maintenance: keys that expired since then are announced
 }
 
 // New creates a Service publishing change events to bus.
@@ -106,6 +109,7 @@ const maxAllocAttempts = 8
 // not leak nodes or addresses.
 func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollResponse, error) {
 	grant, err := s.resumeGrant(ctx, req)
+	fresh := grant == nil // an enrollment token, not a resume: restarts the key's lifetime
 	if grant == nil && err == nil {
 		grant, err = enroll.Authorize(ctx, s.cfg.SecretKey, s.db.Enrollments, enroll.Request{
 			Token: req.Token, PublicKey: req.PublicKey, Hostname: req.Hostname, NodeType: req.NodeType,
@@ -136,7 +140,7 @@ func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollRespons
 		return nil, internal("failed to generate node credentials", err)
 	}
 
-	node, err := s.admit(ctx, network, grant, req, tokenHash)
+	node, err := s.admit(ctx, network, grant, req, tokenHash, fresh)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +159,10 @@ func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollRespons
 		_ = s.db.Nodes.Update(ctx, node)
 	}
 
-	peers, _ := s.db.Nodes.ListByNetworkID(ctx, network.ID)
+	peers, _ := s.members(ctx, network.ID)
+	if !node.Admitted(time.Now()) {
+		peers = nil // a pending node learns its address but no one to talk to
+	}
 	resp := &EnrollResponse{
 		NodeID:       node.ID,
 		NetworkID:    network.ID,
@@ -200,7 +207,7 @@ func (s *Service) resumeGrant(ctx context.Context, req EnrollRequest) (*enroll.G
 		return nil, nil
 	}
 	n, err := s.db.Nodes.GetByTokenHash(ctx, controlauth.HashToken(req.CurrentToken))
-	if err != nil || n == nil || !n.IsActive || n.PublicKey != req.PublicKey { // unknown token: not a resume
+	if err != nil || n == nil || !n.IsActive || n.PublicKey != req.PublicKey || n.Expired(time.Now()) { // not a resume
 		return nil, nil
 	}
 	if req.NodeType != "" && req.NodeType != n.NodeType {
@@ -217,7 +224,7 @@ func (s *Service) resumeGrant(ctx context.Context, req EnrollRequest) (*enroll.G
 // or a new one with a unique overlay address. The database unique indexes on
 // (network, public key) and (network, address) are the arbiter, so concurrent
 // enrollments on several replicas cannot hand out the same address.
-func (s *Service) admit(ctx context.Context, network *core.Network, grant *enroll.Grant, req EnrollRequest, tokenHash string) (*core.Node, error) {
+func (s *Service) admit(ctx context.Context, network *core.Network, grant *enroll.Grant, req EnrollRequest, tokenHash string, fresh bool) (*core.Node, error) {
 	defaultDeny := true
 	if req.DefaultDeny != nil {
 		defaultDeny = *req.DefaultDeny
@@ -226,7 +233,13 @@ func (s *Service) admit(ctx context.Context, network *core.Network, grant *enrol
 		now := time.Now()
 		n.Hostname = grant.Hostname
 		n.TokenHash = tokenHash
-		n.Tags = req.Tags
+		if !n.TagsManaged {
+			n.Tags = req.Tags
+		}
+		if fresh && network.KeyExpiryHours > 0 {
+			exp := now.Add(time.Duration(network.KeyExpiryHours) * time.Hour)
+			n.ExpiresAt = &exp
+		}
 		n.Endpoints = req.Endpoints
 		n.AllowedPorts = req.AllowedPorts
 		n.DefaultDeny = defaultDeny
@@ -284,6 +297,7 @@ func (s *Service) admit(ctx context.Context, network *core.Network, grant *enrol
 			OverlayIPv6: v6,
 			NodeType:    grant.NodeType,
 			AllowedIPs:  core.StringList{v4 + "/32", v6 + "/128"},
+			Pending:     network.ApprovalRequired,
 			CreatedAt:   time.Now(),
 		}
 		apply(node)
@@ -350,13 +364,25 @@ func (s *Service) allocator(ctx context.Context, n *core.Network) (*ipam.IPAM, e
 
 // --- Peers --------------------------------------------------------------
 
-// Peers lists the members of node's own network.
+// Peers lists the members of node's own network. A node that is not admitted
+// itself (pending approval) sees none.
 func (s *Service) Peers(ctx context.Context, node *core.Node) ([]core.Node, error) {
-	peers, err := s.db.Nodes.ListByNetworkID(ctx, node.NetworkID)
+	if !node.Admitted(time.Now()) {
+		return []core.Node{}, nil
+	}
+	peers, err := s.members(ctx, node.NetworkID)
 	if err != nil {
 		return nil, internal("failed to list peers", err)
 	}
 	return peers, nil
+}
+
+// members lists the admitted nodes of a network: pending, disabled and
+// expired nodes are left out of every peer list and edge.
+func (s *Service) members(ctx context.Context, networkID string) ([]core.Node, error) {
+	nodes, err := s.db.Nodes.ListByNetworkID(ctx, networkID)
+	now := time.Now()
+	return slices.DeleteFunc(nodes, func(n core.Node) bool { return !n.Admitted(now) }), err
 }
 
 // ACLPolicy returns the access rules of node's network, which the node enforces
@@ -723,7 +749,7 @@ func (s *Service) EdgeSync(ctx context.Context) (*EdgeSnapshot, error) {
 	for _, t := range tenants {
 		nets, _ := s.db.Networks.ListByTenantID(ctx, t.ID)
 		for _, n := range nets {
-			ns, _ := s.db.Nodes.ListByNetworkID(ctx, n.ID)
+			ns, _ := s.members(ctx, n.ID)
 			snap.Nodes = append(snap.Nodes, ns...)
 			for _, cidr := range []string{n.IPv4CIDR, n.IPv6CIDR} {
 				if cidr != "" && !seen[cidr] {
@@ -816,6 +842,42 @@ func (s *Service) maintainOnce(ctx context.Context, nodeTTL time.Duration) int {
 		}
 	}
 	_ = s.db.Enrollments.PurgeExpired(ctx)
+	s.announceExpired(ctx, time.Now())
+	_ = s.db.Audit.Purge(ctx, time.Now().Add(-auditRetention))
 	s.delegator.Prune(10 * time.Minute)
 	return reaped
+}
+
+// auditRetention is how long audit events are kept.
+// ponytail: fixed 90 days; make it a config value when someone needs another.
+const auditRetention = 90 * 24 * time.Hour
+
+// announceExpired tells peers and edges about keys that expired since the last
+// scan, so they drop those nodes without waiting for the next change.
+func (s *Service) announceExpired(ctx context.Context, now time.Time) {
+	from := s.lastExpiryScan
+	if from.IsZero() {
+		from = now.Add(-24 * time.Hour)
+	}
+	s.lastExpiryScan = now
+	expired, err := s.db.Nodes.ListExpiredBetween(ctx, from, now)
+	if err != nil {
+		return
+	}
+	for _, n := range expired {
+		scope := s.scopeForNetwork(ctx, n.NetworkID)
+		s.publish(scope, "node_left", map[string]any{"network_id": n.NetworkID, "node_id": n.ID, "pubkey": n.PublicKey, "reason": "key_expired"})
+	}
+}
+
+// NodeChanged announces an operator change to a node (approval, tags,
+// disable) so peers and edges refetch it.
+func (s *Service) NodeChanged(ctx context.Context, n *core.Node) {
+	scope := s.scopeForNetwork(ctx, n.NetworkID)
+	name := "node_joined"
+	if !n.Admitted(time.Now()) {
+		name = "node_left"
+	}
+	s.publish(scope, name, map[string]any{"network_id": n.NetworkID, "node_id": n.ID, "pubkey": n.PublicKey})
+	s.publish(scope, "mesh_graph_updated", map[string]any{"network_id": n.NetworkID})
 }

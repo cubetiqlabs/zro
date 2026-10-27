@@ -92,8 +92,13 @@ type Network struct {
 	DNSDomain string    `gorm:"size:255;default:'zro.internal'" json:"dns_domain"`
 	MTU       int       `gorm:"default:1420" json:"mtu"`
 	IsActive  bool      `gorm:"default:true" json:"is_active"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	// ApprovalRequired holds new nodes as pending until an operator approves them.
+	ApprovalRequired bool `json:"approval_required"`
+	// KeyExpiryHours makes a node re-join with a new enrollment token after
+	// this long (0 = never).
+	KeyExpiryHours int       `json:"key_expiry_hours"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 
 	Nodes    []Node    `gorm:"foreignKey:NetworkID" json:"nodes,omitempty"`
 	ACLRules []ACLRule `gorm:"foreignKey:NetworkID" json:"acl_rules,omitempty"`
@@ -140,14 +145,43 @@ type Node struct {
 	AllowedIPs    StringList `gorm:"type:text" json:"allowed_ips"`
 	AllowedPorts  StringList `gorm:"type:text" json:"allowed_ports"` // e.g. ["5432/tcp", "80/tcp"]
 	DefaultDeny   bool       `gorm:"default:true" json:"default_deny"`
-	Endpoints     StringList `gorm:"type:text" json:"endpoints"` // reflexive/STUN public addresses
-	IsActive      bool       `gorm:"default:true" json:"is_active"`
-	LastSeenAt    time.Time  `json:"last_seen_at"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	// Pending nodes wait for approval; Disabled ones were switched off by an
+	// operator; both stay out of the mesh. TagsManaged means the plane set the
+	// tags, so a re-join keeps them instead of the node's own.
+	Pending     bool       `json:"pending"`
+	Disabled    bool       `json:"disabled"`
+	TagsManaged bool       `json:"tags_managed"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	Endpoints   StringList `gorm:"type:text" json:"endpoints"` // reflexive/STUN public addresses
+	IsActive    bool       `gorm:"default:true" json:"is_active"`
+	LastSeenAt  time.Time  `json:"last_seen_at"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 
 	AssignedPoP *EdgePoP `gorm:"foreignKey:AssignedPoPID" json:"assigned_pop,omitempty"`
 	Tunnels     []Tunnel `gorm:"foreignKey:NodeID" json:"tunnels,omitempty"`
+}
+
+// Expired reports whether the node's key has expired.
+func (n *Node) Expired(now time.Time) bool { return n.ExpiresAt != nil && now.After(*n.ExpiresAt) }
+
+// Admitted reports whether the node takes part in the mesh: peers and edges
+// route to it only then.
+func (n *Node) Admitted(now time.Time) bool {
+	return n.IsActive && !n.Pending && !n.Disabled && !n.Expired(now)
+}
+
+// AuditEvent records one change made through the API.
+type AuditEvent struct {
+	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	TenantID  uuid.UUID `gorm:"type:uuid;index" json:"tenant_id"`
+	NetworkID string    `gorm:"size:16;index" json:"network_id,omitempty"`
+	Actor     string    `gorm:"size:255" json:"actor"`  // "tenant:acme", "admin", "node:web-1", "edge:KH"
+	Action    string    `gorm:"size:64" json:"action"`  // "acl.create", "node.approve", "ssh.session"
+	Target    string    `gorm:"size:255" json:"target"` // what was acted on (id, hostname)
+	Detail    string    `gorm:"size:1024" json:"detail,omitempty"`
+	SourceIP  string    `gorm:"size:64" json:"source_ip"`
+	CreatedAt time.Time `gorm:"index" json:"created_at"`
 }
 
 // ACLAction represents whether to allow or drop traffic.

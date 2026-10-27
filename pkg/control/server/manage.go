@@ -30,6 +30,10 @@ func (s *Server) handleUpdateNetwork(w http.ResponseWriter, r *http.Request) {
 		Name      *string `json:"name"`
 		DNSDomain *string `json:"dns_domain"`
 		IsActive  *bool   `json:"is_active"`
+		// New nodes wait for POST /nodes/{id}/approve.
+		ApprovalRequired *bool `json:"approval_required"`
+		// Nodes must re-join with a new enrollment token after this long; 0 = never.
+		KeyExpiryHours *int `json:"key_expiry_hours"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		apiError(w, "invalid request body", http.StatusBadRequest)
@@ -52,11 +56,22 @@ func (s *Server) handleUpdateNetwork(w http.ResponseWriter, r *http.Request) {
 	if req.IsActive != nil {
 		network.IsActive = *req.IsActive
 	}
+	if req.ApprovalRequired != nil {
+		network.ApprovalRequired = *req.ApprovalRequired
+	}
+	if req.KeyExpiryHours != nil {
+		if *req.KeyExpiryHours < 0 || *req.KeyExpiryHours > 24*365 {
+			apiError(w, "key_expiry_hours must be between 0 (never) and 8760", http.StatusBadRequest)
+			return
+		}
+		network.KeyExpiryHours = *req.KeyExpiryHours
+	}
 	network.UpdatedAt = time.Now()
 	if err := s.db.Networks.Update(r.Context(), network); err != nil {
 		apiError(w, "failed to update network", http.StatusInternalServerError)
 		return
 	}
+	s.auditNetwork(r, network, "network.update", network.ID, "")
 	writeJSON(w, http.StatusOK, network)
 }
 
@@ -86,6 +101,7 @@ func (s *Server) handleDeleteNetwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.svc.ForgetNetwork(network.ID)
+	s.auditNetwork(r, network, "network.delete", network.ID, network.Name)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -117,7 +133,8 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A node of another tenant looks the same as a missing one.
-	if _, ok := s.authorizeNetwork(r.Context(), node.NetworkID); !ok {
+	network, ok := s.authorizeNetwork(r.Context(), node.NetworkID)
+	if !ok {
 		apiError(w, "node not found", http.StatusNotFound)
 		return
 	}
@@ -125,6 +142,7 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, err)
 		return
 	}
+	s.auditNetwork(r, network, "node.delete", node.Hostname, node.OverlayIPv4)
 	if s.cfg.EnableGateway {
 		_ = s.syncInternalGateway(r.Context())
 	}
@@ -144,6 +162,7 @@ func (s *Server) handleDeletePoP(w http.ResponseWriter, r *http.Request) {
 	}
 	s.broadcastDelta(controlevents.Scope{}, map[string]any{"event": "pop_status_changed", "pop_code": pop.PoPCode, "is_healthy": false, "status": "removed"})
 	s.broadcastDelta(controlevents.Scope{}, map[string]any{"event": "mesh_graph_updated"})
+	s.audit(r, uuid.Nil, "", "pop.delete", pop.PoPCode, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -238,7 +257,7 @@ func (s *Server) handleCreateEnrollmentToken(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	s.mintEnrollmentToken(w, network, req)
+	s.mintEnrollmentToken(w, r, network, req)
 }
 
 // tokenRequest is the body of both token endpoints.
@@ -261,7 +280,7 @@ func decodeTokenRequest(w http.ResponseWriter, r *http.Request) (tokenRequest, b
 }
 
 // mintEnrollmentToken validates req and answers with a signed token for network.
-func (s *Server) mintEnrollmentToken(w http.ResponseWriter, network *core.Network, req tokenRequest) {
+func (s *Server) mintEnrollmentToken(w http.ResponseWriter, r *http.Request, network *core.Network, req tokenRequest) {
 	if req.Hours == 0 {
 		req.Hours = defaultTokenHours
 	}
@@ -300,6 +319,7 @@ func (s *Server) mintEnrollmentToken(w http.ResponseWriter, network *core.Networ
 	if s.cfg.PublicURL != "" {
 		join = "zro join --plane " + s.cfg.PublicURL + " --token " + token
 	}
+	s.auditNetwork(r, network, "token.create", req.Hostname, fmt.Sprintf("node_type=%s hours=%d bound_key=%v", req.NodeType, req.Hours, req.PubKey != ""))
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"token": token, "network_id": network.ID, "node_type": req.NodeType,
 		"expires_at": expires.UTC(), "join_command": join,
@@ -364,7 +384,7 @@ func (s *Server) handleMintTokenWithSecret(w http.ResponseWriter, r *http.Reques
 		apiError(w, "network not found", http.StatusNotFound)
 		return
 	}
-	s.mintEnrollmentToken(w, network, req)
+	s.mintEnrollmentToken(w, r, network, req)
 }
 
 //go:embed ui/tokens.html ui/tokens.js

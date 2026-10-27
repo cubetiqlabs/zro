@@ -59,6 +59,8 @@ type NodeRepository interface {
 	TouchLastSeen(ctx context.Context, id uuid.UUID, at time.Time) error
 	// ListStale returns nodes not seen since before, oldest first.
 	ListStale(ctx context.Context, before time.Time, limit int) ([]Node, error)
+	// ListExpiredBetween returns nodes whose key expired in (from, to].
+	ListExpiredBetween(ctx context.Context, from, to time.Time) ([]Node, error)
 }
 
 // ACLRepository defines operations for Access Control Rules.
@@ -89,6 +91,16 @@ type TunnelRepository interface {
 var ErrDuplicate = errors.New("duplicate record")
 
 var ErrTokenReused = errors.New("enrollment token already used")
+
+// AuditRepository stores the audit trail.
+type AuditRepository interface {
+	Create(ctx context.Context, ev *AuditEvent) error
+	// List returns a tenant's events newest first, optionally for one network,
+	// created before before (zero = now), at most limit.
+	List(ctx context.Context, tenantID uuid.UUID, networkID string, before time.Time, limit int) ([]AuditEvent, error)
+	// Purge deletes events older than cutoff.
+	Purge(ctx context.Context, cutoff time.Time) error
+}
 
 // EnrollmentRepository tracks redeemed enrollment-token nonces.
 type EnrollmentRepository interface {
