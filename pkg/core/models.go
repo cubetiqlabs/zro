@@ -152,11 +152,16 @@ type Node struct {
 	Disabled    bool       `json:"disabled"`
 	TagsManaged bool       `json:"tags_managed"`
 	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
-	Endpoints   StringList `gorm:"type:text" json:"endpoints"` // reflexive/STUN public addresses
-	IsActive    bool       `gorm:"default:true" json:"is_active"`
-	LastSeenAt  time.Time  `json:"last_seen_at"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	// SSHKey is the node's SSH public key (authorized_keys format): its host
+	// key when it serves SSH and its identity when it connects. SSHPort is
+	// where its built-in SSH server listens on the mesh; 0 = SSH off.
+	SSHKey     string     `gorm:"size:255" json:"ssh_key,omitempty"`
+	SSHPort    int        `json:"ssh_port,omitempty"`
+	Endpoints  StringList `gorm:"type:text" json:"endpoints"` // reflexive/STUN public addresses
+	IsActive   bool       `gorm:"default:true" json:"is_active"`
+	LastSeenAt time.Time  `json:"last_seen_at"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 
 	AssignedPoP *EdgePoP `gorm:"foreignKey:AssignedPoPID" json:"assigned_pop,omitempty"`
 	Tunnels     []Tunnel `gorm:"foreignKey:NodeID" json:"tunnels,omitempty"`

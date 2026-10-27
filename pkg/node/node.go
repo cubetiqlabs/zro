@@ -3,6 +3,7 @@ package node
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +40,7 @@ import (
 type Daemon struct {
 	cfg          *config.NodeConfig
 	keyPair      *crypto.KeyPair
+	sshKey       ed25519.PrivateKey // SSH host key and identity
 	nodeID       uuid.UUID
 	networkID    string // ZeroTier-style 16-hex network ID
 	overlayIPv4  string
@@ -93,6 +95,10 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to load WireGuard identity: %w", err)
 	}
+	sshKey, err := identity.LoadOrCreateSSHKey(cfg.StateDir, "ssh.key")
+	if err != nil {
+		return nil, fmt.Errorf("failed to load SSH identity: %w", err)
+	}
 
 	dev, err := agent.OpenDevice(cfg.InterfaceMode, cfg.InterfaceName, cfg.MTU)
 	if err != nil {
@@ -111,6 +117,7 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 	d := &Daemon{
 		cfg:          cfg,
 		keyPair:      kp,
+		sshKey:       sshKey,
 		peers:        make(map[string]core.Node),
 		tunDev:       tunDev,
 		dev:          dev,
@@ -256,6 +263,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}
 
+	d.startSSH(ctx)
 	d.wg.Add(6)
 	go d.serveAdmin(ctx)
 	go d.directWorker(ctx)

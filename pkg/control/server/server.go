@@ -632,6 +632,7 @@ func (s *Server) registerRoutes() {
 	// Ingress & Tunneling
 	s.mux.HandleFunc("GET /api/v1/acl/policy", s.nodeAuthMiddleware(s.handleACLPolicy))
 	s.mux.HandleFunc("DELETE /api/v1/node", s.nodeAuthMiddleware(s.handleDeregister))
+	s.mux.HandleFunc("POST /api/v1/node/audit", s.nodeAuthMiddleware(s.handleNodeAudit))
 	s.mux.HandleFunc("POST /api/v1/tunnels", s.nodeAuthMiddleware(s.handleRegisterTunnel))
 	s.mux.HandleFunc("GET /api/v1/tunnels", s.nodeAuthMiddleware(s.handleListTunnels))
 	s.mux.HandleFunc("DELETE /api/v1/tunnels/{id}", s.nodeAuthMiddleware(s.handleDeleteTunnel))

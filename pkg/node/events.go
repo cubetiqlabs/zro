@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	v1 "github.com/cubetiqlabs/zro/api/proto/v1"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -61,11 +62,7 @@ func (d *Daemon) fetchPeers(ctx context.Context) ([]core.Node, error) {
 		}
 		peers := make([]core.Node, 0, len(g.Peers))
 		for _, p := range g.Peers {
-			peers = append(peers, core.Node{
-				Hostname: p.Hostname, PublicKey: p.PublicKey,
-				OverlayIPv4: p.OverlayIpv4, OverlayIPv6: p.OverlayIpv6,
-				Endpoints: core.StringList(p.Endpoints), Tags: core.StringList(p.Tags),
-			})
+			peers = append(peers, nodeFromProto(p))
 		}
 		return peers, nil
 	}
@@ -84,6 +81,16 @@ func (d *Daemon) fetchPeers(ctx context.Context) ([]core.Node, error) {
 	}
 	var peers []core.Node
 	return peers, json.NewDecoder(resp.Body).Decode(&peers)
+}
+
+// nodeFromProto is a peer as the gRPC transport carries it.
+func nodeFromProto(p *v1.Node) core.Node {
+	return core.Node{
+		Hostname: p.Hostname, PublicKey: p.PublicKey,
+		OverlayIPv4: p.OverlayIpv4, OverlayIPv6: p.OverlayIpv6,
+		Endpoints: core.StringList(p.Endpoints), Tags: core.StringList(p.Tags),
+		SSHKey: p.SshKey, SSHPort: int(p.SshPort),
+	}
 }
 
 // syncPeers reconciles the node's peers with the plane: new members are

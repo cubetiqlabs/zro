@@ -95,6 +95,14 @@ node:
   tags:
     - "tag:web"
     - "env:prod"
+  ssh: # built-in SSH server, reachable only on the mesh (zro ssh user@host)
+    enabled: false
+    port: 22 # on the overlay address; use e.g. 2222 if the host's sshd holds 22
+    allow: # which peers may log in as which local users; root only when listed
+      - from: "tag:admin" # "*", a tag, a node hostname or an overlay IP
+        users: ["ubuntu"]
+    idle_timeout: 30m
+    max_sessions: 10
   # Cloudflared-style exposed local services (IPless ingress)
   tunnels:
     - name: "internal-api"

@@ -75,6 +75,8 @@ func (d *Daemon) enroll(ctx context.Context, endpoints []string, probes []core.L
 			Probes:       protoProbes,
 			AllowedPorts: d.allowedPorts,
 			DefaultDeny:  &d.defaultDeny,
+			SshKey:       d.sshPublicKey(),
+			SshPort:      int32(d.sshPort()),
 		})
 		if err != nil {
 			wrapped := fmt.Errorf("gRPC enrollment failed: %w", err)
@@ -114,14 +116,7 @@ func (d *Daemon) enroll(ctx context.Context, endpoints []string, probes []core.L
 			enrollResp.SecondaryPoP = &sec
 		}
 		for _, p := range gResp.Peers {
-			enrollResp.Peers = append(enrollResp.Peers, core.Node{
-				Hostname:    p.Hostname,
-				PublicKey:   p.PublicKey,
-				OverlayIPv4: p.OverlayIpv4,
-				OverlayIPv6: p.OverlayIpv6,
-				Endpoints:   core.StringList(p.Endpoints),
-				Tags:        core.StringList(p.Tags),
-			})
+			enrollResp.Peers = append(enrollResp.Peers, nodeFromProto(p))
 		}
 		return enrollResp, nil
 	}
@@ -136,6 +131,8 @@ func (d *Daemon) enroll(ctx context.Context, endpoints []string, probes []core.L
 		AllowedPorts: core.StringList(d.allowedPorts),
 		DefaultDeny:  &d.defaultDeny,
 		Probes:       probes,
+		SSHKey:       d.sshPublicKey(),
+		SSHPort:      d.sshPort(),
 	}
 	bodyBytes, err := json.Marshal(enrollReq)
 	if err != nil {

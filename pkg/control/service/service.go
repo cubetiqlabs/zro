@@ -71,7 +71,9 @@ type EnrollRequest struct {
 	Endpoints    core.StringList      `json:"endpoints"` // STUN reflexive endpoints
 	AllowedPorts core.StringList      `json:"allowed_ports,omitempty"`
 	DefaultDeny  *bool                `json:"default_deny,omitempty"`
-	Probes       []core.LatencySample `json:"probes,omitempty"` // pre-enrollment RTT telemetry
+	Probes       []core.LatencySample `json:"probes,omitempty"`   // pre-enrollment RTT telemetry
+	SSHKey       string               `json:"ssh_key,omitempty"`  // authorized_keys format
+	SSHPort      int                  `json:"ssh_port,omitempty"` // 0 = no SSH server
 
 	// CurrentToken is the bearer token the caller already holds for this key, if
 	// any. Re-enrolling a key that is already a member requires it: public keys
@@ -241,6 +243,7 @@ func (s *Service) admit(ctx context.Context, network *core.Network, grant *enrol
 			n.ExpiresAt = &exp
 		}
 		n.Endpoints = req.Endpoints
+		n.SSHKey, n.SSHPort = req.SSHKey, req.SSHPort
 		n.AllowedPorts = req.AllowedPorts
 		n.DefaultDeny = defaultDeny
 		n.IsActive = true

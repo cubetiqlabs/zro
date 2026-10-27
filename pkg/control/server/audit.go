@@ -183,3 +183,26 @@ func (s *Server) handleApproveNode(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, node)
 }
+
+// handleNodeAudit records an event a node reports about itself, such as an
+// SSH login. Only ssh.* actions are accepted, so a node cannot write entries
+// that look like operator changes.
+func (s *Server) handleNodeAudit(w http.ResponseWriter, r *http.Request) {
+	node := NodeFromContext(r.Context())
+	var req struct{ Action, Target, Detail string }
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		apiError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if !strings.HasPrefix(req.Action, "ssh.") || len(req.Action) > 64 || len(req.Target) > 255 || len(req.Detail) > 1024 {
+		apiError(w, "action must be ssh.* and fields must be short", http.StatusBadRequest)
+		return
+	}
+	network, err := s.db.Networks.GetByID(r.Context(), node.NetworkID)
+	if err != nil || network == nil {
+		apiError(w, "network not found", http.StatusNotFound)
+		return
+	}
+	s.auditNetwork(r, network, req.Action, req.Target, req.Detail)
+	w.WriteHeader(http.StatusCreated)
+}

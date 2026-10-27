@@ -83,6 +83,7 @@ func init() {
 	rootCmd.AddCommand(newACLCmd())
 	rootCmd.AddCommand(newNodesCmd())
 	rootCmd.AddCommand(newAuditCmd())
+	rootCmd.AddCommand(newSSHCmd())
 }
 
 func main() {
@@ -249,7 +250,7 @@ func newEdgeCmd() *cobra.Command {
 func newNodeCmd() *cobra.Command {
 	var planeFlag, tokenFlag, hostnameFlag string
 	var netstack bool
-	var allowFlag []string
+	var allowFlag, sshUsers []string
 
 	cmd := &cobra.Command{
 		Use:     "node",
@@ -273,6 +274,10 @@ func newNodeCmd() *cobra.Command {
 				cfg.Node.InterfaceMode = "netstack"
 			}
 			cfg.Node.Allow = append(cfg.Node.Allow, allowFlag...)
+			if len(sshUsers) > 0 {
+				cfg.Node.SSH.Enabled = true
+				cfg.Node.SSH.Allow = append(cfg.Node.SSH.Allow, config.SSHGrant{From: "*", Users: sshUsers})
+			}
 			if cfg.Node.Hostname == "" {
 				cfg.Node.Hostname, _ = os.Hostname()
 			}
@@ -285,6 +290,7 @@ func newNodeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&hostnameFlag, "hostname", "", "Node name (default: this machine's hostname)")
 	cmd.Flags().BoolVar(&netstack, "netstack", false, "Run unprivileged: no TUN device or root needed")
 	cmd.Flags().StringSliceVar(&allowFlag, "allow", nil, "Services or ports peers may reach, e.g. ssh,5432/tcp (ping is on by default)")
+	cmd.Flags().StringSliceVar(&sshUsers, "ssh-user", nil, "Turn on the built-in SSH server and let peers the network policy allows log in as these local users")
 	return cmd
 }
 

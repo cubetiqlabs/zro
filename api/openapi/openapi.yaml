@@ -752,6 +752,27 @@ paths:
       security: [{NodeToken: []}]
       responses:
         "204": {description: Removed.}
+  /api/v1/node/audit:
+    post:
+      tags: [Node API]
+      operationId: reportNodeAudit
+      summary: Report an SSH event for the audit log
+      description: Nodes report logins to their built-in SSH server. Only `ssh.*` actions are accepted.
+      security: [{NodeToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: {type: string, pattern: "^ssh\\.", maxLength: 64, example: ssh.login}
+                target: {type: string, maxLength: 255, description: The local user., example: ubuntu}
+                detail: {type: string, maxLength: 1024, example: "from web-1 (100.64.0.2)"}
+      responses:
+        "201": {description: Recorded.}
+        "400": {$ref: "#/components/responses/BadRequest"}
   /api/v1/tunnels:
     get:
       tags: [Node API]
@@ -1097,6 +1118,8 @@ components:
         disabled: {type: boolean, description: Switched off by the network owner; cannot authenticate.}
         tags_managed: {type: boolean, description: The plane set the tags; a re-join keeps them.}
         expires_at: {type: string, format: date-time, description: When the node must re-join. Absent means never.}
+        ssh_key: {type: string, description: "The node's SSH public key (authorized_keys format): host key of its SSH server and its identity as a client."}
+        ssh_port: {type: integer, description: Port of the node's built-in SSH server on the mesh; absent when SSH is off.}
         last_seen_at: {type: string, format: date-time}
         created_at: {type: string, format: date-time}
     AuditEvent:

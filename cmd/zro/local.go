@@ -1,10 +1,8 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,36 +10,13 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/cubetiqlabs/zro/pkg/config"
 	"github.com/cubetiqlabs/zro/pkg/node"
 	"github.com/spf13/cobra"
 )
 
 // localCall talks to the running node through its admin socket.
 func localCall(method, path string, out any) error {
-	cfg, err := config.Load(cfgFile)
-	if err != nil {
-		return err
-	}
-	sock := node.AdminSocket(cfg.Node.StateDir)
-	c := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
-		}},
-	}
-	req, _ := http.NewRequest(method, "http://zro"+path, nil)
-	resp, err := c.Do(req)
-	if err != nil {
-		return fmt.Errorf("no running node at %s (is `zro join` running, as this user?): %w", sock, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		var e struct{ Error string }
-		_ = json.NewDecoder(resp.Body).Decode(&e)
-		return fmt.Errorf("%s", e.Error)
-	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return localCallBody(method, path, nil, out)
 }
 
 func ago(t time.Time) string {

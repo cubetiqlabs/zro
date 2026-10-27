@@ -41,7 +41,7 @@ sleep 5
 for n in n1 n2; do
   TOK=$(docker exec smoke-plane zro token --network-id "$NETID" --secret $SEC --hostname $n | tail -1)
   docker run -d --name smoke-$n --network $NET --cap-add NET_ADMIN --device /dev/net/tun -e ZRO_NODE_ENABLE_P2P="$P2P" \
-    "$IMG" join --plane http://smoke-plane:8443 --token "$TOK" --hostname $n >/dev/null
+    "$IMG" join --plane http://smoke-plane:8443 --token "$TOK" --hostname $n $([ $n = n2 ] && echo --ssh-user root) >/dev/null
 done
 sleep 10
 
@@ -95,6 +95,19 @@ if [ "$P2P" = true ]; then
   ping_ok smoke-n1 "$N2" "after the direct path died"
   ping_ok smoke-n2 "$N1" "after the direct path died"
 fi
+# Built-in SSH: n2 opted in for root; the host key comes from the plane.
+[ "$(docker exec smoke-n1 zro ssh root@n2 -- hostname)" = "$(docker exec smoke-n2 hostname)" ] || { echo "FAIL zro ssh command"; exit 1; }
+ok "zro ssh root@n2 -- hostname"
+rc=0; docker exec smoke-n1 zro ssh root@n2 -- 'exit 7' || rc=$?
+[ $rc -eq 7 ] || { echo "FAIL zro ssh exit status ($rc)"; exit 1; }
+ok "zro ssh passes the exit status"
+docker exec -t smoke-n1 zro ssh -t root@n2 -- tty | grep -q /dev/pts/ || { echo "FAIL zro ssh pty"; exit 1; }
+ok "zro ssh -t gets a terminal"
+if docker exec smoke-n1 zro ssh nobody@n2 -- true 2>/dev/null; then echo "FAIL ssh as an ungranted user"; exit 1; fi
+ok "ungranted user refused"
+if docker exec smoke-n2 zro ssh root@n1 -- true 2>/dev/null; then echo "FAIL ssh to a node with SSH off"; exit 1; fi
+ok "node without SSH refused"
+
 # Lifecycle: a disabled node drops out of the mesh and comes back when enabled.
 zro_plane() { docker exec -e ZRO_PLANE=http://127.0.0.1:8443 -e ZRO_API_KEY="$KEY" -e ZRO_NETWORK="$NETID" smoke-plane zro "$@"; }
 zro_plane nodes list

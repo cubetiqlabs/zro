@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -12,6 +13,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/cubetiqlabs/zro/pkg/core"
 )
 
 // AdminSocket is the node's local control socket inside its state directory.
@@ -85,10 +88,89 @@ func (d *Daemon) serveAdmin(ctx context.Context) {
 	mux.HandleFunc("POST /policy/deny", func(w http.ResponseWriter, r *http.Request) {
 		d.adminPolicyChange(w, d.DenyService(r.URL.Query().Get("service")))
 	})
+	mux.HandleFunc("GET /ssh/peer", func(w http.ResponseWriter, r *http.Request) {
+		p, ok := d.peerByName(r.URL.Query().Get("host"))
+		if !ok {
+			writeAdminJSON(w, http.StatusNotFound, map[string]string{"error": "unknown peer: give a peer hostname or overlay IP"})
+			return
+		}
+		writeAdminJSON(w, http.StatusOK, SSHPeer{Hostname: p.Hostname, IP: p.OverlayIPv4, Port: p.SSHPort, HostKey: p.SSHKey, User: d.sshPublicKey()})
+	})
+	mux.HandleFunc("POST /ssh/sign", func(w http.ResponseWriter, r *http.Request) {
+		data, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+		if err != nil {
+			writeAdminJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		sig, err := d.SignSSH(data)
+		if err != nil {
+			writeAdminJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeAdminJSON(w, http.StatusOK, sig)
+	})
+	mux.HandleFunc("POST /dial", d.adminDial)
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { <-ctx.Done(); _ = srv.Close() }()
 	_ = srv.Serve(ln)
 	_ = os.Remove(path)
+}
+
+// SSHPeer is what `zro ssh` needs to reach a peer's SSH server.
+type SSHPeer struct {
+	Hostname string `json:"hostname"`
+	IP       string `json:"ip"`
+	Port     int    `json:"port"`     // 0: the peer has SSH off
+	HostKey  string `json:"host_key"` // pinned: no trust on first use
+	User     string `json:"user_key"` // this node's key, which the client signs with
+}
+
+func (d *Daemon) peerByName(name string) (core.Node, bool) {
+	if p, ok := d.peerByIP(name); ok {
+		return p, true
+	}
+	d.peersMu.RLock()
+	defer d.peersMu.RUnlock()
+	for _, p := range d.peers {
+		if p.Hostname == name {
+			return p, true
+		}
+	}
+	return core.Node{}, false
+}
+
+// adminDial opens a TCP connection to a peer's overlay address and hands the
+// socket over to it, so local clients reach the mesh in netstack mode too.
+// Only peers' overlay addresses can be dialed.
+func (d *Daemon) adminDial(w http.ResponseWriter, r *http.Request) {
+	ap, err := netip.ParseAddrPort(r.URL.Query().Get("addr"))
+	if err != nil {
+		writeAdminJSON(w, http.StatusBadRequest, map[string]string{"error": "addr must be ip:port"})
+		return
+	}
+	if _, ok := d.peerByIP(ap.Addr().String()); !ok {
+		writeAdminJSON(w, http.StatusForbidden, map[string]string{"error": "not a peer's overlay address"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	upstream, err := d.DialMesh(ctx, "tcp", ap.String())
+	if err != nil {
+		writeAdminJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	defer upstream.Close()
+	c, buf, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Time{})
+	_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(upstream, buf); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(c, upstream); done <- struct{}{} }()
+	<-done
 }
 
 func (d *Daemon) adminPolicyChange(w http.ResponseWriter, err error) {
