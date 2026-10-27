@@ -246,7 +246,12 @@ func NodeFromContext(ctx context.Context) *core.Node {
 }
 
 func withTenant(ctx context.Context, tenant *core.Tenant) context.Context {
-	ctx = controlauth.WithSubject(ctx, &controlauth.Subject{Kind: controlauth.KindTenant, Tenant: tenant})
+	return withTenantKey(ctx, tenant, core.ScopeAdmin, "")
+}
+
+// withTenantKey binds a tenant principal acting with a key's scope.
+func withTenantKey(ctx context.Context, tenant *core.Tenant, scope, keyName string) context.Context {
+	ctx = controlauth.WithSubject(ctx, &controlauth.Subject{Kind: controlauth.KindTenant, Tenant: tenant, Scope: scope, KeyName: keyName})
 	return context.WithValue(ctx, tenantContextKey, tenant)
 }
 
@@ -303,12 +308,16 @@ func (s *Server) tenantAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		apiKey := controlauth.TenantKey(r)
 		if apiKey != "" {
-			tenant, err := s.db.Tenants.GetByAPIKey(r.Context(), apiKey)
-			if err != nil || tenant == nil || !tenant.IsActive {
-				apiError(w, "unauthorized: invalid or inactive API key", http.StatusUnauthorized)
+			tenant, scope, keyName, ok := s.tenantByKey(r.Context(), apiKey)
+			if !ok {
+				apiError(w, "unauthorized: invalid, expired or inactive API key", http.StatusUnauthorized)
 				return
 			}
-			next(w, r.WithContext(withTenant(r.Context(), tenant)))
+			if need := methodScope(r); !core.ScopeAllows(scope, need) {
+				apiError(w, "forbidden: this API key has "+scope+" scope; this needs "+need, http.StatusForbidden)
+				return
+			}
+			next(w, r.WithContext(withTenantKey(r.Context(), tenant, scope, keyName)))
 			return
 		}
 
@@ -381,9 +390,8 @@ func (s *Server) authenticateStream(r *http.Request) (context.Context, string) {
 
 	tenantKey := controlauth.TenantKey(r)
 	if tenantKey != "" {
-		tenant, err := s.db.Tenants.GetByAPIKey(ctx, tenantKey)
-		if err == nil && tenant != nil && tenant.IsActive {
-			return withTenant(ctx, tenant), ""
+		if tenant, scope, keyName, ok := s.tenantByKey(ctx, tenantKey); ok {
+			return withTenantKey(ctx, tenant, scope, keyName), "" // streams only read
 		}
 		// The same header may carry an edge key; fall through to edge
 		// authentication before rejecting it.
@@ -586,7 +594,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/nodes", s.tenantAuthMiddleware(s.handleListNodes))
 	s.mux.HandleFunc("DELETE /api/v1/nodes/{id}", s.tenantAuthMiddleware(s.handleDeleteNode))
 	s.mux.HandleFunc("PATCH /api/v1/nodes/{id}", s.tenantAuthMiddleware(s.handleUpdateNode))
-	s.mux.HandleFunc("POST /api/v1/nodes/{id}/approve", s.tenantAuthMiddleware(s.handleApproveNode))
+	s.mux.HandleFunc("POST /api/v1/nodes/{id}/approve", s.tenantAuthMiddleware(requireAdminScope(s.handleApproveNode)))
+	s.mux.HandleFunc("POST /api/v1/keys", s.tenantAuthMiddleware(requireAdminScope(s.handleCreateAPIKey)))
+	s.mux.HandleFunc("GET /api/v1/keys", s.tenantAuthMiddleware(requireAdminScope(s.handleListAPIKeys)))
+	s.mux.HandleFunc("DELETE /api/v1/keys/{id}", s.tenantAuthMiddleware(requireAdminScope(s.handleDeleteAPIKey)))
 	s.mux.HandleFunc("GET /api/v1/audit", s.tenantAuthMiddleware(s.handleListAudit))
 	s.mux.HandleFunc("DELETE /api/v1/pops/{code}", s.adminAuthMiddleware(s.handleDeletePoP))
 	s.mux.HandleFunc("POST /api/v1/networks", s.tenantAuthMiddleware(s.handleCreateNetwork))

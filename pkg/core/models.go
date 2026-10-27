@@ -176,6 +176,32 @@ func (n *Node) Admitted(now time.Time) bool {
 	return n.IsActive && !n.Pending && !n.Disabled && !n.Expired(now)
 }
 
+// API key scopes, each including the ones before it.
+const (
+	ScopeRead  = "read"  // GET only
+	ScopeWrite = "write" // change networks, rules, tokens, nodes
+	ScopeAdmin = "admin" // also manage API keys and approve nodes
+)
+
+// ScopeAllows reports whether a key with scope have may act with need.
+func ScopeAllows(have, need string) bool {
+	rank := map[string]int{ScopeRead: 1, ScopeWrite: 2, ScopeAdmin: 3}
+	return rank[have] >= rank[need] && rank[need] > 0
+}
+
+// APIKey is an extra tenant key with a scope and an optional expiry. The
+// tenant's own key (Tenant.APIKey) acts with admin scope.
+type APIKey struct {
+	ID         uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
+	TenantID   uuid.UUID  `gorm:"type:uuid;not null;index" json:"tenant_id"`
+	Name       string     `gorm:"size:100;not null" json:"name"`
+	KeyHash    string     `gorm:"size:64;uniqueIndex;not null" json:"-"`
+	Scope      string     `gorm:"size:10;not null" json:"scope"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+}
+
 // AuditEvent records one change made through the API.
 type AuditEvent struct {
 	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`

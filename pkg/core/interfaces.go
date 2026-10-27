@@ -92,6 +92,15 @@ var ErrDuplicate = errors.New("duplicate record")
 
 var ErrTokenReused = errors.New("enrollment token already used")
 
+// APIKeyRepository stores scoped tenant keys (hashed).
+type APIKeyRepository interface {
+	Create(ctx context.Context, key *APIKey) error
+	GetByHash(ctx context.Context, hash string) (*APIKey, error)
+	ListByTenant(ctx context.Context, tenantID uuid.UUID) ([]APIKey, error)
+	Delete(ctx context.Context, tenantID, id uuid.UUID) error
+	Touch(ctx context.Context, id uuid.UUID, at time.Time) error
+}
+
 // AuditRepository stores the audit trail.
 type AuditRepository interface {
 	Create(ctx context.Context, ev *AuditEvent) error

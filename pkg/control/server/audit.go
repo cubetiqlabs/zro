@@ -41,6 +41,8 @@ func actorOf(r *http.Request) string {
 		return "cluster-secret" // only reached once the secret was verified
 	case sub == nil:
 		return "admin" // admin routes authenticate without a subject
+	case sub.Tenant != nil && sub.KeyName != "":
+		return "tenant:" + sub.Tenant.Slug + "/key:" + sub.KeyName
 	case sub.Tenant != nil:
 		return "tenant:" + sub.Tenant.Slug
 	case sub.Node != nil:

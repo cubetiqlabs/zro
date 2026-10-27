@@ -35,6 +35,7 @@ tags:
   - {name: PoPs, description: "Edge points of presence."}
   - {name: Topology, description: "Live mesh graph."}
   - {name: Audit, description: "Who changed what, kept 90 days."}
+  - {name: API keys, description: "Extra tenant keys with a scope (read, write, admin) and an optional expiry."}
   - {name: Events, description: "Real-time change feed (SSE and WebSocket)."}
   - {name: Enrollment, description: "Joining a network. Used by `zro node`."}
   - {name: Node API, description: "Calls a node makes with its node token."}
@@ -385,6 +386,57 @@ paths:
         "200":
           description: The node.
           content: {application/json: {schema: {$ref: "#/components/schemas/Node"}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /api/v1/keys:
+    get:
+      tags: [API keys]
+      operationId: listAPIKeys
+      summary: List the tenant's scoped keys
+      description: Needs an admin-scoped key or the tenant key. Key material is never returned.
+      responses:
+        "200":
+          description: Keys.
+          content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/APIKey"}}}}
+        "403": {$ref: "#/components/responses/Forbidden"}
+    post:
+      tags: [API keys]
+      operationId: createAPIKey
+      summary: Create a scoped key
+      description: |
+        `read` keys may only GET; `write` keys may also change networks, rules, tokens and nodes; `admin` keys may
+        also manage keys and approve nodes. The tenant's own key acts as `admin`. The key is shown once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, scope]
+              properties:
+                name: {type: string, maxLength: 100, example: ci-deploy}
+                scope: {type: string, enum: [read, write, admin]}
+                expires_in_hours: {type: integer, minimum: 0, maximum: 8784, default: 0, description: 0 = never.}
+      responses:
+        "201":
+          description: The key, with its plaintext `key` this once.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/APIKey"
+                  - {type: object, properties: {key: {type: string, example: zro_key_3f9c…}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /api/v1/keys/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    delete:
+      tags: [API keys]
+      operationId: deleteAPIKey
+      summary: Revoke a scoped key
+      responses:
+        "204": {description: Revoked; the key stops working at once.}
+        "403": {$ref: "#/components/responses/Forbidden"}
         "404": {$ref: "#/components/responses/NotFound"}
 
   /api/v1/audit:
@@ -912,7 +964,10 @@ components:
     TenantKey:
       type: http
       scheme: bearer
-      description: Tenant API key (`zro_key_…`). Also accepted as `X-API-Key`. With `require_auth=false`, requests without a key act as a built-in dev tenant until a real tenant exists.
+      description: |
+        Tenant API key (`zro_key_…`): the tenant's own key, or a scoped key from `POST /api/v1/keys`. Also accepted as `X-API-Key`.
+        A `read` key may only GET; `write` may change networks, rules, tokens and nodes; `admin` (and the tenant key) may also manage keys and approve nodes.
+        With `require_auth=false`, requests without a key act as a built-in dev tenant until a real tenant exists.
     AdminKey:
       type: apiKey
       in: header
@@ -1121,6 +1176,16 @@ components:
         ssh_key: {type: string, description: "The node's SSH public key (authorized_keys format): host key of its SSH server and its identity as a client."}
         ssh_port: {type: integer, description: Port of the node's built-in SSH server on the mesh; absent when SSH is off.}
         last_seen_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+    APIKey:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        name: {type: string}
+        scope: {type: string, enum: [read, write, admin]}
+        expires_at: {type: string, format: date-time}
+        last_used_at: {type: string, format: date-time}
         created_at: {type: string, format: date-time}
     AuditEvent:
       type: object

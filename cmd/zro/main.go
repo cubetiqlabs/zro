@@ -84,6 +84,7 @@ func init() {
 	rootCmd.AddCommand(newNodesCmd())
 	rootCmd.AddCommand(newAuditCmd())
 	rootCmd.AddCommand(newSSHCmd())
+	rootCmd.AddCommand(newKeyCmd())
 }
 
 func main() {

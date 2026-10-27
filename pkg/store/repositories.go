@@ -444,3 +444,36 @@ func (r auditRepo) List(ctx context.Context, tenantID uuid.UUID, networkID strin
 func (r auditRepo) Purge(ctx context.Context, cutoff time.Time) error {
 	return r.db.WithContext(ctx).Where("created_at < ?", cutoff).Delete(&core.AuditEvent{}).Error
 }
+
+// --- API Key Repository ---
+
+type apiKeyRepo struct{ db *gorm.DB }
+
+func (r apiKeyRepo) Create(ctx context.Context, key *core.APIKey) error {
+	return r.db.WithContext(ctx).Create(key).Error
+}
+
+func (r apiKeyRepo) GetByHash(ctx context.Context, hash string) (*core.APIKey, error) {
+	var k core.APIKey
+	if err := r.db.WithContext(ctx).First(&k, "key_hash = ?", hash).Error; err != nil {
+		return nil, err
+	}
+	return &k, nil
+}
+
+func (r apiKeyRepo) ListByTenant(ctx context.Context, tenantID uuid.UUID) ([]core.APIKey, error) {
+	var keys []core.APIKey
+	return keys, r.db.WithContext(ctx).Where("tenant_id = ?", tenantID).Order("created_at").Find(&keys).Error
+}
+
+func (r apiKeyRepo) Delete(ctx context.Context, tenantID, id uuid.UUID) error {
+	res := r.db.WithContext(ctx).Where("tenant_id = ? AND id = ?", tenantID, id).Delete(&core.APIKey{})
+	if res.Error == nil && res.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return res.Error
+}
+
+func (r apiKeyRepo) Touch(ctx context.Context, id uuid.UUID, at time.Time) error {
+	return r.db.WithContext(ctx).Model(&core.APIKey{}).Where("id = ?", id).Update("last_used_at", at).Error
+}
