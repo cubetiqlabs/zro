@@ -95,6 +95,13 @@ if [ "$P2P" = true ]; then
   ping_ok smoke-n1 "$N2" "after the direct path died"
   ping_ok smoke-n2 "$N1" "after the direct path died"
 fi
+# MagicDNS: each node answers <peer>.<dns_domain> on its own mesh address.
+DOMAIN=$(curl -fsS "http://127.0.0.1:18443/api/v1/networks/$NETID" -H "Authorization: Bearer $KEY" | jq -r .dns_domain)
+docker exec smoke-n1 nslookup "n2.$DOMAIN" "$N1" 2>/dev/null | grep -q "$N2" || { echo "FAIL MagicDNS n2.$DOMAIN"; docker exec smoke-n1 nslookup "n2.$DOMAIN" "$N1"; exit 1; }
+ok "MagicDNS resolves n2.$DOMAIN"
+docker exec smoke-n1 zro ping -n 1 "n2.$DOMAIN" >/dev/null || { echo "FAIL zro ping by FQDN"; exit 1; }
+ok "zro ping n2.$DOMAIN"
+
 # Built-in SSH: n2 opted in for root; the host key comes from the plane.
 [ "$(docker exec smoke-n1 zro ssh root@n2 -- hostname)" = "$(docker exec smoke-n2 hostname)" ] || { echo "FAIL zro ssh command"; exit 1; }
 ok "zro ssh root@n2 -- hostname"

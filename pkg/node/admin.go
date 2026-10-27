@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cubetiqlabs/zro/pkg/core"
@@ -126,6 +127,9 @@ type SSHPeer struct {
 }
 
 func (d *Daemon) peerByName(name string) (core.Node, bool) {
+	if d.dnsDomain != "" {
+		name = strings.TrimSuffix(strings.TrimSuffix(strings.ToLower(name), "."), "."+d.dnsDomain)
+	}
 	if p, ok := d.peerByIP(name); ok {
 		return p, true
 	}
@@ -219,17 +223,12 @@ func (d *Daemon) status() Status {
 func (d *Daemon) ping(ctx context.Context, target string) (PingResult, error) {
 	res := PingResult{Target: target, Path: "relay"}
 	ip, err := netip.ParseAddr(target)
-	d.peersMu.RLock()
-	for key, p := range d.peers {
-		if p.Hostname == target || p.OverlayIPv4 == target {
-			ip, err = netip.ParseAddr(p.OverlayIPv4)
-			if d.direct.isDirect(key) {
-				res.Path = "direct"
-			}
-			break
+	if p, ok := d.peerByName(target); ok {
+		ip, err = netip.ParseAddr(p.OverlayIPv4)
+		if d.direct.isDirect(p.PublicKey) {
+			res.Path = "direct"
 		}
 	}
-	d.peersMu.RUnlock()
 	if err != nil {
 		return res, errors.New("unknown peer: give a peer hostname or overlay IP")
 	}

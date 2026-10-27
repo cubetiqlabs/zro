@@ -97,6 +97,7 @@ func (d *Daemon) enroll(ctx context.Context, endpoints []string, probes []core.L
 			IPv6CIDR:    gResp.Ipv6Cidr,
 			OverlayIPv4: gResp.OverlayIpv4,
 			OverlayIPv6: gResp.OverlayIpv6,
+			DNSDomain:   gResp.DnsDomain,
 		}
 		if gResp.PrimaryPop != nil {
 			enrollResp.PrimaryPoP = core.EdgePoP{

@@ -95,6 +95,7 @@ node:
   tags:
     - "tag:web"
     - "env:prod"
+  magic_dns: true # resolve <peer>.<network dns_domain> (e.g. web-1.zro.internal); uses systemd-resolved when present
   ssh: # built-in SSH server, reachable only on the mesh (zro ssh user@host)
     enabled: false
     port: 22 # on the overlay address; use e.g. 2222 if the host's sshd holds 22

@@ -110,6 +110,7 @@ type NodeConfig struct {
 	AllowPing           bool                `mapstructure:"allow_ping"`            // answer ICMP echo unless a network rule denies it
 	Tunnels             []LocalTunnelConfig `mapstructure:"tunnels"`
 	SSH                 SSHConfig           `mapstructure:"ssh"`
+	MagicDNS            bool                `mapstructure:"magic_dns"` // resolve <peer>.<network dns_domain> on this machine
 }
 
 // SSHConfig runs the node's built-in SSH server, reachable only on the mesh.
@@ -208,6 +209,7 @@ func Load(cfgFile string) (*AppConfig, error) {
 	v.SetDefault("node.enable_p2p", true)
 	v.SetDefault("node.default_deny", true)
 	v.SetDefault("node.allow_ping", true)
+	v.SetDefault("node.magic_dns", true)
 	v.SetDefault("node.ssh.port", 22)
 	v.SetDefault("node.ssh.idle_timeout", "30m")
 	v.SetDefault("node.ssh.max_sessions", 10)

@@ -179,3 +179,25 @@ func enableForwarding(paths []string) error {
 	}
 	return nil
 }
+
+// ConfigureDNS sends lookups for domain (and only that domain) to nameserver
+// through the interface, using systemd-resolved. Other systems return an
+// error so the caller can tell the operator what to set.
+func ConfigureDNS(name, nameserver, domain string) error {
+	if err := ValidateInterfaceName(name); err != nil {
+		return err
+	}
+	if _, err := validateIP(nameserver); err != nil {
+		return err
+	}
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("split DNS is only configured automatically with systemd-resolved")
+	}
+	if _, err := exec.LookPath("resolvectl"); err != nil {
+		return fmt.Errorf("resolvectl not found (systemd-resolved)")
+	}
+	if err := run("resolvectl", "dns", name, nameserver); err != nil {
+		return err
+	}
+	return run("resolvectl", "domain", name, "~"+strings.TrimPrefix(domain, "~"))
+}

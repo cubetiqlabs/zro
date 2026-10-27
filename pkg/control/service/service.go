@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"regexp"
@@ -231,9 +232,10 @@ func (s *Service) admit(ctx context.Context, network *core.Network, grant *enrol
 	if req.DefaultDeny != nil {
 		defaultDeny = *req.DefaultDeny
 	}
+	hostname := grant.Hostname // made unique once below, not on every allocation attempt
 	apply := func(n *core.Node) {
 		now := time.Now()
-		n.Hostname = grant.Hostname
+		n.Hostname = hostname
 		n.TokenHash = tokenHash
 		if !n.TagsManaged {
 			n.Tags = req.Tags
@@ -266,6 +268,7 @@ func (s *Service) admit(ctx context.Context, network *core.Network, grant *enrol
 		if req.CurrentToken == "" || subtle.ConstantTimeCompare([]byte(presented), []byte(existing.TokenHash)) != 1 {
 			return nil, newErr(KindConflict, "this key is already enrolled; present its current node token, or have the network owner remove the node first")
 		}
+		hostname = s.uniqueHostname(ctx, network.ID, grant.Hostname, existing.ID)
 		apply(existing)
 		if err := s.db.Nodes.Update(ctx, existing); err != nil {
 			return nil, internal("failed to refresh node", err)
@@ -277,6 +280,7 @@ func (s *Service) admit(ctx context.Context, network *core.Network, grant *enrol
 		return n, err
 	}
 
+	hostname = s.uniqueHostname(ctx, network.ID, grant.Hostname, uuid.Nil)
 	for attempt := 0; attempt < maxAllocAttempts; attempt++ {
 		allocator, err := s.allocator(ctx, network)
 		if err != nil {
@@ -849,6 +853,28 @@ func (s *Service) maintainOnce(ctx context.Context, nodeTTL time.Duration) int {
 	_ = s.db.Audit.Purge(ctx, time.Now().Add(-auditRetention))
 	s.delegator.Prune(10 * time.Minute)
 	return reaped
+}
+
+// uniqueHostname returns want, or want-2, want-3… when another node of the
+// network already has that name, so MagicDNS names stay unambiguous.
+// ponytail: two nodes enrolling the same name at the same instant on two
+// replicas can still tie; a unique index on (network, lower(hostname)) would close it.
+func (s *Service) uniqueHostname(ctx context.Context, networkID, want string, self uuid.UUID) string {
+	nodes, err := s.db.Nodes.ListByNetworkID(ctx, networkID)
+	if err != nil {
+		return want
+	}
+	taken := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		if n.ID != self {
+			taken[strings.ToLower(n.Hostname)] = true
+		}
+	}
+	name := want
+	for i := 2; taken[strings.ToLower(name)]; i++ {
+		name = fmt.Sprintf("%s-%d", want, i)
+	}
+	return name
 }
 
 // auditRetention is how long audit events are kept.

@@ -45,6 +45,7 @@ type Daemon struct {
 	networkID    string // ZeroTier-style 16-hex network ID
 	overlayIPv4  string
 	overlayIPv6  string
+	dnsDomain    string // MagicDNS domain of the network
 	primaryPoP   core.EdgePoP
 	secondaryPoP *core.EdgePoP
 	popMu        sync.RWMutex
@@ -226,6 +227,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.networkID = enrollResp.NetworkID
 	d.overlayIPv4 = enrollResp.OverlayIPv4
 	d.overlayIPv6 = enrollResp.OverlayIPv6
+	d.dnsDomain = strings.ToLower(strings.TrimSuffix(enrollResp.DNSDomain, "."))
 
 	// Give the overlay interface its addresses: the kernel TUN gets OS addresses,
 	// netstack mode adds them to the userspace stack.
@@ -264,6 +266,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}
 
 	d.startSSH(ctx)
+	d.startDNS(ctx)
 	d.wg.Add(6)
 	go d.serveAdmin(ctx)
 	go d.directWorker(ctx)

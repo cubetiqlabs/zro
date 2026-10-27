@@ -135,6 +135,12 @@ func TestNodeLifecycleAndAudit(t *testing.T) {
 		t.Fatalf("expired node: %d %s", code, body)
 	}
 
+	// A second "a" gets a distinct name, so MagicDNS stays unambiguous.
+	a2 := enroll("a")
+	if n, _ := db.Nodes.GetByID(t.Context(), a2.NodeID); n.Hostname != "a-2" {
+		t.Fatalf("duplicate hostname kept: %q", n.Hostname)
+	}
+
 	// The audit trail has every change, scoped to the tenant.
 	_, body = do("GET", "/api/v1/audit?network_id="+nw.ID, key, nil)
 	var events []core.AuditEvent
