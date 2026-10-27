@@ -152,6 +152,8 @@ func (e *PoPDaemon) fetchMesh(ctx context.Context) (*meshState, error) {
 
 // syncMeshTopology pulls the mesh and programs WireGuard peers and routes.
 func (e *PoPDaemon) syncMeshTopology(ctx context.Context) {
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
 	st, err := e.fetchMesh(ctx)
 	if err != nil {
 		if now := time.Now().UnixNano(); now-e.lastSyncWarn.Load() > int64(time.Minute) {

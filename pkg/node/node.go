@@ -48,6 +48,7 @@ type Daemon struct {
 	popKick      chan struct{}        // wakes popWorker for an immediate refresh
 	peers        map[string]core.Node // pubKey -> node
 	peersMu      sync.RWMutex
+	direct       directPaths // liveness of direct P2P paths
 
 	tunDev          tun.Device
 	dev             *agent.Device
@@ -243,7 +244,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}
 
-	d.wg.Add(4)
+	d.wg.Add(6)
+	go d.serveAdmin(ctx)
+	go d.directWorker(ctx)
 	go d.relayWorker(ctx)
 	go d.popWorker(ctx)
 	go d.tunnelWorker(ctx)
@@ -569,12 +572,15 @@ func (d *Daemon) DiscoverAndConnectPeer(ctx context.Context, targetOverlayIP str
 	var routeTarget router.RouteTarget
 	if directEndpoint != "" {
 		// Direct WireGuard P2P
-		_ = d.wgManager.ApplyPeer(wireguard.PeerConfig{
+		if err := d.wgManager.ApplyPeer(wireguard.PeerConfig{
 			PublicKey:           discResp.TargetPublicKey,
 			Endpoint:            directEndpoint,
 			AllowedIPs:          []string{discResp.TargetOverlayIPv4 + "/32"},
-			PersistentKeepalive: 20 * time.Second,
-		})
+			PersistentKeepalive: p2pKeepalive,
+		}); err != nil {
+			return nil, err
+		}
+		d.direct.up(discResp.TargetPublicKey, discResp.TargetOverlayIPv4, time.Now())
 		agent.NudgeUntilHandshake(d.wgManager, discResp.TargetPublicKey, func() bool { return true })
 
 		routeTarget = router.RouteTarget{
@@ -602,6 +608,9 @@ func (d *Daemon) DiscoverAndConnectPeer(ctx context.Context, targetOverlayIP str
 		// relays through it. A direct peer with the PoP as endpoint would only
 		// attempt a handshake the PoP cannot complete on the target's behalf.
 		_ = d.wgManager.RemovePeer(discResp.TargetPublicKey)
+		if d.cfg.EnableP2P {
+			d.direct.down(discResp.TargetPublicKey, discResp.TargetOverlayIPv4, time.Now())
+		}
 
 		routeTarget = router.RouteTarget{
 			PublicKey:   discResp.TargetPublicKey,
@@ -620,6 +629,11 @@ func (d *Daemon) connectPeer(ctx context.Context, peer core.Node) {
 	d.peers[peer.PublicKey] = peer
 	d.peersMu.Unlock()
 
+	// The PoP relays until a direct path exists. Only one side opens it; the
+	// other answers the punch request the plane forwards.
+	if !d.cfg.EnableP2P || !d.initiates(peer.PublicKey) {
+		return
+	}
 	_, _ = d.DiscoverAndConnectPeer(ctx, peer.OverlayIPv4)
 }
 

@@ -48,6 +48,7 @@ type PoPDaemon struct {
 	peerCount    int
 	knownKeys    atomic.Pointer[map[[32]byte]struct{}] // public keys allowed on the DERP relay
 	peersMu      sync.RWMutex
+	syncMu       sync.Mutex   // one mesh sync at a time: the worker and realtime events both trigger it
 	synced       bool         // first mesh sync done (guarded by peersMu)
 	lastSyncWarn atomic.Int64 // unix nanos of the last sync failure warning
 

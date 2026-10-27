@@ -55,3 +55,26 @@ ping_ok smoke-n1 "$N2" "node to node"
 ping_ok smoke-n2 "$N1" "node to node"
 ping_ok smoke-n1 "$EDGE" "node to edge"
 ping_ok smoke-n2 "$EDGE" "node to edge"
+
+# The local admin socket: status lists the peer, and zro ping reaches it.
+docker exec smoke-n1 zro status | grep -q "^n2 " || { echo "FAIL zro status does not list n2"; docker exec smoke-n1 zro status; exit 1; }
+ok "zro status lists peers"
+docker exec smoke-n1 zro ping -n 1 n2 || { echo "FAIL zro ping n2"; exit 1; }
+ok "zro ping n2"
+
+# A direct path that stops carrying traffic must fall back to the edge relay.
+if [ "$P2P" = true ]; then
+  N2_LAN=$(docker inspect smoke-n2 -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+  docker exec smoke-n1 zro status
+  docker exec smoke-n1 iptables -I INPUT -s "$N2_LAN" -p udp -j DROP
+  docker exec smoke-n1 iptables -I OUTPUT -d "$N2_LAN" -p udp -j DROP
+  echo "..   blocked direct UDP n1<->n2; waiting for the watchdog"
+  for _ in $(seq 1 45); do
+    docker exec smoke-n1 ping -c1 -W2 "$N2" >/dev/null 2>&1 && docker exec smoke-n2 ping -c1 -W2 "$N1" >/dev/null 2>&1 && break
+    sleep 2
+  done
+  docker exec smoke-n1 zro status
+  ping_ok smoke-n1 "$N2" "after the direct path died"
+  ping_ok smoke-n2 "$N1" "after the direct path died"
+fi
+echo "mesh smoke passed"

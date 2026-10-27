@@ -140,6 +140,7 @@ func (d *Daemon) dropPeer(p core.Node) {
 	d.peersMu.Lock()
 	delete(d.peers, p.PublicKey)
 	d.peersMu.Unlock()
+	d.direct.forget(p.PublicKey)
 	_ = d.wgManager.RemovePeer(p.PublicKey)
 	slog.Info("Peer left the mesh", "peer", p.Hostname, "overlay_ipv4", p.OverlayIPv4)
 }
@@ -173,6 +174,7 @@ func (d *Daemon) answerPunchRequest(ctx context.Context, data json.RawMessage) {
 			if err := d.wgManager.ApplyPeer(peer); err != nil {
 				return
 			}
+			d.direct.up(req.InitiatorPubKey, req.InitiatorOverlay, time.Now())
 			slog.Info("Direct P2P path opened at the request of a peer", "endpoint", ep, "rtt", rtt)
 			time.AfterFunc(responderKeepaliveDelay, func() {
 				peer.PersistentKeepalive = p2pKeepalive

@@ -73,6 +73,8 @@ func init() {
 	rootCmd.AddCommand(newNetworkCmd())
 	rootCmd.AddCommand(newP2PCmd())
 	rootCmd.AddCommand(newUpdateCmd())
+	rootCmd.AddCommand(newStatusCmd())
+	rootCmd.AddCommand(newPingCmd())
 }
 
 func main() {
