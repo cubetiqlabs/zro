@@ -298,6 +298,22 @@ func (r *aclRepo) ListByNetworkID(ctx context.Context, networkID string) ([]core
 	return rules, err
 }
 
+func (r *aclRepo) Update(ctx context.Context, rule *core.ACLRule) error {
+	return r.db.WithContext(ctx).Save(rule).Error
+}
+
+func (r *aclRepo) Replace(ctx context.Context, networkID string, rules []core.ACLRule) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("network_id = ?", networkID).Delete(&core.ACLRule{}).Error; err != nil {
+			return err
+		}
+		if len(rules) == 0 {
+			return nil
+		}
+		return tx.Create(&rules).Error
+	})
+}
+
 func (r *aclRepo) Delete(ctx context.Context, id uuid.UUID) error {
 	return r.db.WithContext(ctx).Delete(&core.ACLRule{}, "id = ?", id).Error
 }

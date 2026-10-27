@@ -70,7 +70,9 @@ type Daemon struct {
 	// Zero-Trust Inbound Firewall & Mesh Listeners
 	policy       networkPolicy // network-wide rules from the plane
 	policyMu     sync.RWMutex
-	allowedPorts []string // e.g. ["5432/tcp"]
+	allowedPorts []string // effective "ports/proto" entries, e.g. ["5432/tcp"]
+	configAllow  []string // the part of allowedPorts from the config file
+	runtimeAllow []string // opened with `zro allow`, persisted in policy.json
 	defaultDeny  bool     // default true for zero-trust
 	allowPing    bool
 	allowedPeers []string
@@ -114,13 +116,18 @@ func NewDaemon(cfg *config.NodeConfig) (*Daemon, error) {
 		dev:          dev,
 		udpConn:      udpConn,
 		tunnelClient: tunnel.NewClient(),
-		allowedPorts: cfg.AllowedInboundPorts,
 		defaultDeny:  cfg.DefaultDeny,
 		allowPing:    cfg.AllowPing,
 		stunWaiters:  make(map[[12]byte]chan *stun.ReflexiveAddress),
 		relay:        newRelayState(),
 		popKick:      make(chan struct{}, 1),
 		punchWaiters: make(map[string]chan struct{}),
+	}
+
+	if err := d.loadLocalPolicy(); err != nil {
+		_ = udpConn.Close()
+		_ = tunDev.Close()
+		return nil, err
 	}
 
 	agent.LoadToken(cfg.StateDir, "node.token", &d.token)

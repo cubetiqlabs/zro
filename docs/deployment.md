@@ -271,8 +271,8 @@ node:
   enable_p2p: true
   default_deny: true                 # drops all incoming connections by default
   allow_ping: true                   # ping is answered unless a network DENY rule matches
-  allowed_inbound_ports:
-    - "5432/tcp"
+  allow:                             # services or ports peers may reach (zro allow / zro deny change it live)
+    - "postgres"
   tags:
     - "role:db"
 ```

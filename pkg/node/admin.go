@@ -76,10 +76,27 @@ func (d *Daemon) serveAdmin(ctx context.Context) {
 		}
 		writeAdminJSON(w, http.StatusOK, res)
 	})
+	mux.HandleFunc("GET /policy", func(w http.ResponseWriter, r *http.Request) {
+		writeAdminJSON(w, http.StatusOK, d.localPolicy())
+	})
+	mux.HandleFunc("POST /policy/allow", func(w http.ResponseWriter, r *http.Request) {
+		d.adminPolicyChange(w, d.AllowService(r.URL.Query().Get("service")))
+	})
+	mux.HandleFunc("POST /policy/deny", func(w http.ResponseWriter, r *http.Request) {
+		d.adminPolicyChange(w, d.DenyService(r.URL.Query().Get("service")))
+	})
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { <-ctx.Done(); _ = srv.Close() }()
 	_ = srv.Serve(ln)
 	_ = os.Remove(path)
+}
+
+func (d *Daemon) adminPolicyChange(w http.ResponseWriter, err error) {
+	if err != nil {
+		writeAdminJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, d.localPolicy())
 }
 
 func writeAdminJSON(w http.ResponseWriter, code int, v any) {

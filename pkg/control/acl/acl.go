@@ -117,6 +117,9 @@ func NewEvaluatorWithDefault(rules []core.ACLRule, defaultAction core.ACLAction)
 	return &Evaluator{rules: compiled, defaultAction: defaultAction}
 }
 
+// Len is the number of rules.
+func (e *Evaluator) Len() int { return len(e.rules) }
+
 // Decide reports the outcome of the first matching rule. matched is false when
 // no rule applies, so the caller can fall back to its own policy.
 func (e *Evaluator) Decide(srcIP string, srcTags []string, dstIP string, dstTags []string, protocol string, port int) (allow, matched bool) {

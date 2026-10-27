@@ -30,6 +30,7 @@ var (
 	cfgFile string
 	rootCmd = &cobra.Command{
 		Use:              "zro",
+		SilenceErrors:    true, // main prints the error once
 		PersistentPreRun: func(cmd *cobra.Command, args []string) { notifyIfOutdated(cmd) },
 		Short:            "ZRO: High-Performance Global Networking & Ether-Switch Mesh",
 		Long: `ZRO is an enterprise-grade global networking fabric with userspace WireGuard,
@@ -75,6 +76,10 @@ func init() {
 	rootCmd.AddCommand(newUpdateCmd())
 	rootCmd.AddCommand(newStatusCmd())
 	rootCmd.AddCommand(newPingCmd())
+	rootCmd.AddCommand(newAllowCmd(false))
+	rootCmd.AddCommand(newAllowCmd(true))
+	rootCmd.AddCommand(newPolicyCmd())
+	rootCmd.AddCommand(newACLCmd())
 }
 
 func main() {
@@ -241,6 +246,7 @@ func newEdgeCmd() *cobra.Command {
 func newNodeCmd() *cobra.Command {
 	var planeFlag, tokenFlag, hostnameFlag string
 	var netstack bool
+	var allowFlag []string
 
 	cmd := &cobra.Command{
 		Use:     "node",
@@ -263,6 +269,7 @@ func newNodeCmd() *cobra.Command {
 			if netstack {
 				cfg.Node.InterfaceMode = "netstack"
 			}
+			cfg.Node.Allow = append(cfg.Node.Allow, allowFlag...)
 			if cfg.Node.Hostname == "" {
 				cfg.Node.Hostname, _ = os.Hostname()
 			}
@@ -274,6 +281,7 @@ func newNodeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&tokenFlag, "token", "", "Enrollment token (from the operator)")
 	cmd.Flags().StringVar(&hostnameFlag, "hostname", "", "Node name (default: this machine's hostname)")
 	cmd.Flags().BoolVar(&netstack, "netstack", false, "Run unprivileged: no TUN device or root needed")
+	cmd.Flags().StringSliceVar(&allowFlag, "allow", nil, "Services or ports peers may reach, e.g. ssh,5432/tcp (ping is on by default)")
 	return cmd
 }
 
@@ -399,15 +407,14 @@ func mintViaPlane(plane, apiKey, networkID, hostname, nodeType, pubKey string, h
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return planeError(resp)
+	}
 	var out struct {
 		JoinCommand string `json:"join_command"`
 		Token       string `json:"token"`
-		Error       string `json:"error"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&out)
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("control plane refused (%d): %s", resp.StatusCode, out.Error)
-	}
 	fmt.Printf("Enrollment Token:\n%s\n\nRun on the new machine:\n  %s\n", out.Token, out.JoinCommand)
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -108,4 +109,58 @@ func newPingCmd() *cobra.Command {
 	}
 	cmd.Flags().IntVarP(&count, "count", "n", 3, "Number of pings")
 	return cmd
+}
+
+func newAllowCmd(deny bool) *cobra.Command {
+	use, short, path := "allow", "Let peers reach a service or port on this node: zro allow ssh 5432/tcp", "/policy/allow"
+	if deny {
+		use, short, path = "deny", "Close what `zro allow` opened: zro deny ssh", "/policy/deny"
+	}
+	return &cobra.Command{
+		Use:   use + " <service|port[/proto]>...",
+		Short: short,
+		Long: short + `
+
+Services: ssh, http, https, dns, ping, rdp, postgres, mysql, redis.
+Ports: 5432/tcp, 80,443/tcp, 8000-8100/udp, */icmp.
+The change is live and kept across restarts. Network ACL rules still apply:
+a network DENY rule wins over a local allow.`,
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var p node.LocalPolicy
+			for _, s := range args {
+				if err := localCall(http.MethodPost, path+"?service="+url.QueryEscape(s), &p); err != nil {
+					return err
+				}
+			}
+			printPolicy(p)
+			return nil
+		},
+	}
+}
+
+func newPolicyCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "policy",
+		Short: "Show this node's inbound policy",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var p node.LocalPolicy
+			if err := localCall(http.MethodGet, "/policy", &p); err != nil {
+				return err
+			}
+			printPolicy(p)
+			return nil
+		},
+	}
+}
+
+func printPolicy(p node.LocalPolicy) {
+	def := "allow"
+	if p.DefaultDeny {
+		def = "deny"
+	}
+	fmt.Printf("default: %s   ping: %v   network rules: %d\nallowed: %s\n", def, p.AllowPing, p.NetworkRules, strings.Join(p.Allow, " "))
+	if len(p.Runtime) > 0 {
+		fmt.Printf("opened with zro allow: %s\n", strings.Join(p.Runtime, " "))
+	}
 }

@@ -89,8 +89,9 @@ node:
   enable_p2p: true
   default_deny: true # Zero-Trust default deny all inbound traffic (enforced per packet, tun and netstack)
   allow_ping: true # answer ICMP echo unless a network rule denies it
-  allowed_inbound_ports:
-    - "5432/tcp" # e.g. expose Postgres service to mesh peers
+  allow: # services or ports peers may reach; change live with `zro allow` / `zro deny`
+    - "ssh"
+    - "5432/tcp" # services: ssh http https dns ping rdp postgres mysql redis; ports: 80,443/tcp 8000-8100/udp
   tags:
     - "tag:web"
     - "env:prod"

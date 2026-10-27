@@ -160,18 +160,20 @@ const (
 
 // ACLRule defines microsegmentation and access control within a network.
 type ACLRule struct {
-	ID        uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
-	NetworkID string    `gorm:"size:16;not null;index" json:"network_id"`
-	Priority  int       `gorm:"default:100;not null" json:"priority"`
-	SourceIP  string    `gorm:"size:50;default:'*'" json:"source_ip"` // e.g. "100.64.0.11" or "*"
-	DestIP    string    `gorm:"size:50;default:'*'" json:"dest_ip"`   // e.g. "100.64.0.10" or "*"
-	SourceTag string    `gorm:"size:100;not null" json:"source_tag"`  // e.g. "tag:web" or "*"
-	DestTag   string    `gorm:"size:100;not null" json:"dest_tag"`    // e.g. "tag:db" or "*"
-	Protocol  string    `gorm:"size:20;default:'*'" json:"protocol"`  // "tcp", "udp", "icmp", "*"
-	Ports     string    `gorm:"size:100;default:'*'" json:"ports"`    // "80,443", "5432", "*"
-	Action    ACLAction `gorm:"size:20;default:'ALLOW'" json:"action"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID          uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	NetworkID   string    `gorm:"size:16;not null;index" json:"network_id"`
+	Name        string    `gorm:"size:100" json:"name,omitempty"`
+	Description string    `gorm:"size:255" json:"description,omitempty"`
+	Priority    int       `gorm:"default:100;not null" json:"priority"`
+	SourceIP    string    `gorm:"size:50;default:'*'" json:"source_ip"` // e.g. "100.64.0.11" or "*"
+	DestIP      string    `gorm:"size:50;default:'*'" json:"dest_ip"`   // e.g. "100.64.0.10" or "*"
+	SourceTag   string    `gorm:"size:100;not null" json:"source_tag"`  // e.g. "tag:web" or "*"
+	DestTag     string    `gorm:"size:100;not null" json:"dest_tag"`    // e.g. "tag:db" or "*"
+	Protocol    string    `gorm:"size:20;default:'*'" json:"protocol"`  // "tcp", "udp", "icmp", "*"
+	Ports       string    `gorm:"size:100;default:'*'" json:"ports"`    // "80,443", "5432", "*"
+	Action      ACLAction `gorm:"size:20;default:'ALLOW'" json:"action"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // Tunnel defines a Cloudflared-style exposed service from a node to the mesh or gateway.

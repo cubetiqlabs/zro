@@ -21,7 +21,6 @@ import (
 	"github.com/cubetiqlabs/zro/api/openapi"
 	v1 "github.com/cubetiqlabs/zro/api/proto/v1"
 	"github.com/cubetiqlabs/zro/pkg/config"
-	controlacl "github.com/cubetiqlabs/zro/pkg/control/acl"
 	controlauth "github.com/cubetiqlabs/zro/pkg/control/auth"
 	controlevents "github.com/cubetiqlabs/zro/pkg/control/events"
 	controlgrpc "github.com/cubetiqlabs/zro/pkg/control/grpc"
@@ -601,6 +600,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/acl/rules", s.tenantAuthMiddleware(s.handleCreateACLRule))
 	s.mux.HandleFunc("GET /api/v1/acl/rules", s.tenantAuthMiddleware(s.handleListACLRules))
 	s.mux.HandleFunc("DELETE /api/v1/acl/rules/{id}", s.tenantAuthMiddleware(s.handleDeleteACLRule))
+	s.mux.HandleFunc("PATCH /api/v1/acl/rules/{id}", s.tenantAuthMiddleware(s.handleUpdateACLRule))
+	s.mux.HandleFunc("GET /api/v1/networks/{id}/policy", s.tenantAuthMiddleware(s.handleGetPolicy))
+	s.mux.HandleFunc("PUT /api/v1/networks/{id}/policy", s.tenantAuthMiddleware(s.handlePutPolicy))
+	s.mux.HandleFunc("POST /api/v1/networks/{id}/policy/test", s.tenantAuthMiddleware(s.handleTestPolicy))
 
 	// Node Enrollment & Mesh Coordination
 	s.mux.HandleFunc("POST /api/v1/enroll", s.handleEnrollNode)
@@ -1492,180 +1495,6 @@ func (s *Server) handleGetMeshGraph(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
-}
-
-// CreateACLRuleRequest defines parameters for a new microsegmentation rule.
-type CreateACLRuleRequest struct {
-	NetworkID string         `json:"network_id"`
-	Priority  int            `json:"priority"`
-	SourceIP  string         `json:"source_ip"`
-	DestIP    string         `json:"dest_ip"`
-	SourceTag string         `json:"source_tag"`
-	DestTag   string         `json:"dest_tag"`
-	Protocol  string         `json:"protocol"`
-	Ports     string         `json:"ports"`
-	Action    core.ACLAction `json:"action"`
-}
-
-func (s *Server) handleCreateACLRule(w http.ResponseWriter, r *http.Request) {
-	var req CreateACLRuleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		apiError(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	if req.NetworkID == "" {
-		apiError(w, "network_id is required", http.StatusBadRequest)
-		return
-	}
-
-	tenant := TenantFromContext(r.Context())
-	if tenant != nil {
-		net, err := s.db.Networks.GetByID(r.Context(), req.NetworkID)
-		if err != nil || net == nil {
-			apiError(w, "network not found", http.StatusNotFound)
-			return
-		}
-		if net.TenantID != tenant.ID {
-			apiError(w, "forbidden: network does not belong to tenant", http.StatusForbidden)
-			return
-		}
-	}
-
-	if req.Priority <= 0 {
-		req.Priority = 100
-	}
-	if req.Action == "" {
-		req.Action = core.ACLActionAllow
-	}
-	if req.Protocol == "" {
-		req.Protocol = "*"
-	}
-	if req.Ports == "" {
-		req.Ports = "*"
-	}
-	if req.SourceIP == "" {
-		req.SourceIP = "*"
-	}
-	if req.DestIP == "" {
-		req.DestIP = "*"
-	}
-	if req.SourceTag == "" {
-		req.SourceTag = "*"
-	}
-	if req.DestTag == "" {
-		req.DestTag = "*"
-	}
-
-	rule := &core.ACLRule{
-		ID:        uuid.New(),
-		NetworkID: req.NetworkID,
-		Priority:  req.Priority,
-		SourceIP:  req.SourceIP,
-		DestIP:    req.DestIP,
-		SourceTag: req.SourceTag,
-		DestTag:   req.DestTag,
-		Protocol:  req.Protocol,
-		Ports:     req.Ports,
-		Action:    req.Action,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-
-	if err := controlacl.ValidateRule(rule); err != nil {
-		apiError(w, "invalid ACL rule: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	if err := s.db.ACLs.Create(r.Context(), rule); err != nil {
-		apiError(w, fmt.Sprintf("failed to create ACL rule: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	slog.Info("Created new ACL rule", "id", rule.ID, "network_id", rule.NetworkID, "action", rule.Action, "ports", rule.Ports)
-
-	// Broadcast ACL and graph update
-	s.broadcastDelta(s.scopeForNetwork(r.Context(), rule.NetworkID), map[string]any{
-		"event":      "acl_rules_updated",
-		"network_id": rule.NetworkID,
-		"rule_id":    rule.ID,
-	})
-	s.broadcastDelta(s.scopeForNetwork(r.Context(), rule.NetworkID), map[string]any{
-		"event": "mesh_graph_updated",
-	})
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(rule)
-}
-
-func (s *Server) handleListACLRules(w http.ResponseWriter, r *http.Request) {
-	netID := r.URL.Query().Get("network_id")
-	if netID == "" {
-		apiError(w, "network_id query parameter is required", http.StatusBadRequest)
-		return
-	}
-
-	tenant := TenantFromContext(r.Context())
-	if tenant != nil {
-		net, err := s.db.Networks.GetByID(r.Context(), netID)
-		if err != nil || net == nil {
-			apiError(w, "network not found", http.StatusNotFound)
-			return
-		}
-		if net.TenantID != tenant.ID {
-			apiError(w, "forbidden: network does not belong to tenant", http.StatusForbidden)
-			return
-		}
-	}
-
-	rules, err := s.db.ACLs.ListByNetworkID(r.Context(), netID)
-	if err != nil {
-		apiError(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	writePage(w, r, rules)
-}
-
-func (s *Server) handleDeleteACLRule(w http.ResponseWriter, r *http.Request) {
-	idStr := r.PathValue("id")
-	id, err := uuid.Parse(idStr)
-	if err != nil {
-		apiError(w, "invalid rule id", http.StatusBadRequest)
-		return
-	}
-
-	rule, err := s.db.ACLs.GetByID(r.Context(), id)
-	if err != nil || rule == nil {
-		apiError(w, "rule not found", http.StatusNotFound)
-		return
-	}
-	network, ok := s.authorizeNetwork(r.Context(), rule.NetworkID)
-	if !ok {
-		// Same response as a missing rule so rule IDs cannot be probed across tenants.
-		apiError(w, "rule not found", http.StatusNotFound)
-		return
-	}
-
-	if err := s.db.ACLs.Delete(r.Context(), id); err != nil {
-		apiError(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	scope := networkScope(network)
-	s.broadcastDelta(scope, map[string]any{
-		"event":      "acl_rules_updated",
-		"network_id": rule.NetworkID,
-		"rule_id":    idStr,
-	})
-	s.broadcastDelta(scope, map[string]any{
-		"event":      "mesh_graph_updated",
-		"network_id": rule.NetworkID,
-	})
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
 }
 
 // adminAuthMiddleware guards tenant administration with the bootstrap admin key.

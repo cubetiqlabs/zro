@@ -104,7 +104,8 @@ type NodeConfig struct {
 	// SOCKSListen, if set, runs a SOCKS5 proxy on this loopback address that reaches the overlay only.
 	SOCKSListen         string              `mapstructure:"socks_listen"`
 	Tags                []string            `mapstructure:"tags"`
-	AllowedInboundPorts []string            `mapstructure:"allowed_inbound_ports"` // e.g. ["5432/tcp"]
+	Allow               []string            `mapstructure:"allow"`                 // services or ports peers may reach: ["ssh", "5432/tcp", "ping"]
+	AllowedInboundPorts []string            `mapstructure:"allowed_inbound_ports"` // older name for allow; both are read
 	DefaultDeny         bool                `mapstructure:"default_deny"`          // zero-trust default deny all
 	AllowPing           bool                `mapstructure:"allow_ping"`            // answer ICMP echo unless a network rule denies it
 	Tunnels             []LocalTunnelConfig `mapstructure:"tunnels"`

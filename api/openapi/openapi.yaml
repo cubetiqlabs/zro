@@ -368,13 +368,19 @@ paths:
       tags: [ACL]
       operationId: createACLRule
       summary: Create an ACL rule
-      description: Omitted match fields default to `*`; `priority` defaults to 100; `action` to `ALLOW`. Nodes receive the change live.
+      description: |
+        Write the rule in shorthand with `from`, `to` and `ports`, or with the explicit `source_*`/`dest_*` fields.
+        Omitted match fields default to `*`, `priority` defaults to 100 and `action` to `ALLOW`. Nodes receive the change live.
       requestBody:
         required: true
         content:
           application/json:
             schema: {$ref: "#/components/schemas/CreateACLRuleRequest"}
-            example: {network_id: 8056c2e21c000001, priority: 10, source_tag: "tag:web", dest_tag: "tag:db", protocol: tcp, ports: "5432", action: ALLOW}
+            examples:
+              shorthand:
+                value: {network_id: 8056c2e21c000001, name: web to db, from: "tag:web", to: db-1, ports: postgres}
+              explicit:
+                value: {network_id: 8056c2e21c000001, priority: 10, source_tag: "tag:web", dest_tag: "tag:db", protocol: tcp, ports: "5432", action: ALLOW}
       responses:
         "201":
           description: Rule created.
@@ -393,13 +399,89 @@ paths:
           description: The rule.
           content: {application/json: {schema: {$ref: "#/components/schemas/ACLRule"}}}
         "404": {$ref: "#/components/responses/NotFound"}
+    patch:
+      tags: [ACL]
+      operationId: updateACLRule
+      summary: Change an ACL rule
+      description: Only the fields in the body change. New `ports` bring their own protocol unless `protocol` is also given.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateACLRuleRequest"}
+            example: {ports: "ssh", action: DENY}
+      responses:
+        "200":
+          description: The updated rule.
+          content: {application/json: {schema: {$ref: "#/components/schemas/ACLRule"}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
     delete:
       tags: [ACL]
       operationId: deleteACLRule
       summary: Delete an ACL rule
-      description: To change a rule, create the new one first, then delete the old one.
       responses:
-        "204": {description: Deleted.}
+        "200": {description: Deleted.}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /api/v1/networks/{id}/policy:
+    parameters: [{name: id, in: path, required: true, schema: {$ref: "#/components/schemas/NetworkID"}}]
+    get:
+      tags: [ACL]
+      operationId: getPolicy
+      summary: Get a network's whole policy
+      description: The rules in the same form `PUT` accepts, so a policy can be exported, edited and applied back.
+      responses:
+        "200":
+          description: The policy.
+          content: {application/json: {schema: {$ref: "#/components/schemas/PolicyDocument"}}}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [ACL]
+      operationId: putPolicy
+      summary: Replace a network's whole policy
+      description: |
+        Validates every rule, then replaces the network's rules in one transaction: if any rule is invalid, nothing changes.
+        At most 1000 rules. An empty list removes the network policy, so each node's own allow list and `default_deny` decide.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PolicyDocument"}
+            example:
+              rules:
+                - {name: admins anywhere, from: "tag:admin", to: "*", priority: 10}
+                - {name: web to db, from: "tag:web", to: "tag:db", ports: postgres}
+                - {name: no ssh from contractors, from: "tag:contractor", ports: ssh, action: DENY, priority: 5}
+      responses:
+        "200":
+          description: The rules now in force.
+          content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/ACLRule"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/networks/{id}/policy/test:
+    parameters: [{name: id, in: path, required: true, schema: {$ref: "#/components/schemas/NetworkID"}}]
+    post:
+      tags: [ACL]
+      operationId: testPolicy
+      summary: Ask whether one flow is allowed
+      description: |
+        Evaluates the network rules for `from` → `to` on `port`. `verdict` is `allow` or `deny` when a rule matches.
+        It is `node-policy` when none does: the destination node's own allow list and `default_deny` decide then.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PolicyTestRequest"}
+            example: {from: web-1, to: db-1, port: postgres}
+      responses:
+        "200":
+          description: The verdict.
+          content: {application/json: {schema: {$ref: "#/components/schemas/PolicyTestResult"}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
         "404": {$ref: "#/components/responses/NotFound"}
 
   /api/v1/mesh/graph:
@@ -961,17 +1043,44 @@ components:
         - properties: {items: {type: array, items: {$ref: "#/components/schemas/Node"}}}
     CreateACLRuleRequest:
       type: object
-      required: [network_id]
       properties:
         network_id: {$ref: "#/components/schemas/NetworkID"}
-        priority: {type: integer, default: 100, description: Lower is evaluated first.}
+        name: {type: string, maxLength: 100, example: web to db}
+        description: {type: string, maxLength: 255}
+        priority: {type: integer, default: 100, description: Lower is evaluated first; a DENY wins a tie.}
+        from:
+          type: string
+          description: "Shorthand source: `*`, an IP, a CIDR, a tag (anything with a colon, such as `tag:web` or `role:db`) or a node hostname. Overrides `source_ip`/`source_tag`."
+          example: "tag:web"
+        to: {type: string, description: "Shorthand destination, same forms as `from`.", example: db-1}
         source_ip: {type: string, default: "*", description: "IP, CIDR or `*`."}
         dest_ip: {type: string, default: "*"}
         source_tag: {type: string, default: "*", example: "tag:web"}
         dest_tag: {type: string, default: "*", example: "tag:db"}
         protocol: {type: string, enum: [tcp, udp, icmp, "*"], default: "*"}
-        ports: {type: string, default: "*", example: "80,443"}
+        ports:
+          type: string
+          default: "*"
+          description: "A service (ssh, http, https, dns, ping, rdp, postgres, mysql, redis) or ports with an optional protocol: `80,443/tcp`, `8000-8100`."
+          example: "80,443/tcp"
         action: {type: string, enum: [ALLOW, DENY], default: ALLOW}
+    PolicyDocument:
+      type: object
+      required: [rules]
+      properties:
+        rules: {type: array, maxItems: 1000, items: {$ref: "#/components/schemas/CreateACLRuleRequest"}}
+    PolicyTestRequest:
+      type: object
+      required: [from, to]
+      properties:
+        from: {type: string, example: web-1}
+        to: {type: string, example: db-1}
+        port: {type: string, default: "*", example: postgres}
+    PolicyTestResult:
+      type: object
+      properties:
+        verdict: {type: string, enum: [allow, deny, node-policy]}
+        rule: {$ref: "#/components/schemas/ACLRule"}
     ACLRule:
       allOf:
         - $ref: "#/components/schemas/CreateACLRuleRequest"

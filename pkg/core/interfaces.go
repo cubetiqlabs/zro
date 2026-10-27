@@ -66,6 +66,9 @@ type ACLRepository interface {
 	Create(ctx context.Context, rule *ACLRule) error
 	GetByID(ctx context.Context, id uuid.UUID) (*ACLRule, error)
 	ListByNetworkID(ctx context.Context, networkID string) ([]ACLRule, error)
+	Update(ctx context.Context, rule *ACLRule) error
+	// Replace makes rules the network's whole policy, atomically.
+	Replace(ctx context.Context, networkID string, rules []ACLRule) error
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 

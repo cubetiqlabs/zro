@@ -68,6 +68,12 @@ sleep 1
 reach() { [ "$(docker exec smoke-n1 sh -c "nc -w 3 $N2 7000 </dev/null" 2>/dev/null)" = hi ]; }
 if reach; then echo "FAIL port 7000 reachable under default deny"; exit 1; fi
 ok "port 7000 filtered by default deny"
+docker exec smoke-n2 zro allow 7000/tcp >/dev/null
+reach || { echo "FAIL port 7000 filtered after zro allow"; exit 1; }
+ok "zro allow 7000/tcp opens it"
+docker exec smoke-n2 zro deny 7000/tcp >/dev/null
+if reach; then echo "FAIL port 7000 reachable after zro deny"; exit 1; fi
+ok "zro deny 7000/tcp closes it"
 api /api/v1/acl/rules "{\"network_id\":\"$NETID\",\"priority\":10,\"source_tag\":\"*\",\"dest_tag\":\"*\",\"protocol\":\"tcp\",\"ports\":\"7000\",\"action\":\"ALLOW\"}" -H "Authorization: Bearer $KEY" >/dev/null
 for _ in $(seq 1 10); do reach && break; sleep 1; done
 reach || { echo "FAIL port 7000 still filtered after an ALLOW rule"; exit 1; }
