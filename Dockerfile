@@ -31,7 +31,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     ./cmd/zro
 
 # Stage 2: Production minimal runtime
-FROM alpine:3.23
+FROM alpine:3.24
 
 # Runtime utilities: `ip` programs overlay addresses/routes, curl serves health checks.
 # iptables only opens FORWARD for relayed overlay traffic (Docker defaults it to DROP); ZRO adds no NAT rules.
